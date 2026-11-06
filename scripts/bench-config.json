@@ -1,0 +1,30 @@
+{
+  "_comment": "Engines are found on PATH. Edit the paths for your machine, or pass your own file with --config. {lesto}, {previous}, {model}, {model_dir} and {port} are filled in by scripts/bench.py. See docs/benchmark.md.",
+  "checkpoints": {
+    "standard": "~/models/gemma-4-26b-a4b-it-4bit"
+  },
+  "engines": {
+    "lesto": {"command": "{lesto} serve --model {model} --host 127.0.0.1 --port {port}", "version": "{lesto} --version"},
+    "lesto-again": {"command": "{lesto} serve --model {model} --host 127.0.0.1 --port {port}", "version": "{lesto} --version"},
+    "lesto-previous": {"command": "{previous} serve --model {model} --host 127.0.0.1 --port {port}", "version": "{previous} --version"},
+    "mlx-lm": {"command": "mlx_lm.server --model {model} --host 127.0.0.1 --port {port}", "version": "python3 -c \"import mlx_lm; print('mlx-lm', mlx_lm.__version__)\""},
+    "mlx-vlm": {"command": "python3 -m mlx_vlm.server --model {model} --host 127.0.0.1 --port {port}", "version": "python3 -c \"import mlx_vlm; print('mlx-vlm', mlx_vlm.__version__)\""},
+    "mlx-serve": {"command": "mlx-serve serve --model {model} --host 127.0.0.1 --port {port}", "version": "mlx-serve --version"},
+    "vllm-mlx": {"command": "vllm-mlx serve {model} --host 127.0.0.1 --port {port}", "version": "python3 -c \"import vllm_mlx; print('vllm-mlx', vllm_mlx.__version__)\""},
+    "omlx": {"command": "omlx serve --model-dir {model_dir} --host 127.0.0.1 --port {port}", "version": "omlx --version"}
+  },
+  "modes": {
+    "release": {
+      "compare_to": "lesto",
+      "noise_pair": ["lesto", "lesto-again"],
+      "cold": [["lesto", "standard"], ["lesto-previous", "standard"], ["lesto-again", "standard"]],
+      "warm": [["lesto", "standard"], ["lesto-previous", "standard"]]
+    },
+    "field": {
+      "compare_to": "lesto",
+      "noise_pair": ["lesto", "lesto-again"],
+      "cold": [["lesto", "standard"], ["mlx-lm", "standard"], ["mlx-vlm", "standard"], ["mlx-serve", "standard"], ["vllm-mlx", "standard"], ["omlx", "standard"], ["lesto-again", "standard"]],
+      "warm": [["lesto", "standard"], ["mlx-lm", "standard"], ["mlx-vlm", "standard"], ["mlx-serve", "standard"], ["vllm-mlx", "standard"], ["omlx", "standard"]]
+    }
+  }
+}

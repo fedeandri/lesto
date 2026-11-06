@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Integration test for Unsloth UD MoE models — verifies the loader handles
+# bf16 router/shared_expert_gate (the v26.5.x UD MoE fix).
+# Usage: UD_MOE_MODEL=/path/to/model PORT=8090 ./tests/test_ud_moe.sh
+# Defaults to ~/.mlx-serve/models/unsloth/Qwen3.6-27B-UD-MLX-4bit/ if present
+# (the UD MoE fix is independent of the specific size - any
+# Unsloth Dynamic-quantization MoE checkpoint exercises the bf16
+# router/shared_expert_gate path).
+# Skips silently when the model isn't available (CI-friendly).
+
+set -euo pipefail
+
+MODEL="${UD_MOE_MODEL:-$HOME/.mlx-serve/models/unsloth/Qwen3.6-27B-UD-MLX-4bit}"
+PORT="${PORT:-8090}"
+HOST="127.0.0.1"
+
+if [ ! -d "$MODEL" ]; then
+    echo "skip: $MODEL not found"
+    exit 0
+fi
+
+if [ ! -x ./zig-out/bin/lesto ]; then
+    echo "FAIL: ./zig-out/bin/lesto not built - run 'zig build -Doptimize=ReleaseFast' first"
+    exit 1
+fi
+
+LOG=$(mktemp -t mlx-ud-moe.XXXXXX.log)
+echo "[ud-moe] starting server: model=$MODEL port=$PORT log=$LOG"
+./zig-out/bin/lesto --model "$MODEL" --serve --host "$HOST" --port "$PORT" --log-level info >"$LOG" 2>&1 &
+SERVER_PID=$!
+trap 'kill -9 $SERVER_PID 2>/dev/null || true; wait $SERVER_PID 2>/dev/null || true' EXIT
+
+# Wait up to 120s for /health
+for _ in $(seq 1 120); do
+    if curl -sf "http://$HOST:$PORT/health" >/dev/null 2>&1; then
+        break
+    fi
+    if ! kill -0 $SERVER_PID 2>/dev/null; then
+        echo "FAIL: server crashed during load"
+        tail -30 "$LOG"
+        exit 1
+    fi
+    sleep 1
+done
+
+if ! curl -sf "http://$HOST:$PORT/health" >/dev/null 2>&1; then
+    echo "FAIL: server did not become healthy within 120s"
+    tail -30 "$LOG"
+    exit 1
+fi
+
+echo "[ud-moe] server healthy, sending chat completion"
+
+resp=$(curl -sf "http://$HOST:$PORT/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "local",
+        "messages": [{"role": "user", "content": "Reply with one short greeting."}],
+        "max_tokens": 30,
+        "temperature": 0.0,
+        "stream": false
+    }')
+
+content=$(printf '%s' "$resp" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+c = d['choices'][0]['message']['content']
+print(c)
+")
+
+if [ -z "${content// /}" ]; then
+    echo "FAIL: empty completion"
+    echo "  full response: $resp"
+    exit 1
+fi
+
+echo "[ud-moe] PASS — generated: $content"
+exit 0

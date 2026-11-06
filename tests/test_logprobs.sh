@@ -1,0 +1,291 @@
+#!/bin/bash
+# test_logprobs.sh — the logprobs wire contract, on every surface that serves it.
+#
+# Three defects fixed 2026-08-05 (temperature-scaled logits, float-equality id
+# recovery, a one-token offset) all reduce to ONE observable bar: at temp 0 the
+# emitted token IS the argmax, so rank 1 of top_logprobs must equal it. A broken
+# instrument is worse than none — an early "-0.004, therefore 99.6% confident"
+# read off this field sent a quantization hunt down the wrong path for a day.
+#
+# Section [4] pins the class those three did NOT cover: STREAMING chat accepted
+# `logprobs`, disabled speculation to honor it (paying the throughput), had the
+# generator compute every entry — and then dropped them, because the SSE chunk
+# template had no `logprobs` field at all. Silently-ignored-field class. It is
+# invisible to llmprobe (which probes logprobs non-streaming only, and scored
+# this server 100% on `Logprob consistency` while streaming returned nothing),
+# and invisible to any output-equality test, since the deltas are unchanged.
+#
+#   LOGPROBS_TEST_MODEL=<dir> ./tests/test_logprobs.sh [port]
+#
+# Any chat model works; defaults to gemma-4-e4b-it-4bit. SKIPs without one.
+set -uo pipefail
+
+MODEL="${LOGPROBS_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit}"
+PORT="${1:-11293}"
+BIN="${BINARY:-./zig-out/bin/lesto}"
+BASE="http://127.0.0.1:$PORT"
+
+[ -d "$MODEL" ] || { echo "SKIP: no model at $MODEL"; exit 0; }
+[ -x "$BIN" ]   || { echo "fail: build mlx-serve first"; exit 1; }
+
+ID="$(basename "$MODEL")"
+LOG="$(mktemp)"
+pkill -f "^([^ ]*/)?(lesto|mlx-serve) .*--port $PORT( |$)" 2>/dev/null; sleep 1
+"$BIN" --serve --model "$MODEL" --port "$PORT" >"$LOG" 2>&1 &
+SRV=$!
+trap 'kill $SRV 2>/dev/null; rm -f "$LOG"' EXIT
+
+for _ in $(seq 1 180); do curl -sf -m 2 "$BASE/health" >/dev/null 2>&1 && break; sleep 1; done
+curl -sf -m 2 "$BASE/health" >/dev/null 2>&1 || { echo "fail: server never came up"; tail -20 "$LOG"; exit 1; }
+
+python3 - "$BASE" "$ID" <<'PY'
+import json, sys, urllib.request
+BASE, MODEL = sys.argv[1], sys.argv[2]
+fails, checks = [], 0
+
+def ck(name, cond, detail=""):
+    global checks
+    checks += 1
+    print(("  \033[32mPASS\033[0m  " if cond else "  \033[31mFAIL\033[0m  ") + name + ("  " + detail if not cond else ""))
+    if not cond: fails.append(name)
+
+# A token is a BPE fragment, so it can carry HALF a multi-byte character — and
+# the token STRINGS go out in the JSON. Raw bytes there make the whole body
+# invalid UTF-8, i.e. unparseable, not merely degraded. Checked on EVERY
+# response this script makes rather than in one place, since which request
+# happens to draw a split candidate into its top-5 is luck.
+utf8_bad = []
+
+def post(path, body, stream=False):
+    req = urllib.request.Request(BASE + path, data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    r = urllib.request.urlopen(req, timeout=600)
+    if stream:
+        return r
+    raw = r.read()
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except UnicodeDecodeError as e:
+        utf8_bad.append((path, e.start, bytes(raw[e.start:e.start + 2])))
+        return json.loads(raw.decode("utf-8", "replace"))
+
+MSG = [{"role": "user", "content": "Count from one to eight in words."}]
+# Room for a model that thinks before it answers: entries describe content only.
+REQ = {"model": MODEL, "messages": MSG, "max_tokens": 512, "temperature": 0,
+       "logprobs": True, "top_logprobs": 5}
+
+def entries_ok(label, content):
+    bad_rank1 = [(i, e["token"], e["top_logprobs"][0]["token"])
+                 for i, e in enumerate(content)
+                 if e.get("top_logprobs") and e["top_logprobs"][0]["token"] != e["token"]]
+    ck(f"[{label}] rank 1 == emitted token at temp 0", not bad_rank1,
+       f"{len(bad_rank1)}/{len(content)}: {bad_rank1[:3]}")
+    bad_ord = [i for i, e in enumerate(content)
+               if (v := [t["logprob"] for t in e.get("top_logprobs") or []]) != sorted(v, reverse=True)]
+    ck(f"[{label}] top_logprobs descend", not bad_ord, f"{bad_ord[:3]}")
+    ck(f"[{label}] logprobs are <= 0",
+       all(e["logprob"] <= 1e-6 and all(t["logprob"] <= 1e-6 for t in e.get("top_logprobs") or [])
+           for e in content))
+    ck(f"[{label}] every entry carries bytes", all("bytes" in e for e in content))
+
+print("── [1/8] chat non-streaming ──")
+r = post("/v1/chat/completions", {**REQ, "stream": False})
+ns = (r["choices"][0].get("logprobs") or {}).get("content") or []
+chat_text = r["choices"][0]["message"].get("content") or ""
+ck("[non-stream] logprobs present", bool(ns), f"got {r['choices'][0].get('logprobs')}")
+if ns:
+    entries_ok("non-stream", ns)
+    # logprobs.content describes message.content, NOT the whole completion:
+    # tokens generated outside content (a model that closes its unconditionally-opened
+    # <think> with one token) are billed in completion_tokens and correctly have
+    # no entry. So the model-independent contract is the CONCATENATION, which
+    # also catches an off-by-one in position that a count identity cannot.
+    ck("[non-stream] entries concatenate to message.content",
+       "".join(e["token"] for e in ns) == (r["choices"][0]["message"].get("content") or ""),
+       f"joined={''.join(e['token'] for e in ns)[:80]!r} vs content={(r['choices'][0]['message'].get('content') or '')[:80]!r}")
+    ck("[non-stream] entries never exceed completion tokens",
+       len(ns) <= r["usage"]["completion_tokens"],
+       f"{len(ns)} entries vs {r['usage']['completion_tokens']} tokens")
+
+print("── [2/8] temperature must not move the model's own distribution ──")
+# max_tokens=1 is not enough to guarantee a CONTENT token: a model whose template
+# opens <think> unconditionally spends its first token closing it, and that token
+# has no logprobs.content entry (the field describes message.content). Ask for a
+# few and take the first content entry — greedy on both arms, so it is the same
+# token either way, which is exactly what this check is about.
+def first_content_entry(req):
+    ents = (post("/v1/chat/completions", req)["choices"][0].get("logprobs") or {}).get("content") or []
+    if not ents:
+        print("  \033[0;31mFAIL\033[0m  no content logprob entries to compare"); sys.exit(1)
+    return ents[0]
+
+a = first_content_entry({**REQ, "stream": False})
+b = first_content_entry({**REQ, "temperature": 2.0, "top_k": 1, "stream": False})
+ck("same token drawn", a["token"] == b["token"], f"{a['token']!r} vs {b['token']!r}")
+ck("its logprob is temperature-INDEPENDENT", abs(a["logprob"] - b["logprob"]) < 1e-3,
+   f"temp0={a['logprob']} temp2={b['logprob']}")
+ck("distribution not saturated to 0.0 at temp 0",
+   any(abs(t["logprob"]) > 1e-4 for t in a["top_logprobs"][1:]),
+   f"{[round(t['logprob'],6) for t in a['top_logprobs']]}")
+
+print("── [4/8] STREAMING chat must carry the same logprobs ──")
+resp = post("/v1/chat/completions", {**REQ, "stream": True}, stream=True)
+st = []
+for raw in resp:
+    line = raw.decode().strip()
+    if not line.startswith("data: ") or line == "data: [DONE]":
+        continue
+    for ch in json.loads(line[6:]).get("choices", []):
+        c = (ch.get("logprobs") or {}).get("content") or []
+        st.extend(c)
+ck("[stream] logprobs present", bool(st), "streaming emitted NO logprobs")
+if st:
+    entries_ok("stream", st)
+    # The decisive one: same greedy request, so streaming must agree with
+    # non-streaming entry for entry. A partial or duplicated drain fails here.
+    ck("[stream] same entry count as non-streaming", len(st) == len(ns), f"{len(st)} vs {len(ns)}")
+    n = min(len(st), len(ns))
+    tok_mismatch = [i for i in range(n) if st[i]["token"] != ns[i]["token"]]
+    ck("[stream] tokens match non-streaming", not tok_mismatch, f"{tok_mismatch[:5]}")
+    lp_mismatch = [i for i in range(n) if abs(st[i]["logprob"] - ns[i]["logprob"]) > 1e-6]
+    ck("[stream] logprob VALUES match non-streaming", not lp_mismatch, f"{lp_mismatch[:5]}")
+
+print("── [4b] STREAMING + a stop string: entries never run ahead of the delivered content ──")
+# A stop string that spans several tokens makes the stream HOLD a token's tail until the
+# next token decides it; the held token's logprob entry must wait with its bytes.
+if len(chat_text) < 24:
+    ck("[stream+stop] reference answer long enough to carve a stop string from", False, repr(chat_text))
+else:
+    stop = chat_text[len(chat_text) // 3:][:7]
+    resp = post("/v1/chat/completions", {**REQ, "stream": True, "stop": [stop]}, stream=True)
+    text, toks, ahead = "", "", []
+    for raw in resp:
+        line = raw.decode().strip()
+        if not line.startswith("data: ") or line == "data: [DONE]":
+            continue
+        for ch in json.loads(line[6:]).get("choices", []):
+            text += (ch.get("delta") or {}).get("content") or ""
+            toks += "".join(e["token"] for e in ((ch.get("logprobs") or {}).get("content") or []))
+            if not text.startswith(toks):
+                ahead.append((toks[-20:], text[-20:]))
+    ck("[stream+stop] entries never run ahead of the content", not ahead, f"{ahead[:2]}")
+    # The cut lands INSIDE a token: that token's bytes before the cut ship, its entry (for a
+    # token the client never saw whole) does not.
+    ck("[stream+stop] entries describe the delivered content",
+       text.startswith(toks) and len(text.encode()) - len(toks.encode()) <= 16,
+       f"entries {toks[-30:]!r} vs content {text[-30:]!r}")
+    ck("[stream+stop] the stop string never reached the client", stop not in text, repr(stop))
+
+
+print("── [6/8] logprobs describe message.content, not the reasoning we strip ──")
+# OpenAI defines `logprobs.content` as the tokens of the message CONTENT. We
+# built it from the whole generation, so on every model that thinks the array
+# described the reasoning block — text the client never receives — and entry 0
+# was the first token of the thought. Measured on three builds of a 27B,
+# a 35B-A3B, gemma-4-31b, gemma-4-e4b and two others: 37-186
+# entries against 8 characters of content.
+TMSG = [{"role": "user", "content": "The capital of Australia is which city? Reply with just the city."}]
+TREQ = {"model": MODEL, "messages": TMSG, "max_tokens": 300, "temperature": 0,
+        "logprobs": True, "top_logprobs": 5, "enable_thinking": True}
+r = post("/v1/chat/completions", {**TREQ, "stream": False})
+tch = r["choices"][0]
+tcontent = tch["message"].get("content") or ""
+treasoning = tch["message"].get("reasoning_content") or ""
+tents = (tch.get("logprobs") or {}).get("content") or []
+tjoined = "".join(e["token"] for e in tents)
+ck("[think non-stream] logprobs present", bool(tents))
+if tents:
+    ck("[think non-stream] entries reconstruct message.content",
+       tjoined.strip() == tcontent.strip(),
+       f"{len(tents)} entries -> {tjoined[:44]!r} vs content {tcontent[:44]!r}")
+    # Red-on-revert: pre-fix this equalled completion_tokens exactly, because
+    # every generated token got an entry whether or not it survived the split.
+    if treasoning.strip():
+        ck("[think non-stream] reasoning tokens are NOT in the array",
+           len(tents) < r["usage"]["completion_tokens"],
+           f"{len(tents)} entries vs {r['usage']['completion_tokens']} generated"
+           f" ({len(treasoning)} chars of reasoning stripped)")
+    else:
+        print("  \033[33mNOTE\033[0m  model emitted no reasoning; count check skipped")
+
+sc, sents = "", []
+for raw in post("/v1/chat/completions",
+                {**TREQ, "stream": True, "stream_options": {"include_usage": True}}, stream=True):
+    line = raw.decode().strip()
+    if not line.startswith("data: ") or line == "data: [DONE]":
+        continue
+    for ch in json.loads(line[6:]).get("choices", []):
+        sc += (ch.get("delta") or {}).get("content") or ""
+        sents.extend((ch.get("logprobs") or {}).get("content") or [])
+sjoined = "".join(e["token"] for e in sents)
+ck("[think stream] logprobs present", bool(sents), "streaming emitted NO logprobs")
+if sents:
+    # Streaming has its own content (the gate trims differently), so it is held
+    # to ITS deltas — the invariant is that entries describe what was sent.
+    ck("[think stream] entries reconstruct the content deltas",
+       sjoined.strip() == sc.strip(),
+       f"{len(sents)} entries -> {sjoined[:44]!r} vs deltas {sc[:44]!r}")
+
+print("── [7/8] response_format keeps logprobs ──")
+# Entries are the model's raw distribution, so under a grammar the emitted token
+# need not be rank 1; the bar is that every content token has its own entry.
+SCHEMA = {"type": "json_schema", "json_schema": {"name": "d", "strict": True, "schema": {
+    "type": "object", "properties": {"a": {"type": "string", "enum": ["yes", "no"]}},
+    "required": ["a"], "additionalProperties": False}}}
+FMSG = [{"role": "user", "content": "Answer yes or no in JSON: is water wet?"}]
+FREQ = {"model": MODEL, "messages": FMSG, "max_tokens": 40, "temperature": 0,
+        "logprobs": True, "top_logprobs": 3, "enable_thinking": False}
+
+def format_entries_ok(label, ents, content):
+    if not content.strip():
+        print(f"  \033[33mNOTE\033[0m  [{label}] model produced no content; entry checks skipped")
+        return
+    ck(f"[{label}] logprobs present", bool(ents), "none")
+    if not ents:
+        return
+    # The last token may straddle the payload end (`}` plus a trailing byte), and it keeps its entry.
+    joined, content = "".join(e["token"] for e in ents).lstrip(), content.strip()
+    ck(f"[{label}] entries reconstruct the content",
+       joined.startswith(content) and len(joined) - len(content) < max(1, len(ents[-1]["token"])),
+       f"{joined[:44]!r} vs {content[:44]!r}")
+    unpaired = [i for i, e in enumerate(ents) for t in e.get("top_logprobs") or []
+                if t["token"] == e["token"] and abs(t["logprob"] - e["logprob"]) > 1e-4]
+    ck(f"[{label}] each entry describes its own token", not unpaired, f"{unpaired[:5]}")
+
+fr = {}
+for kind, rf in (("json_schema", SCHEMA), ("json_object", {"type": "json_object"})):
+    ch = post("/v1/chat/completions", {**FREQ, "response_format": rf})["choices"][0]
+    fr[kind] = ch
+    format_entries_ok(f"{kind} non-stream", (ch.get("logprobs") or {}).get("content") or [],
+                      ch["message"].get("content") or "")
+
+fc, fents = "", []
+for raw in post("/v1/chat/completions", {**FREQ, "response_format": SCHEMA, "stream": True}, stream=True):
+    line = raw.decode().strip()
+    if not line.startswith("data: ") or line == "data: [DONE]":
+        continue
+    for ch in json.loads(line[6:]).get("choices", []):
+        fc += (ch.get("delta") or {}).get("content") or ""
+        fents.extend((ch.get("logprobs") or {}).get("content") or [])
+format_entries_ok("json_schema stream", fents, fc)
+nsents = (fr["json_schema"].get("logprobs") or {}).get("content") or []
+ck("[json_schema stream] same tokens as non-streaming",
+   bool(fents) and [e["token"] for e in fents] == [e["token"] for e in nsents], f"{len(fents)} vs {len(nsents)}")
+
+ch = post("/v1/chat/completions", {**FREQ, "response_format": SCHEMA, "enable_thinking": True,
+                                   "max_tokens": 1000})["choices"][0]
+format_entries_ok("json_schema thinking", (ch.get("logprobs") or {}).get("content") or [],
+                  ch["message"].get("content") or "")
+
+print("── [8/8] every response body is valid UTF-8 ──")
+ck("no response carried a split multi-byte token as raw bytes", not utf8_bad,
+   f"{len(utf8_bad)} bodies failed to decode: {utf8_bad[:2]}")
+
+print(f"\n{checks - len(fails)}/{checks} passed")
+if fails:
+    print("FAILED:"); [print("  -", f) for f in fails]
+sys.exit(1 if fails else 0)
+PY
+rc=$?
+[ $rc -eq 0 ] && echo "✅ logprobs contract holds on all surfaces" || echo "❌ logprobs contract broken"
+exit $rc
