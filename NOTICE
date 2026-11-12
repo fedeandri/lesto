@@ -164,7 +164,10 @@ https://github.com/ml-explore/mlx
 Copyright (c) 2023 Apple Inc.
 
 Vendored source tree at `lib/mlx-src`, built by `scripts/build-mlx.sh` and linked
-into the lesto binary, without changes.
+into the lesto binary. Modified in two places: MLX PR 4516's affine input sums in
+float (`kernels/quantized.h`, `kernels/quantized_nax.h`), and a per-thread switch
+for the command-buffer byte limit with a commit count (`backend/metal/device.cpp`,
+`device.h`).
 
 Separately, Metal source from MLX was ported into `src/transformer.zig`: the
 fused head-dim-256 prefill attention kernel (`msv_attn_p256`) began as a
@@ -185,6 +188,11 @@ MLX ops (reduction order, accumulator dtype, `fast::exp`, the `precise::rsqrt`
 variant) so a fused kernel stays bit-identical to the op chain it replaces.
 Those are our own implementations written against MLX's observable behaviour,
 not copies of its source.
+
+`src/kernels/moe_prefill_fused.metal` adapts MLX's `affine_gather_qmm_rhs`
+(`kernels/quantized.h`) and its steel block loader and matmul, and
+`src/moe_prefill_fused.zig` embeds MLX's steel and quantized headers from the
+vendored tree (Copyright (c) 2023-2025 Apple Inc., MIT License).
 
 `src/kernels/gather_qmm_nax_header.metal` adapts the NAX matmul fragment and
 MMA helpers from MLX's `steel/gemm/nax.h` (Copyright (c) 2025 Apple Inc., MIT
@@ -217,7 +225,8 @@ Copyright (c) 2023 ml-explore
 Vendored source tree at `lib/mlxc-src`, built by `scripts/build-mlx.sh` and linked
 into the lesto binary. Taken from an upstream commit chosen for compatibility
 with the vendored MLX version. Modified by one upstream compile fix,
-`patches/mlxc-gather-qmm-global-scale.patch`.
+`patches/mlxc-gather-qmm-global-scale.patch`, and by Lesto's own additions in
+`mlx/c/array.cpp` and `mlx/c/metal.cpp`.
 
 --------------------------------------------------------------------------------
 nlohmann/json

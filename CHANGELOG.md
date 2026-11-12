@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.21.1
+
+- On macOS 14, the first request no longer fails with HTTP 500. The fused MoE prefill kernel now compiles there, and a failed warm-up or compile at load switches its path off and clears its own error, instead of leaving it for the first request to report.
+- A streamed reply sends a character the model writes as several byte tokens (an emoji outside the vocabulary, for example) whole, instead of one U+FFFD per byte.
+
+## 0.21.0
+
+- `MLX_SERVE_TOPK_SCHEDULE=<k1>:<n>:<k2>` routes each request's prompt and first n reply tokens to k1 experts and the later ones to k2. On Gemma 4's 26B-A4B (8 experts by default), `8:4:6` decodes about 7.4% faster and keeps the reply format; replies change, so it is off unless set. The count is per server, which fits one user at a time.
+
+## 0.20.0
+
+- A thread keeps one CPU core busy while chat turns are served and for 500 ms after, so the performance cores stay clocked up while decoding waits on the GPU: faster decoding and a faster first token on a follow-up turn, with replies unchanged. It costs about 0.4 W of CPU power while a turn is served. `MLX_SERVE_KEEP_WARM_OFF=1` turns it off; `MLX_SERVE_KEEP_WARM_MS` sets the window.
+
+## 0.19.0
+
+- One-token decode steps commit on MLX's ops limit alone, for faster decoding with replies unchanged. A turn sent at once after the previous one sees its first token about 14 ms later. `MLX_SERVE_DECODE_OPS_ONLY_COMMIT_OFF=1` keeps the byte limit.
+- `NOTICE` states the changes to the vendored MLX and mlx-c, and names the kernel adapted from MLX.
+
+## 0.18.0
+
+- Prompt reading is faster on Gemma 4's 26B-A4B, with replies unchanged: a short MoE prefill runs one eval for the layer loop, the fused expert reduce admits hidden 2816, and gate, up and GeGLU run in one kernel. Each has a switch, listed in `docs/changes-from-mlx-serve.md`.
+
 ## 0.17.1
 
 First public version.

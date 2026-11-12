@@ -119,3 +119,20 @@ extern "C" int mlx_lesto_written_in_place(
   }
   return 0;
 }
+
+// ── Lesto's addition to mlx-c: the byte limit on a command buffer off for what the calling thread encodes ──
+extern "C" int mlx_lesto_commit_on_ops_limit_only(bool on) {
+#ifdef MLX_LESTO_WRITTEN_IN_PLACE_METAL
+  mlx::core::metal::set_commit_on_ops_limit_only(on);
+#else
+  (void)on;
+#endif
+  return 0;
+}
+extern "C" uint64_t mlx_lesto_command_buffers_committed(void) {
+#ifdef MLX_LESTO_WRITTEN_IN_PLACE_METAL
+  return mlx::core::metal::command_buffers_committed();
+#else
+  return 0;
+#endif
+}

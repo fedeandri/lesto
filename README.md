@@ -13,7 +13,7 @@ On an M4 Pro, one user at a time, Lesto decodes Gemma 4 26B-A4B 17 to 26% faster
 
 ## Speed
 
-Gemma 4 26B-A4B, `mlx-community`'s standard 4-bit checkpoint unless the row says otherwise. Each engine ran with its default flags, one at a time, serving one user at a time: 15 cold requests per prompt size for a 200-token reply. M4 Pro, 20 GPU cores, 64 GB, macOS 26.7.2, on 2026-11-06.
+Gemma 4 26B-A4B, `mlx-community`'s standard 4-bit checkpoint unless the row says otherwise. Each engine ran with its default flags, one at a time, serving one user at a time: 15 cold requests per prompt size for a 200-token reply. M4 Pro, 20 GPU cores, 64 GB, macOS 26.7.2, on 2026-11-06. The table was measured with Lesto 0.17.1; later releases are compared with the one before them on the same machine, and [CHANGELOG.md](CHANGELOG.md) says what each one changed.
 
 | Engine | Decode tok/s, 1k / 8k | First text s, 1k / 8k | 200-token reply s, 1k / 8k | First text on later turns s, 1k / 8k |
 |---|---:|---:|---:|---:|

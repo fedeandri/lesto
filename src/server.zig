@@ -1,4 +1,5 @@
 const std = @import("std");
+const keep_warm = @import("keep_warm.zig");
 const crt = @import("crt.zig");
 const builtin = @import("builtin");
 const mlx = @import("mlx.zig");
@@ -1754,6 +1755,7 @@ const ConnThreadArgs = struct {
 };
 
 fn handleConnectionThread(args: *ConnThreadArgs) void {
+    keep_warm.touch();
     // Decrement LAST (declared first → runs after every other defer), so the
     // shutdown drain in `serve` only sees this thread leave once it has fully
     // returned from `complete()` and closed its socket.
@@ -3394,6 +3396,10 @@ fn growCoexistBytes(config: *const model_mod.ModelConfig, warm: WarmPrefix, seq:
     if (!warm.grows(seq)) return 0;
     const attn: u32 = config.num_hidden_layers;
     if (attn == 0) return 0;
+    // A MoE runs a forward under 1024 tokens with one eval for the whole layer loop, and any append
+    // can have one (a short last chunk), so bill it the whole old cache: an upper bound, and the
+    // plain one (a per-chunk width rule misses checkpoint-aligned first chunks).
+    if (transformer_mod.Transformer.moeShortPrefillSkipsCadence(config)) return warm.capacity_tokens *| kv_per_tok;
     const span: u64 = seq -| warm.matched_tokens;
     const window: u32 = if (transformer_mod.Transformer.prefillEvalCadenceApplies(@intCast(@min(span, 1 << 20))))
         attnLayersPerEvalWindow(config, transformer_mod.Transformer.MOE_EVAL_EVERY_N_LAYERS)
@@ -3488,7 +3494,7 @@ fn prefillStreamBytesPerTokenOn(config: *const model_mod.ModelConfig, nax: bool)
     _ = nax;
     var per_tok: u64 = 0;
     if (config.isMoe()) {
-        const top_k: u64 = @max(@as(u64, config.num_experts_per_tok), 1);
+        const top_k: u64 = @max(@as(u64, config.num_experts_per_tok), @as(u64, transformer_mod.Transformer.topKScheduleMaxK(config)), 1);
         per_tok += MOE_PREFILL_COEXIST * top_k * 2 *
             (@as(u64, config.hidden_size) + config.moe_intermediate_size) * 2;
     }
@@ -3509,7 +3515,7 @@ fn prefillDequantWeightBytes(config: *const model_mod.ModelConfig) u64 {
 }
 
 fn prefillFfnWidth(config: *const model_mod.ModelConfig) u64 {
-    const per_tok: u64 = @max(@as(u64, config.num_experts_per_tok), 1);
+    const per_tok: u64 = @max(@as(u64, config.num_experts_per_tok), @as(u64, transformer_mod.Transformer.topKScheduleMaxK(config)), 1);
     const moe_w: u64 = @as(u64, config.moe_intermediate_size) * per_tok +
         config.shared_expert_intermediate_size;
     const dense_w: u64 = if (config.intermediate_size_declared) config.intermediate_size else 0;
@@ -7765,8 +7771,8 @@ fn handleStreamingGeneration(
         // then strip any new trailing incomplete bytes into the carry buffer.
         var token_text = if (next_id) |token_id| blk: {
             try lps.note(token_id);
-            const strip = tok.tok_type == .sentencepiece_bpe;
-            const raw_decoded = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, strip and false);
+            // Byte tokens come back raw so the carry below can join a multi-byte character.
+            const raw_decoded = try tok.decodeStreamPiece(allocator, token_id);
             if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
             // Step 1: prepend carry-over from previous token
             const with_carry = if (utf8_carry_len > 0) cc: {
@@ -7791,11 +7797,18 @@ fn handleStreamingGeneration(
                 continue;
             }
 
-            // Step 4: if we trimmed trailing bytes, reallocate to the complete prefix
-            if (tail > 0) {
-                const trimmed = try allocator.dupe(u8, with_carry[0 .. with_carry.len - tail]);
+            // Step 4: send the complete prefix. Raw byte tokens can form an invalid sequence
+            // (a stray continuation byte): each such byte becomes '?', never invalid JSON text.
+            // One byte for one byte, so the logprob and constrained-delivery byte counts, which
+            // note each token's raw length, still match what is sent.
+            const complete = with_carry[0 .. with_carry.len - tail];
+            if (tail > 0 or !std.unicode.utf8ValidateSlice(complete)) {
+                const fixed = utf8Replaced(allocator, complete) catch |e| {
+                    allocator.free(with_carry);
+                    return e;
+                };
                 allocator.free(with_carry);
-                break :blk trimmed;
+                break :blk fixed;
             }
 
             break :blk with_carry;
@@ -8356,7 +8369,8 @@ const StreamLogprobs = struct {
     fn note(self: *StreamLogprobs, id: u32) !void {
         if (!self.enabled) return;
         try self.ids.append(self.allocator, id);
-        const text = self.tok.decode(self.allocator, &[_]u32{id}, false) catch "";
+        // The stream's own decode, so a byte token counts the one byte the stream sends.
+        const text = self.tok.decodeStreamPiece(self.allocator, id) catch "";
         defer if (text.len > 0) self.allocator.free(text);
         try self.lens.append(self.allocator, text.len);
         self.bytes_noted += text.len;
@@ -9699,6 +9713,36 @@ fn sendErrorResponse(allocator: std.mem.Allocator, stream: *Conn, status: []cons
     , .{ escaped_msg, err_type, code_str });
     defer allocator.free(body);
     try sendResponse(stream, status, "application/json", body);
+}
+
+/// A copy of `s`, the same length, with every byte that does not start a valid UTF-8
+/// sequence replaced by '?'. Length-preserving on purpose: the stream's byte accounting
+/// counts raw token bytes (U+FFFD would add two bytes per replaced byte). Caller frees.
+fn utf8Replaced(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < s.len) {
+        const n = std.unicode.utf8ByteSequenceLength(s[i]) catch 0;
+        if (n > 0 and i + n <= s.len and std.unicode.utf8ValidateSlice(s[i .. i + n])) {
+            try out.appendSlice(allocator, s[i .. i + n]);
+            i += n;
+        } else {
+            try out.append(allocator, '?');
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "utf8Replaced keeps valid text and replaces stray bytes one for one" {
+    const a = testing.allocator;
+    const ok = try utf8Replaced(a, "ciao \xF0\x9F\x87\xAE\xF0\x9F\x87\xB9!");
+    defer a.free(ok);
+    try testing.expectEqualStrings("ciao \xF0\x9F\x87\xAE\xF0\x9F\x87\xB9!", ok);
+    const bad = try utf8Replaced(a, "a\x80\xFFb");
+    defer a.free(bad);
+    try testing.expectEqualStrings("a??b", bad);
 }
 
 /// Returns the number of trailing bytes that form an incomplete UTF-8 sequence.
@@ -13680,6 +13724,22 @@ const CheckoutCase = struct {
         };
     }
 };
+
+test "growCoexistBytes: a MoE is billed the whole old cache on a growing append" {
+    // The switch turns the predicate off for the whole process (cached env read): nothing to test then.
+    if (std.c.getenv("MLX_SERVE_MOE_SHORT_PREFILL_ONE_EVAL_OFF") != null) return error.SkipZigTest;
+    // Its short forwards run without the mid-loop cadence, so the old buffer can live the whole loop.
+    const t = std.testing;
+    var cfg = model_mod.ModelConfig{};
+    cfg.num_hidden_layers = 30;
+    cfg.num_experts = 128;
+    const kv: u64 = 1000;
+    const warm = WarmPrefix{ .matched_tokens = 6000, .capacity_tokens = 6000, .will_donate = true };
+    try t.expectEqual(6000 * kv, growCoexistBytes(&cfg, warm, 6300, kv));
+    try t.expectEqual(6000 * kv, growCoexistBytes(&cfg, warm, 10096, kv));
+    // Not growing: nothing.
+    try t.expectEqual(@as(u64, 0), growCoexistBytes(&cfg, warm, 5000, kv));
+}
 
 test "pinnedResidentBytes names the entry a restore would share, and only that" {
     const t = std.testing;

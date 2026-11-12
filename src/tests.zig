@@ -4,6 +4,7 @@
 test {
     _ = @import("io_util.zig");
     _ = @import("log.zig");
+    _ = @import("keep_warm.zig");
     _ = @import("os_mutex.zig");
     _ = @import("crt.zig");
     _ = @import("version.zig");

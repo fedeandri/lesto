@@ -742,6 +742,37 @@ fn cachedScalarInt(v: c_int) mlx.mlx_array {
     return arr;
 }
 
+test "top-k schedule: parse k1:n:k2, refuse malformed or zero k" {
+    const p = Transformer.parseTopKSchedule("8:16:6").?;
+    try std.testing.expectEqual(@as(u32, 8), p.k1);
+    try std.testing.expectEqual(@as(u32, 16), p.n);
+    try std.testing.expectEqual(@as(u32, 6), p.k2);
+    try std.testing.expectEqual(@as(u32, 0), Transformer.parseTopKSchedule("8:0:6").?.n);
+    for ([_][]const u8{ "", "8", "8:4", "8:4:6:1", "0:4:6", "8:4:0", "8:x:6", "-1:4:6" }) |bad|
+        try std.testing.expect(Transformer.parseTopKSchedule(bad) == null);
+}
+
+test "top-k schedule: a prompt resets the count, the first n reply forwards keep k1, later ones k2" {
+    const sch = Transformer.TopKSchedule{ .k1 = 8, .n = 2, .k2 = 6 };
+    var fw: u32 = 0;
+    var ks: [5]u32 = undefined;
+    // after a prompt forward (seq > 1) resets the count: five one-token forwards
+    for (&ks) |*k| {
+        k.* = Transformer.scheduleK(sch, fw);
+        fw +|= 1;
+    }
+    try std.testing.expectEqualSlices(u32, &.{ 8, 8, 6, 6, 6 }, &ks);
+    try std.testing.expectEqual(@as(u32, 6), Transformer.scheduleK(.{ .k1 = 8, .n = 0, .k2 = 6 }, 0));
+}
+
+test "top-k schedule: refused for a model whose expert count either k exceeds" {
+    var cfg = ModelConfig{};
+    cfg.num_experts = 128;
+    try std.testing.expect(Transformer.scheduleFits(.{ .k1 = 8, .n = 4, .k2 = 6 }, &cfg));
+    try std.testing.expect(!Transformer.scheduleFits(.{ .k1 = 129, .n = 4, .k2 = 6 }, &cfg));
+    try std.testing.expect(!Transformer.scheduleFits(.{ .k1 = 8, .n = 4, .k2 = 4096 }, &cfg));
+}
+
 test "vqmm scalar cache never evicts a scalar the caller is still holding" {
     // The live crash, as a pure decision: every verifyQmm-family call site
     // takes K then N back to back and holds BOTH handles in one `inputs_arr`.
@@ -2834,6 +2865,8 @@ const QuantMode = model_mod.QuantMode;
 const moe_fp4 = @import("moe_fp4.zig");
 const mxfp8_qmv = @import("mxfp8_qmv.zig");
 const moe_affine4 = @import("moe_affine4.zig");
+/// The MoE prefill expert kernels without NAX (MLX_SERVE_MOE_PREFILL_FUSED_OFF=1 restores the stock path).
+const moe_prefill_fused = @import("moe_prefill_fused.zig");
 const Weights = model_mod.Weights;
 
 // ── KV Cache (standard attention) ──
@@ -5920,6 +5953,12 @@ pub const Transformer = struct {
     // Compiled forward pass closure (JIT-compiled for Metal kernel fusion)
     compiled_forward: ?mlx.mlx_closure = null,
 
+    // Lesto: top-k schedule (MLX_SERVE_TOPK_SCHEDULE, `topKSchedule`). One-token forwards since the request's prompt
+    // (`beginTopKPrefill`: the reply tokens so far), and the experts per token the next forward routes to (0: the config's).
+    decode_forwards: u32 = 0,
+    topk_active: u32 = 0,
+    topk_prefilling: bool = false,
+
     // Vision: set before prefill when images are present, cleared after.
     // Shape: [B, num_image_tokens, hidden_size]. Spliced at image_token_id positions.
     vision_embeddings: ?mlx.mlx_array = null,
@@ -6533,6 +6572,8 @@ pub const Transformer = struct {
 
     /// Create a compiled version of the forward pass for faster decode.
     pub fn compileForward(self: *Transformer) void {
+        // A failed compile falls back to the uncompiled path; the MLX error it latched must not fail the first request.
+        const had_error = mlx.errorPending();
         const raw_closure = mlx.mlx_closure_new_func_payload(
             &forwardClosureCallback,
             @ptrCast(self),
@@ -6546,12 +6587,15 @@ pub const Transformer = struct {
             log.info("Forward pass compiled (Metal kernel fusion enabled)\n", .{});
         } else {
             log.warn("Forward compilation failed, using uncompiled path\n", .{});
+            mlx.dropLatchedErrorUnless(had_error);
         }
     }
 
     /// Compile GELU activation for kernel fusion.
     /// Fuses 8 separate ops into 1 GPU kernel, matching mlx-lm's @mx.compile behavior.
     pub fn compileGelu(self: *Transformer) void {
+        // A failed compile falls back to the uncompiled path; the MLX error it latched must not fail the first request.
+        const had_error = mlx.errorPending();
         const raw_closure = mlx.mlx_closure_new_func_payload(
             &geluClosureCallback,
             @ptrCast(self),
@@ -6565,6 +6609,7 @@ pub const Transformer = struct {
             log.info("GELU compiled (kernel fusion enabled)\n", .{});
         } else {
             log.warn("GELU compilation failed, using uncompiled path\n", .{});
+            mlx.dropLatchedErrorUnless(had_error);
         }
     }
 
@@ -6573,6 +6618,8 @@ pub const Transformer = struct {
     /// the op chain's intermediate rounding (a same-binary greedy A/B diverged
     /// at token ~55), so silu gets the bit-exact `fusedSwiGLU` kernel instead.
     pub fn compileGeglu(self: *Transformer) void {
+        // A failed compile falls back to the uncompiled path; the MLX error it latched must not fail the first request.
+        const had_error = mlx.errorPending();
         const raw_closure = mlx.mlx_closure_new_func_payload(
             &gegluClosureCallback,
             @ptrCast(self),
@@ -6584,6 +6631,9 @@ pub const Transformer = struct {
         if (rc == 0 and compiled.ctx != null) {
             self.compiled_geglu = compiled;
             log.info("GeGLU compiled (kernel fusion enabled)\n", .{});
+        } else {
+            log.warn("GeGLU compilation failed, using uncompiled path\n", .{});
+            mlx.dropLatchedErrorUnless(had_error);
         }
     }
 
@@ -6613,6 +6663,8 @@ pub const Transformer = struct {
 
     /// Compile logit softcap: tanh(x/cap) * cap → single fused kernel.
     pub fn compileSoftcap(self: *Transformer) void {
+        // A failed compile falls back to the uncompiled path; the MLX error it latched must not fail the first request.
+        const had_error = mlx.errorPending();
         const raw_closure = mlx.mlx_closure_new_func_payload(
             &softcapClosureCallback,
             @ptrCast(self),
@@ -6624,6 +6676,9 @@ pub const Transformer = struct {
         if (rc == 0 and compiled.ctx != null) {
             self.compiled_softcap = compiled;
             log.info("Softcap compiled (kernel fusion enabled)\n", .{});
+        } else {
+            log.warn("Softcap compilation failed, using uncompiled path\n", .{});
+            mlx.dropLatchedErrorUnless(had_error);
         }
     }
 
@@ -6673,6 +6728,8 @@ pub const Transformer = struct {
     /// (decode seq_len=1, prefill seq_len=N), so the trace cost amortizes after
     /// the first prefill + first decode.
     pub fn compileMoeRouting(self: *Transformer) void {
+        // A failed compile falls back to the uncompiled path; the MLX error it latched must not fail the first request.
+        const had_error = mlx.errorPending();
         const raw_closure = mlx.mlx_closure_new_func_payload(
             &moeRoutingClosureCallback,
             @ptrCast(self),
@@ -6684,6 +6741,9 @@ pub const Transformer = struct {
         if (rc == 0 and compiled.ctx != null) {
             self.compiled_moe_routing = compiled;
             log.info("MoE routing compiled (kernel fusion enabled)\n", .{});
+        } else {
+            log.warn("MoE routing compilation failed, using uncompiled path\n", .{});
+            mlx.dropLatchedErrorUnless(had_error);
         }
     }
 
@@ -6702,7 +6762,7 @@ pub const Transformer = struct {
     /// branches on per-layer weights at model-load time.
     fn moeRoutingClosureCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
         const self: *Transformer = @ptrCast(@alignCast(payload.?));
-        const k: c_int = @intCast(self.config.num_experts_per_tok);
+        const k: c_int = self.topK();
 
         var router_logits = mlx.mlx_array_new();
         if (mlx.mlx_vector_array_get(&router_logits, input, 0) != 0) return -1;
@@ -6727,7 +6787,7 @@ pub const Transformer = struct {
     /// Apply the compiled MoE routing closure if available, else fall back.
     /// Returns owned `inds` + `norm_scores` - caller must free both.
     fn computeMoeRouting(self: *const Transformer, router_logits: mlx.mlx_array, gate: ?RouterGate) !MoeRouting {
-        const k: c_int = @intCast(self.config.num_experts_per_tok);
+        const k: c_int = self.topK();
         if (try moeRouterTopK(
             self.s,
             router_logits,
@@ -6741,7 +6801,10 @@ pub const Transformer = struct {
             0,
             gate,
         )) |fused| return fused;
-        if (self.compiled_moe_routing) |compiled| {
+        // The compiled closure re-traces per shape only, so a k that changes between same-shaped forwards would keep the
+        // old trace: under a schedule the routing runs uncompiled.
+        if (self.compiled_moe_routing != null and topKSchedule() == null) {
+            const compiled = self.compiled_moe_routing.?;
             const in_arr = [_]mlx.mlx_array{router_logits};
             const in_vec = mlx.mlx_vector_array_new_data(&in_arr, 1);
             defer _ = mlx.mlx_vector_array_free(in_vec);
@@ -7891,6 +7954,33 @@ pub const Transformer = struct {
         return seq_len >= PREFILL_EVAL_MIN_SEQ;
     }
 
+    /// The MoE forward's own gate, for the configs `moeShortPrefillSkipsCadence` admits. The mid-loop
+    /// cadence bounds the GB-scale transients of a wide prefill chunk; a warm turn's prefill of a few
+    /// hundred tokens has MB-scale ones, and its blocking drains (every 4 layers) leave the GPU idle
+    /// while the host encodes the next buffer. A 2048-token chunk keeps the cadence.
+    pub fn moePrefillEvalCadenceApplies(seq_len: c_int) bool {
+        return seq_len >= MOE_PREFILL_EVAL_CADENCE_MIN_SEQ;
+    }
+
+    const MOE_PREFILL_EVAL_CADENCE_MIN_SEQ: c_int = 1024;
+
+    /// The configs whose MoE forward takes `moePrefillEvalCadenceApplies`. The server's
+    /// `growCoexistBytes` reads the same predicate and bills them the whole old cache on a growing
+    /// append, so the switch restores the loop and the admission bill together.
+    pub fn moeShortPrefillSkipsCadence(cfg: *const ModelConfig) bool {
+        return !moeShortPrefillOneEvalOff() and cfg.isMoe();
+    }
+
+    /// MLX_SERVE_MOE_SHORT_PREFILL_ONE_EVAL_OFF=1 restores the mid-loop cadence on short MoE prefills.
+    fn moeShortPrefillOneEvalOff() bool {
+        const S = struct {
+            var v: ?bool = null;
+        };
+        if (S.v) |b| return b;
+        S.v = std.c.getenv("MLX_SERVE_MOE_SHORT_PREFILL_ONE_EVAL_OFF") != null;
+        return S.v.?;
+    }
+
     /// The mid-loop eval of a prefill chunk's residual stream.
     fn evalCadencePoint(h: mlx.mlx_array) !void {
         try mlx.check(mlx.mlx_array_eval(h));
@@ -8054,8 +8144,129 @@ pub const Transformer = struct {
         return self.forwardWith(&ctx, token_ids);
     }
 
+    /// MLX_SERVE_TOPK_SCHEDULE=<k1>:<n>:<k2> a request's prompt and its first n one-token forwards route
+    /// to k1 experts per token, every later one-token forward to k2. A forward of more than one token after the prompt (a
+    /// speculative verify) routes at the current count and is not counted. Unset or malformed: the config's experts per token throughout. One user at a time: batched decode
+    /// and speculative verify share the count, so the schedule is for single-user serving.
+    pub const TopKSchedule = struct { k1: u32, n: u32, k2: u32 };
+    pub fn topKSchedule() ?TopKSchedule {
+        const S = struct {
+            var state: std.atomic.Value(u8) = .init(0); // 0 unread, 1 none, 2 set, 3 being written
+            var v: TopKSchedule = .{ .k1 = 0, .n = 0, .k2 = 0 };
+        };
+        while (true) {
+            switch (S.state.load(.acquire)) {
+                2 => return S.v,
+                1 => return null,
+                3 => std.atomic.spinLoopHint(),
+                else => {
+                    // Only the thread that moves the state from 0 to 3 writes S.v, then publishes it with a release store.
+                    if (S.state.cmpxchgStrong(0, 3, .acq_rel, .acquire) != null) continue;
+                    const parsed = parseTopKSchedule(if (std.c.getenv("MLX_SERVE_TOPK_SCHEDULE")) |r| std.mem.span(r) else "");
+                    if (parsed) |p| {
+                        S.v = p;
+                        S.state.store(2, .release);
+                        log.info("[topk-schedule] {d} experts for the prompt and the first {d} reply tokens, then {d} (MLX_SERVE_TOPK_SCHEDULE)\n", .{ p.k1, p.n, p.k2 });
+                        return p;
+                    }
+                    S.state.store(1, .release);
+                    return null;
+                },
+            }
+        }
+    }
+
+    /// The largest k the schedule routes to on this model (the server's prefill memory admission bills it): 0 without a
+    /// schedule or when `scheduleFits` refuses it for the model, as routing then keeps the config's k.
+    pub fn topKScheduleMaxK(config: *const ModelConfig) u32 {
+        const sch = topKSchedule() orelse return 0;
+        if (!scheduleFits(sch, config)) return 0;
+        return @max(sch.k1, sch.k2);
+    }
+
+    /// A schedule applies to a model only when neither k exceeds its expert count.
+    pub fn scheduleFits(sch: TopKSchedule, config: *const ModelConfig) bool {
+        return config.num_experts == 0 or (sch.k1 <= config.num_experts and sch.k2 <= config.num_experts);
+    }
+
+    pub fn parseTopKSchedule(raw: []const u8) ?TopKSchedule {
+        var it = std.mem.splitScalar(u8, raw, ':');
+        const a = it.next() orelse return null;
+        const b = it.next() orelse return null;
+        const c = it.next() orelse return null;
+        if (it.next() != null) return null;
+        const k1 = std.fmt.parseInt(u32, a, 10) catch return null;
+        const n = std.fmt.parseInt(u32, b, 10) catch return null;
+        const k2 = std.fmt.parseInt(u32, c, 10) catch return null;
+        // k past the model's expert count is refused per model in `applyTopKSchedule`; this bounds it for the c_int cast.
+        if (k1 == 0 or k2 == 0 or k1 > 4096 or k2 > 4096) return null;
+        return .{ .k1 = k1, .n = n, .k2 = k2 };
+    }
+
+    /// A request's prompt starts (`Generator.initWithOptions`, which every request goes through): the count restarts and
+    /// every forward until `endTopKPrefill` (right after the prompt's last forward) is the prompt's, a one-token tail after
+    /// a prefix-cache hit included.
+    pub fn beginTopKPrefill(self: *Transformer) void {
+        self.decode_forwards = 0;
+        self.topk_prefilling = true;
+    }
+
+    pub fn endTopKPrefill(self: *Transformer) void {
+        self.topk_prefilling = false;
+    }
+
+    /// k for the one-token forward that follows `decode_forwards` earlier ones of the same request.
+    pub fn scheduleK(sch: TopKSchedule, decode_forwards: u32) u32 {
+        return if (decode_forwards < sch.n) sch.k1 else sch.k2;
+    }
+
+    /// The schedule's k for the forward about to run on `token_ids`, kept in `topk_active` for the routing.
+    fn applyTopKSchedule(self: *Transformer, token_ids: mlx.mlx_array) void {
+        const sch = topKSchedule() orelse return;
+        if (!scheduleFits(sch, &self.config)) {
+            const S = struct {
+                var warned = std.atomic.Value(bool).init(false);
+            };
+            if (!S.warned.swap(true, .acq_rel)) log.warn("[topk-schedule] ignored: k {d} or {d} exceeds the model's {d} experts\n", .{ sch.k1, sch.k2, self.config.num_experts });
+            return;
+        }
+        const shape = mlx.getShape(token_ids);
+        const seq: i64 = if (shape.len >= 2) shape[shape.len - 1] else if (shape.len == 1) shape[0] else 1;
+        if (self.topk_prefilling) {
+            self.topk_active = sch.k1;
+            const S = struct {
+                var logged = std.atomic.Value(bool).init(false);
+            };
+            if (!S.logged.swap(true, .acq_rel)) log.info("[topk-schedule] prompt forward routed to {d} experts\n", .{sch.k1});
+            return;
+        }
+        // A multi-token forward after the prompt (a speculative verify) routes at the current count and does not advance
+        // it: the tokens it accepts are not known here, so under speculative decoding the switch to k2 comes late.
+        if (seq > 1) {
+            self.topk_active = scheduleK(sch, self.decode_forwards);
+            return;
+        }
+        const k = scheduleK(sch, self.decode_forwards);
+        if (k != self.topk_active and self.decode_forwards == sch.n and sch.k1 != sch.k2) {
+            const S = struct {
+                var logged = std.atomic.Value(bool).init(false);
+            };
+            if (!S.logged.swap(true, .acq_rel)) log.info("[topk-schedule] switched to {d} experts after {d} reply tokens\n", .{ k, sch.n });
+        }
+        self.topk_active = k;
+        self.decode_forwards +|= 1;
+    }
+
+    /// Experts per token for the next routing: the schedule's when it is set, else the config's.
+    fn topK(self: *const Transformer) c_int {
+        return @intCast(if (self.topk_active != 0) self.topk_active else self.config.num_experts_per_tok);
+    }
+
     pub fn forwardWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
-        if (self.moe_layers != null) return self.forwardMoeWith(ctx, token_ids);
+        if (self.moe_layers != null) {
+            self.applyTopKSchedule(token_ids);
+            return self.forwardMoeWith(ctx, token_ids);
+        }
         return self.forwardStandardWith(ctx, token_ids);
     }
 
@@ -8222,6 +8433,11 @@ pub const Transformer = struct {
             }
             _ = mlx.mlx_clear_cache();
             try self.resetCache();
+        }
+        // Build the MoE prefill kernels here, not inside the first prompt.
+        if (self.config.hidden_act == .gelu_approx and self.config.num_experts > 0 and !verifyQmmNaxAvailable() and !moe_prefill_fused.off()) {
+            moe_prefill_fused.warmOrDisable(self.s);
+            _ = mlx.mlx_clear_cache();
         }
     }
 
@@ -9652,6 +9868,21 @@ pub const Transformer = struct {
             @as(u64, @intCast(offset)) + @as(u64, @intCast(seq_len)),
             ctx.cache.config.scheme != .off,
         );
+        // A short MoE prefill runs one eval for the loop only where no cadence-bounded transient is at
+        // stake: no quantized KV (no per-layer dense views), the budget kept the default cadence (no
+        // memory pressure), and too few rows for the dequantized-weight route.
+        const moe_short_no_cadence = moeShortPrefillSkipsCadence(cfg) and ctx.cache.config.scheme == .off and
+            moe_eval_cadence == PREFILL_EVAL_CADENCE_DEFAULT and
+            @as(usize, @intCast(seq_len)) < prefillDqGemmMinRows(cfg.quant_bits);
+        if (is_prefill and moe_short_no_cadence and !moePrefillEvalCadenceApplies(seq_len) and prefillEvalCadenceApplies(seq_len)) {
+            const Once = struct {
+                var logged = false;
+            };
+            if (!Once.logged) {
+                Once.logged = true;
+                log.info("[moe] short prefill runs one eval for the layer loop: seq={d} (MLX_SERVE_MOE_SHORT_PREFILL_ONE_EVAL_OFF=1 restores the cadence)\n", .{seq_len});
+            }
+        }
 
         // DIAGNOSTIC (MLX_SERVE_LAYER_CAP=N): run only the first N layers, so a
         // ms-vs-N sweep separates the forward's per-layer slope from its fixed
@@ -9704,7 +9935,7 @@ pub const Transformer = struct {
                 }
             }
 
-            if (is_prefill and prefillEvalCadenceApplies(seq_len) and ((layer_idx + 1) % moe_eval_cadence == 0 or layer_idx + 1 == layerCap(cfg.num_hidden_layers))) {
+            if (is_prefill and (if (moe_short_no_cadence) moePrefillEvalCadenceApplies(seq_len) else prefillEvalCadenceApplies(seq_len)) and ((layer_idx + 1) % moe_eval_cadence == 0 or layer_idx + 1 == layerCap(cfg.num_hidden_layers))) {
                 try evalCadencePoint(h);
             } else if (ctx.pipeline_build > 0 and (layer_idx + 1) % ctx.pipeline_build == 0 and layer_idx + 1 < n_layers) {
                 const v = mlx.mlx_vector_array_new_value(h);
@@ -10719,7 +10950,7 @@ pub const Transformer = struct {
         }
         const qp = self.quantParamsHinted(mw.router_w, mw.router_s, lastDim(normed));
         if (qp.mode != .affine or qp.bits != 8) return null;
-        const k: c_int = @intCast(cfg.num_experts_per_tok);
+        const k: c_int = self.topK();
         const got = (try routerQmv8TopK(self.s, normed, mw.router_w, mw.router_s, mw.router_b, qp.group_size, k)) orelse return null;
         defer _ = mlx.mlx_array_free(got.logits);
         if (routerQmv8Check()) try routerQmv8Compare(self.s, got, chain_logits, k);
@@ -11129,6 +11360,67 @@ pub const Transformer = struct {
                     }
                 }
             }
+            // Without NAX, gate+up+GeGLU in one kernel through the row map and down, both at 32-row tiles
+            // (moe_prefill_fused.zig), where MLX runs its sorted row-block kernel and an expert averages 32 rows or
+            // more. Bit-identical by construction (each output keeps MLX's K order and float accumulation).
+            var fused_offs: ?mlx.mlx_array = null;
+            defer if (fused_offs) |value| {
+                _ = mlx.mlx_array_free(value);
+            };
+            if (fused_act == null and mapped_gate == null and !nax_available and !moe_prefill_fused.off() and
+                mlx.streamIsGpu(self.s) and
+                cfg.hidden_act == .gelu_approx and cfg.swiglu_limit == 0.0 and swigluFusedEnabled() and
+                mw.gate_expert_scale.ctx == null and mw.up_expert_scale.ctx == null and !has_gate_scale and
+                gate_qp.mode == .affine and up_qp.mode == .affine and down_qp.mode == .affine and
+                gate_qp.bits == 4 and up_qp.bits == 4 and down_qp.bits == 4 and
+                gate_qp.group_size == 64 and up_qp.group_size == 64 and down_qp.group_size == 64 and
+                gate_experts >= 8 and @divTrunc(total_inds, gate_experts) >= moe_prefill_fused.MIN_ROWS_PER_EXPERT)
+            {
+                if (try self.geluTanhTable(.bfloat16)) |table| {
+                    var fused_row_map = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(fused_row_map);
+                    try mlx.check(mlx.mlx_astype(&fused_row_map, lhs_idx, .uint32, self.s));
+                    var fused_ids = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(fused_ids);
+                    try mlx.check(mlx.mlx_astype(&fused_ids, sorted_inds, .uint32, self.s));
+                    // fused_offs owns the offsets from here (the defer above frees them on every path).
+                    fused_offs = try moe_prefill_fused.offsets(fused_ids, gate_experts, self.s);
+                    if (try moe_prefill_fused.gateUp(x_flat, fused_row_map, fused_ids, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, fused_offs.?, table, self.s)) |act| {
+                        // Freed here if the check below fails; fused_act takes it only at the end of this block.
+                        errdefer _ = mlx.mlx_array_free(act);
+                        if (moe_prefill_fused.checkOn() and moe_prefill_fused.check_calls < 4) {
+                            // MLX_SERVE_MOE_PREFILL_FUSED_CHECK=1: the stock take, two gathers and GeGLU on the same rows.
+                            var ck_x = mlx.mlx_array_new();
+                            defer _ = mlx.mlx_array_free(ck_x);
+                            try mlx.check(mlx.mlx_take_axis(&ck_x, x_flat, lhs_idx, 0, self.s));
+                            var ck_rep = mlx.mlx_array_new();
+                            defer _ = mlx.mlx_array_free(ck_rep);
+                            try mlx.check(mlx.mlx_reshape(&ck_rep, ck_x, &.{ total_inds, 1, D }, 3, self.s));
+                            var ck_g3 = mlx.mlx_array_new();
+                            defer _ = mlx.mlx_array_free(ck_g3);
+                            try gatherExpertMm(&ck_g3, ck_rep, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, no_idx, sorted_inds, gate_qp.bits, gate_qp.group_size, gate_qp.mode, true, self.s);
+                            var ck_g = mlx.mlx_array_new();
+                            defer _ = mlx.mlx_array_free(ck_g);
+                            try mlx.check(mlx.mlx_squeeze(&ck_g, ck_g3, self.s));
+                            var ck_u3 = mlx.mlx_array_new();
+                            defer _ = mlx.mlx_array_free(ck_u3);
+                            try gatherExpertMm(&ck_u3, ck_rep, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, no_idx, sorted_inds, up_qp.bits, up_qp.group_size, up_qp.mode, true, self.s);
+                            var ck_u = mlx.mlx_array_new();
+                            defer _ = mlx.mlx_array_free(ck_u);
+                            try mlx.check(mlx.mlx_squeeze(&ck_u, ck_u3, self.s));
+                            const ck_act = try self.computeGeglu(ck_g, ck_u);
+                            defer _ = mlx.mlx_array_free(ck_act);
+                            const same = try bf16BitEqual(act, ck_act, self.s);
+                            log.info("[moe-prefill-fused] check {d}: gate+up+GeGLU act bit-identical to the stock path: {} (M={d})\n", .{ moe_prefill_fused.check_calls + 1, same, total_inds });
+                        }
+                        fused_act = act;
+                    } else {
+                        _ = mlx.mlx_array_free(fused_offs.?);
+                        fused_offs = null;
+                        moe_prefill_fused.noteDeclined(total_inds, gate_experts);
+                    }
+                }
+            }
             var x_gathered = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(x_gathered);
             if (fused_act == null and mapped_gate == null) try mlx.check(mlx.mlx_take_axis(&x_gathered, x_flat, lhs_idx, 0, self.s));
@@ -11168,7 +11460,19 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_expand_dims(&act_exp, expert_act, -2, self.s));
             var down_3d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(down_3d);
-            try gatherExpertMm(&down_3d, act_exp, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, no_idx, sorted_inds, down_qp.bits, down_qp.group_size, down_qp.mode, true, self.s);
+            if (if (fused_offs) |offs| try moe_prefill_fused.down(expert_act, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, offs, self.s) else null) |value| {
+                // Down at 32-row tiles, [M, 1, hidden] like the stock gather.
+                _ = mlx.mlx_array_free(down_3d);
+                down_3d = value;
+                if (moe_prefill_fused.checkOn() and moe_prefill_fused.check_calls < 4) {
+                    moe_prefill_fused.check_calls += 1;
+                    var ck_down = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(ck_down);
+                    try gatherExpertMm(&ck_down, act_exp, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, no_idx, sorted_inds, down_qp.bits, down_qp.group_size, down_qp.mode, true, self.s);
+                    const same = try bf16BitEqual(value, ck_down, self.s);
+                    log.info("[moe-prefill-fused] check {d}: down bit-identical to the stock path: {} (M={d})\n", .{ moe_prefill_fused.check_calls, same, total_inds });
+                }
+            } else try gatherExpertMm(&down_3d, act_exp, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, no_idx, sorted_inds, down_qp.bits, down_qp.group_size, down_qp.mode, true, self.s);
             var down_squeezed = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(down_squeezed);
             try mlx.check(mlx.mlx_squeeze(&down_squeezed, down_3d, self.s)); // [N, hidden]
@@ -17146,8 +17450,18 @@ const VERIFY_EXPERT_REDUCE_SOURCE =
     \\y[p] = total;
 ;
 var verify_expert_reduce_kernel: ?mlx.mlx_fast_metal_kernel = null;
-const ExpertReduceCfgs = KernelCfgCache4([3]c_int, 1);
+const ExpertReduceCfgs = KernelCfgCache4([4]c_int, 1);
 var prefill_expert_reduce_cfgs = ExpertReduceCfgs{};
+
+/// MLX_SERVE_MOE_PREFILL_REDUCE_2816_OFF=1 keeps the fused expert reduce off the 26B-A4B's (8, 2816).
+fn moePrefillReduce2816Off() bool {
+    const S = struct {
+        var v: ?bool = null;
+    };
+    if (S.v) |v| return v;
+    S.v = std.c.getenv("MLX_SERVE_MOE_PREFILL_REDUCE_2816_OFF") != null;
+    return S.v.?;
+}
 
 /// The verify reduction at prefill widths, on every GPU: it only removes the
 /// [B*S*K, hidden] unsorted and weighted intermediates.
@@ -17170,7 +17484,9 @@ fn expertReduceApply(s: mlx.mlx_stream, down: mlx.mlx_array, inverse: mlx.mlx_ar
     if (ds.len != 2 or ss.len != 3 or ix.len != 1) return null;
     const topk = ss[2];
     const hidden = ds[1];
-    if (!((topk == 10 and hidden == 2560) or (topk == 8 and hidden == 4096))) return null;
+    // Gemma 4 26B-A4B's (8, 2816) is admitted on the bit-identity test "prefill expert reduction is bit-identical ...".
+    const gemma4_26b = topk == 8 and hidden == 2816 and !moePrefillReduce2816Off();
+    if (!((topk == 10 and hidden == 2560) or (topk == 8 and hidden == 4096) or gemma4_26b)) return null;
     const batch = ss[0];
     const tokens = ss[1];
     if (batch < 1 or tokens < 1 or batch * tokens < 2 or ds[0] != batch * tokens * topk or ix[0] != ds[0]) return null;
@@ -17187,7 +17503,8 @@ fn expertReduceApply(s: mlx.mlx_stream, down: mlx.mlx_array, inverse: mlx.mlx_ar
         verify_expert_reduce_kernel = value;
         break :blk value;
     };
-    const key = [3]c_int{ batch, tokens, topk };
+    // Hidden is part of the key: (8, 4096) and (8, 2816) share top_k.
+    const key = [4]c_int{ batch, tokens, topk, hidden };
     const cfg = blk: {
         if (cfgs.get(key)) |hit| break :blk hit[0];
         const value = mlx.mlx_fast_metal_kernel_config_new();
@@ -26093,6 +26410,31 @@ test "prefillEvalCadenceApplies: spec-verify-width forwards skip the cadence ent
     try t.expect(Transformer.prefillEvalCadenceApplies(8192));
 }
 
+test "moePrefillEvalCadenceApplies: a warm turn's short MoE prefill runs one eval, a 2048-token chunk keeps the cadence" {
+    const t = std.testing;
+    try t.expect(!Transformer.moePrefillEvalCadenceApplies(1));
+    try t.expect(!Transformer.moePrefillEvalCadenceApplies(32));
+    try t.expect(!Transformer.moePrefillEvalCadenceApplies(512));
+    try t.expect(!Transformer.moePrefillEvalCadenceApplies(1023));
+    try t.expect(Transformer.moePrefillEvalCadenceApplies(1024));
+    try t.expect(Transformer.moePrefillEvalCadenceApplies(2048));
+    // The shared gate the other loops read is unchanged.
+    try t.expect(Transformer.prefillEvalCadenceApplies(32));
+}
+
+test "moeShortPrefillSkipsCadence: MoE only" {
+    // The switch turns the predicate off for the whole process (cached env read): nothing to test then.
+    if (std.c.getenv("MLX_SERVE_MOE_SHORT_PREFILL_ONE_EVAL_OFF") != null) return error.SkipZigTest;
+    const t = std.testing;
+    var moe = ModelConfig{};
+    moe.num_hidden_layers = 30;
+    moe.num_experts = 128;
+    try t.expect(Transformer.moeShortPrefillSkipsCadence(&moe));
+    var dense = ModelConfig{};
+    dense.num_hidden_layers = 30;
+    try t.expect(!Transformer.moeShortPrefillSkipsCadence(&dense));
+}
+
 test "prefillEvalCadence: quantized-KV dequant forces eval-per-layer even at fused head dims" {
     const t = std.testing;
     // hd 128 is fused (zero scores) but denseView rebuilds the FULL cache per
@@ -28751,8 +29093,10 @@ test "prefill expert reduction is bit-identical to unsort multiply and sum" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x5EED_3A11);
-    // (top_k, hidden): the 35B and the 27B geometries.
-    for ([_][2]c_int{ .{ 10, 2560 }, .{ 8, 4096 } }) |kh| for ([_][2]c_int{ .{ 1, 33 }, .{ 1, 2048 }, .{ 2, 1024 }, .{ 1, 8192 } }) |shape| {
+    // The switch declines (8, 2816) for the whole process (cached env read): nothing to test then.
+    if (std.c.getenv("MLX_SERVE_MOE_PREFILL_REDUCE_2816_OFF") != null) return error.SkipZigTest;
+    // (top_k, hidden): the 35B, the 27B and Gemma 4 26B-A4B's geometries.
+    for ([_][2]c_int{ .{ 10, 2560 }, .{ 8, 4096 }, .{ 8, 2816 } }) |kh| for ([_][2]c_int{ .{ 1, 33 }, .{ 1, 2048 }, .{ 2, 1024 }, .{ 1, 8192 } }) |shape| {
         const count = shape[0] * shape[1] * kh[0];
         const down = try testRandWeightBf16(prng.random(), &.{ count, kh[1] }, s);
         defer _ = mlx.mlx_array_free(down);

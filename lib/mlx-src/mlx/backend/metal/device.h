@@ -250,6 +250,11 @@ class MLX_API Device {
 
 MLX_API Device& device(mlx::core::Device);
 MLX_API CommandEncoder& get_command_encoder(Stream s);
+// Lesto's addition. While on for the calling thread (MLX encodes on the thread that calls eval), needs_commit() ignores
+// the byte limit, so the ops limit alone commits.
+MLX_API void set_commit_on_ops_limit_only(bool on);
+// Lesto's addition. Command buffers committed so far by this process.
+MLX_API uint64_t command_buffers_committed();
 
 std::unordered_map<int, CommandEncoder>& get_command_encoders();
 std::unordered_map<int, CommandEncoder>& get_global_command_encoders();

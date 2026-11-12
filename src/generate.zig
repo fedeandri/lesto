@@ -5,6 +5,7 @@ const transformer_mod = @import("transformer.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
+const keep_warm = @import("keep_warm.zig");
 const json_grammar = @import("json_grammar.zig");
 const json_schema = @import("json_schema.zig");
 const token_mask = @import("token_mask.zig");
@@ -1621,6 +1622,10 @@ pub const Generator = struct {
             var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Timestamp.now(io, .real).toNanoseconds())) ^ @intFromPtr(xfm)));
             sampling.seed = prng.random().int(u64);
         }
+        // Lesto top-k schedule (MLX_SERVE_TOPK_SCHEDULE): the prompt's forwards, here, route to k1 and restart the count;
+        // the defer covers the error paths before the prompt's last forward ends the prefill.
+        xfm.beginTopKPrefill();
+        defer xfm.endTopKPrefill();
         const options = options_in;
         const s = xfm.s;
         // Per-slot ForwardCtx (Phase 2). Stored by value on the Generator;
@@ -1814,7 +1819,9 @@ pub const Generator = struct {
                 errdefer if (dflash_active) {
                     for (dfl_out_buf) |a| _ = mlx.mlx_array_free(a);
                 };
+                // The compiled forward bypasses `forwardWith`, so the top-k schedule (MLX_SERVE_TOPK_SCHEDULE) never reaches it.
                 const chunk_logits = if (xfm.compiled_forward != null and
+                    Transformer.topKSchedule() == null and
                     !dflash_active and
                     ctx.cache == &xfm.cache and
                     ctx.capture_hidden == null and
@@ -1965,6 +1972,8 @@ pub const Generator = struct {
             has_captured_hidden = true;
             break :blk try xfm.forwardWithCapture(&ctx, last_input, &captured_hidden);
         } else try xfm.forwardWith(&ctx, last_input);
+        // The prompt's last forward has run: the first reply token's forward (the lazy pre-forward below) is counted.
+        xfm.endTopKPrefill();
         if (dflash_active) {
             ctx.capture_layers = null;
             try dflash_mod.appendContext(options.dflash.?, &dflash_ctx.?, dfl_out_buf, pos_offset + final_start);
@@ -5434,7 +5443,7 @@ pub const Generator = struct {
                 var sw = StepTrace.watch();
                 const arr = [_]mlx.mlx_array{ lazy_token, self.headTailEvalTarget(next_logits) };
                 const vec = mlx.mlx_vector_array_new_data(&arr, 2);
-                _ = mlx.mlx_async_eval(vec);
+                asyncEvalDecodeStep(vec);
                 _ = mlx.mlx_vector_array_free(vec);
                 StepTrace.lap(&sw, .submit);
 
@@ -6012,6 +6021,33 @@ const StepTrace = struct {
         ns = .{ 0, 0, 0, 0 };
     }
 };
+
+/// Evaluates one pipelined decode step with MLX's byte limit on a command buffer off, so the ops limit alone commits:
+/// at one token the bound weights trip the byte limit about twice per layer, and those extra command buffers cost decode
+/// time. MLX encodes on the thread that calls eval (`needs_commit()` is read at the end of each encode), so the scope covers
+/// exactly what this call encodes, and it must stay around this call: a flag set by a forward would also reach whatever
+/// that forward left lazy and a cached compiled forward. No prefill work can be in this graph: a prompt's last forward is
+/// one token, evaluated when `initWithOptions` draws the first token. MLX_SERVE_DECODE_OPS_ONLY_COMMIT_OFF=1 keeps the
+/// byte limit.
+fn asyncEvalDecodeStep(vec: mlx.mlx_vector_array) void {
+    keep_warm.touch();
+    const S = struct {
+        var off: ?bool = null;
+    };
+    const off = S.off orelse blk: {
+        const v = std.c.getenv("MLX_SERVE_DECODE_OPS_ONLY_COMMIT_OFF") != null;
+        S.off = v;
+        if (!v) log.info("[decode] one-token steps commit on the ops limit alone (MLX_SERVE_DECODE_OPS_ONLY_COMMIT_OFF=1 keeps the byte limit)\n", .{});
+        break :blk v;
+    };
+    if (off) {
+        _ = mlx.mlx_async_eval(vec);
+        return;
+    }
+    _ = mlx.mlx_lesto_commit_on_ops_limit_only(true);
+    _ = mlx.mlx_async_eval(vec);
+    _ = mlx.mlx_lesto_commit_on_ops_limit_only(false);
+}
 
 /// Build forward pass from a lazy sampled token array.
 /// Reshapes [1] -> [1, 1] and calls transformer forward. All lazy (no eval).
@@ -11260,6 +11296,18 @@ test "specDecodeUnsupported: release-enforced guard for spec + constraint/logpro
     var dummy: Constraint = undefined;
     try testing.expect(specDecodeUnsupported(.{ .constraint = &dummy }, 0));
     try testing.expect(specDecodeUnsupported(.{ .constraint = &dummy }, 3));
+}
+
+test "only the pipelined decode step runs on the ops limit alone" {
+    const src = @embedFile("generate.zig");
+    const call = "asyncEvalDecodeStep" ++ "(vec)";
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, call));
+    const next_fn = std.mem.indexOf(u8, src, "pub fn next(self: *Generator") orelse return error.MissingNext;
+    const slow = std.mem.indexOfPos(u8, src, next_fn, "Phase 2: Slow path") orelse return error.MissingSlowPath;
+    const at = std.mem.indexOf(u8, src, call).?;
+    try std.testing.expect(at > next_fn and at < slow);
+    const set_call = "mlx_lesto_commit_on_ops_limit_only" ++ "(";
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, src, set_call));
 }
 
 test "no decode path advances `step` outside advanceStep" {

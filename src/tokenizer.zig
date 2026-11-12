@@ -271,6 +271,19 @@ pub const Tokenizer = struct {
         };
     }
 
+    /// Decode ONE generated token for a stream. A `<0xNN>` byte token comes back as its raw
+    /// byte, not the U+FFFD that `decode` gives a lone byte: an emoji the model spells as four
+    /// byte tokens is only valid UTF-8 once all four arrived, and the stream's carry buffer
+    /// joins them. Every other token decodes as `decode` does.
+    pub fn decodeStreamPiece(self: *const Tokenizer, allocator: std.mem.Allocator, id: u32) ![]u8 {
+        if (self.byte_fallback_decode) {
+            if (self.id_to_token.get(id)) |token| {
+                if (byteTokenValue(token)) |b| return allocator.dupe(u8, &[_]u8{b});
+            }
+        }
+        return self.decode(allocator, &[_]u32{id}, false);
+    }
+
     /// Look up a special token ID by its string representation.
     pub fn specialTokenId(self: *const Tokenizer, name: []const u8) ?u32 {
         return self.special_tokens.get(name);
@@ -1334,6 +1347,20 @@ test "ByteFallback decoder: <0xNN> runs decode as bytes, invalid runs as U+FFFD 
     const bad = try tok.decode(allocator, &[_]u32{ 10, 11, 20, 1 }, false);
     defer allocator.free(bad);
     try testing.expectEqualStrings("\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd a", bad);
+
+    // A stream decodes one token at a time: byte tokens come back raw, so the four pieces
+    // join into the character `decode` gives for the run, while a lone `decode` gives U+FFFD.
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(allocator);
+    for ([_]u32{ 1, 10, 11, 12, 13 }) |id| {
+        const piece = try tok.decodeStreamPiece(allocator, id);
+        defer allocator.free(piece);
+        try joined.appendSlice(allocator, piece);
+    }
+    try testing.expectEqualStrings(" a\xf0\xa0\x80\x8b", joined.items);
+    const lone = try tok.decode(allocator, &[_]u32{10}, false);
+    defer allocator.free(lone);
+    try testing.expectEqualStrings("\xef\xbf\xbd", lone);
 
     try testing.expectEqual(@as(?u8, 0xF0), byteTokenValue("<0xF0>"));
     try testing.expectEqual(@as(?u8, null), byteTokenValue("<0xF>"));

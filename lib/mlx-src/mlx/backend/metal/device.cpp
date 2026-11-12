@@ -1,5 +1,6 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <atomic>
 #include <cstdlib>
 #include <sstream>
 
@@ -508,9 +509,23 @@ void CommandEncoder::wait_event(Event event, uint64_t value) {
   wait_events_.push_back(std::move(event));
 }
 
+namespace {
+thread_local bool commit_on_ops_limit_only = false;
+std::atomic<uint64_t> n_command_buffers_committed{0};
+} // namespace
+
+void set_commit_on_ops_limit_only(bool on) {
+  commit_on_ops_limit_only = on;
+}
+
+uint64_t command_buffers_committed() {
+  return n_command_buffers_committed.load(std::memory_order_relaxed);
+}
+
 bool CommandEncoder::needs_commit() const {
   auto [max_ops, max_mb] = device_.get_max_ops_mb_per_buffer();
-  return (buffer_ops_ > max_ops) || ((buffer_sizes_ >> 20) > max_mb);
+  return (buffer_ops_ > max_ops) ||
+      (!commit_on_ops_limit_only && (buffer_sizes_ >> 20) > max_mb);
 }
 
 void CommandEncoder::commit(std::function<void()> completion) {
@@ -556,6 +571,7 @@ void CommandEncoder::commit(std::function<void()> completion) {
         }
       });
   buffer_->commit();
+  n_command_buffers_committed.fetch_add(1, std::memory_order_relaxed);
   buffer_ = NS::RetainPtr(queue_->commandBufferWithUnretainedReferences());
   buffer_ops_ = 0;
   buffer_sizes_ = 0;

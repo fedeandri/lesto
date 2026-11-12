@@ -2845,6 +2845,11 @@ test "memInsufficientForLoad: headroom + unknown-query guards" {
 /// started; on-demand → req.error_name + done broadcast).
 fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     params.entry.load_progress.start(io_util.nowMsMonotonic(sch.io));
+    // Optional load steps (kernel warm-ups, mlx_compile, the Latin-head check, the decode micro-bench, the warm-up)
+    // fall back when MLX fails and carry on, but MLX's error stays latched; left there, the first request's prefill
+    // checkError consumed it and failed with MlxFailure (macOS 14, 2026-11-12). A load that succeeds drops any latch
+    // it raised just before the model is marked ready; one pending before the load belongs to someone else and stays.
+    const load_had_error = mlx.errorPending();
     const model_bytes = params.resident_model_bytes orelse blk: {
         const scanned = try residentModelDiskBytes(sch.io, params.model_dir, params.config);
         break :blk residentGateBytes(scanned, params.entry.bytes_on_disk).?;
@@ -3315,10 +3320,26 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         params.entry.load_progress.begin(.warming_up, 0, io_util.nowMsMonotonic(sch.io));
         const warmup_start = std.Io.Timestamp.now(sch.io, .awake);
         xfm_ptr.warmup() catch |err| {
-            log.warn("Warmup failed ({s}); continuing without it — first request may be slow.\n", .{@errorName(err)});
+            log.warn("Warmup failed ({s}); continuing without it, the first request may be slow.\n", .{@errorName(err)});
         };
         const warmup_ns: u64 = @intCast(warmup_start.untilNow(sch.io, .awake).nanoseconds);
         log.info("Warmup complete ({d} ms).\n", .{warmup_ns / std.time.ns_per_ms});
+    }
+
+    // A MERGED drafter has no `--drafter` to echo: the reported path comes
+    // from what was actually resolved, so `drafter_loaded` and `drafter_path`
+    // must not disagree about the same sidecar. Allocated here, before the latch drop below and Phase 05, which
+    // must not fail.
+    if (drafter_path_owned.len == 0 and drafter_dir.len > 0 and
+        (dflash_ptr != null or drafter_ptr != null))
+    {
+        drafter_path_owned = try sch.allocator.dupe(u8, drafter_dir);
+    }
+
+    if (!load_had_error and mlx.errorPending()) {
+        var buf: [512]u8 = undefined;
+        const msg = mlx.takeError(&buf) orelse "";
+        log.warn("[load] dropped an MLX error an optional load step latched and fell back from; the first request starts clean: {s}\n", .{msg});
     }
 
     // ── Phase 05: install everything onto the LoadedModel entry, mark
@@ -3339,14 +3360,6 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     entry.dflash = dflash_ptr;
     if (entry.config) |c| c.drafter_ctx_bytes_per_token = if (dflash_ptr) |d| dflash_mod.ctxBytesPerToken(&d.config) else 0;
     entry.drafter_block_size = sch.drafter_block_size;
-    // A MERGED drafter has no `--drafter` to echo, so the reported path comes
-    // from what was actually resolved — `drafter_loaded` and `drafter_path`
-    // must not disagree about the same sidecar.
-    if (drafter_path_owned.len == 0 and drafter_dir.len > 0 and
-        (dflash_ptr != null or drafter_ptr != null))
-    {
-        drafter_path_owned = try sch.allocator.dupe(u8, drafter_dir);
-    }
     entry.drafter_path = drafter_path_owned;
     drafter_path_owned = &[_]u8{}; // disarm the errdefer
     // Transfer ownership of the heap-allocated CPU state from `params` to

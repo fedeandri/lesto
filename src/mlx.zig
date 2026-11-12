@@ -115,6 +115,9 @@ pub extern "c" fn mlx_synchronize(s: mlx_stream) c_int;
 
 // Metal
 pub extern "c" fn mlx_metal_is_available(res: *bool) c_int;
+// Lesto's additions to mlx-c (lib/mlxc-src/mlx/c/metal.cpp): the command-buffer commit policy for what the calling thread encodes.
+pub extern "c" fn mlx_lesto_commit_on_ops_limit_only(on: bool) c_int;
+pub extern "c" fn mlx_lesto_command_buffers_committed() u64;
 pub extern "c" fn _mlx_array_is_available(res: *bool, arr: mlx_array) c_int;
 
 // Array creation
@@ -771,6 +774,10 @@ fn defaultDeviceInfoSize(key: [*:0]const u8) usize {
 /// model load or unload completes (and from the offline run path after load)
 /// so `fit` capacity tracks the live set. The caller logs the result.
 pub fn applyWiredPolicy() WiredPolicyResult {
+    // Best effort: every MLX return code here is ignored, so an error one latches (a failed ResidencySet resize)
+    // would otherwise fail the next request's checkError. A latch pending before the call stays.
+    const had_error = errorPending();
+    defer dropLatchedErrorUnless(had_error);
     const mode = WiredMode.fromEnv(if (std.c.getenv("MLX_SERVE_WIRED")) |p| std.mem.span(p) else null);
     if (noGpuBackend()) return .{ .mode = mode, .target = null };
     var prev: usize = 0;
@@ -810,6 +817,70 @@ pub fn applyWiredPolicy() WiredPolicyResult {
 
 test "custom Metal kernels run on the Metal backend only" {
     try std.testing.expectEqual(builtin.os.tag.isDarwin(), metalKernelsAvailable());
+}
+
+/// Command buffers one eval of `steps` chained adds over `start` commits.
+fn commitsOfAddChainForTest(start: mlx_array, steps: usize, s: mlx_stream, sum: *f32) !u64 {
+    var x = mlx_array_new();
+    defer _ = mlx_array_free(x);
+    try check(mlx_array_set(&x, start));
+    for (0..steps) |_| {
+        var y = mlx_array_new();
+        try check(mlx_add(&y, x, x, s));
+        _ = mlx_array_free(x);
+        x = y;
+    }
+    var total = mlx_array_new();
+    defer _ = mlx_array_free(total);
+    try check(mlx_sum(&total, x, false, s));
+    const before = mlx_lesto_command_buffers_committed();
+    const vec = mlx_vector_array_new_value(total);
+    defer _ = mlx_vector_array_free(vec);
+    try check(mlx_eval(vec));
+    const commits = mlx_lesto_command_buffers_committed() - before;
+    try check(mlx_array_item_float32(sum, total));
+    return commits;
+}
+
+test "the ops-limit-only scope drops the byte commits, keeps the ops commits and the values, and restores the limits" {
+    if (!metalKernelsAvailable()) return error.SkipZigTest;
+    const t = std.testing;
+    const s = mlx_default_gpu_stream_new();
+    defer _ = mlx_stream_free(s);
+
+    // 64 M elements per array: MLX's limit counts `array::data_size()`, elements rather than bytes, and this is above it
+    // for every GPU class, so by default each add commits on its own.
+    const big_shape = [_]c_int{64 * 1024 * 1024};
+    var big = mlx_array_new();
+    defer _ = mlx_array_free(big);
+    try check(mlx_ones(&big, &big_shape, 1, .float32, s));
+    try check(mlx_array_eval(big));
+    const big_steps = 6;
+    var sum_default: f32 = 0;
+    var sum_ops_only: f32 = 0;
+    var sum_restored: f32 = 0;
+    const by_default = try commitsOfAddChainForTest(big, big_steps, s, &sum_default);
+    _ = mlx_lesto_commit_on_ops_limit_only(true);
+    const ops_only = commitsOfAddChainForTest(big, big_steps, s, &sum_ops_only);
+    _ = mlx_lesto_commit_on_ops_limit_only(false);
+    const restored = try commitsOfAddChainForTest(big, big_steps, s, &sum_restored);
+    try t.expect(by_default >= big_steps);
+    try t.expect((try ops_only) <= 2);
+    try t.expect(restored >= big_steps);
+    try t.expectEqual(sum_default, sum_ops_only);
+    try t.expectEqual(sum_default, sum_restored);
+
+    // Small arrays: the ops limit (20 to 50 by GPU class) still commits inside the scope.
+    const small_shape = [_]c_int{4};
+    var small = mlx_array_new();
+    defer _ = mlx_array_free(small);
+    try check(mlx_ones(&small, &small_shape, 1, .float32, s));
+    try check(mlx_array_eval(small));
+    var sum_small: f32 = 0;
+    _ = mlx_lesto_commit_on_ops_limit_only(true);
+    const small_commits = commitsOfAddChainForTest(small, 120, s, &sum_small);
+    _ = mlx_lesto_commit_on_ops_limit_only(false);
+    try t.expect((try small_commits) >= 2);
 }
 
 /// Evaluates every array reachable through `value`'s fields (structs, optionals, arrays, slices),

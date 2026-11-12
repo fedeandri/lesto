@@ -58,6 +58,28 @@ The speed techniques, each described by what it does. Each has a switch that res
 - **Joined Q and K.** On the full-attention layers Q and K share one row group in one matmul.
 - **MoE down kernel at four rows, and layer prefetch.** The down kernel computes four output rows per simdgroup, and the
   idle threadgroups of the seam kernels prefetch the next matmul's weights into the system cache.
+- **One eval for a short MoE prefill.** A MoE prefill forward under 1024 tokens (under 384 on a 2-bit checkpoint) runs
+  one eval for the layer loop instead of a blocking eval every 4 layers, when the KV cache is not quantized and the
+  transient budget kept the default cadence. The admission bill charges such a model the whole old cache on a growing append.
+- **Fused prefill expert reduce at Gemma 4's width.** The kernel that replaces the prefill's unsort, multiply and sum also
+  admits top-k 8 at hidden 2816, the 26B-A4B's geometry, where a test shows it bit-identical to MLX's own reduction.
+- **MoE prefill gate, up and GeGLU in one kernel.** On a Mac without MLX's NAX kernels, an affine 4-bit GELU-tanh MoE whose
+  experts average 32 rows or more runs gate, up and GeGLU in one kernel through the row map and down at 32-row tiles,
+  instead of MLX's two gathers at 16-row tiles and a separate activation. The bits are the same.
+  `MLX_SERVE_MOE_PREFILL_FUSED_CHECK=1` compares them with the stock path as a diagnostic.
+- **Decode steps commit on the ops limit alone.** MLX commits a command buffer past an ops limit or a byte limit. At one
+  token the bound weights trip the byte limit about twice per layer, so a pipelined decode step turns the byte limit off
+  around its own eval; prefill keeps both limits. MLX gains a per-thread switch and a commit count for the test. The bits
+  are the same.
+- **A busy core during turns.** With fewer command buffers per decode step, the decode thread mostly waits on the GPU and
+  macOS clocks the P cores down, so the host builds each step more slowly and a turn that follows at once starts later. A
+  thread keeps one core busy while a turn is served and for 500 ms after (`MLX_SERVE_KEEP_WARM_MS`). The bits are the same.
+- **Top-k schedule, on request.** `MLX_SERVE_TOPK_SCHEDULE=<k1>:<n>:<k2>` routes each request's prompt and first n reply
+  tokens to k1 experts per token and every later reply token to k2 (for example `8:16:6`). Under it the MoE routing runs
+  uncompiled, since the compiled closure keeps the k it was traced with. The count is per server, not per request slot, so it
+  fits single-user serving; batched decode and speculative verify share it. Cached prompt states keep the k they were
+  computed with: a later turn that reuses an earlier reply from the prefix cache does not recompute it at k1. Unset, the
+  config's experts per token throughout.
 - **macOS 14 compiler fix.** The runtime-compiled Metal kernels unpack with `as_type` instead of a pointer pun that
   the macOS 14 compiler backend crashes on.
 - **Fixes.** The fp4 MoE decode gate refuses a GELU model (the kernels apply SiLU only); the third `messages` 400 of
@@ -74,14 +96,20 @@ The speed techniques, each described by what it does. Each has a switch that res
 - **Weight formats**: affine 2 to 8 bits, nvfp4, mxfp4, mxfp8 and the generic ModelOpt pack load by the checkpoint's own
   `quantization` block.
 - **`MLX_SERVE_*` environment names.** Scripts and benchmark harnesses set them, so renaming them would break those
-  without a gain. The ten technique switches are the exception: they are named for the technique they control, and each
+  without a gain. The sixteen technique switches are the exception: they are named for the technique they control, and each
   `..._OFF=1` restores the plain path. `MLX_SERVE_KV_REUSE_OFF` (shared K/V projection, folded expert scale, joined Q|K),
   `MLX_SERVE_SEAM_ROUTER_NORM_OFF` (router norm in the seam, head dimension 512), `MLX_SERVE_ROUTER_KERNEL_OFF`
   (router matmul and top-k kernel; back to the matmul-then-softmax chain), `MLX_SERVE_ROUTER_KERNEL_CHECK` (`=1` compares
   the router kernel with the chain on every call), `MLX_SERVE_LATIN_HEAD_OFF` (Latin-script head; keeps the full head),
   `MLX_SERVE_QK_JOINED_OFF` (joined Q and K; keeps them separate), `MLX_SERVE_HEAD_TAIL_OFF` (head tail; full-row argmax),
   `MLX_SERVE_KV_WRITE_IN_PLACE_OFF` (KV write in place; the slice_update path), `MLX_SERVE_MOE_DOWN_ROWS4_OFF`
-  (four-row down kernel; one row) and `MLX_SERVE_LAYER_PREFETCH_OFF` (layer prefetch; plain seam kernels).
+  (four-row down kernel; one row), `MLX_SERVE_LAYER_PREFETCH_OFF` (layer prefetch; plain seam kernels),
+  `MLX_SERVE_MOE_SHORT_PREFILL_ONE_EVAL_OFF` (one eval for a short MoE prefill; the eval cadence and its admission bill),
+  `MLX_SERVE_MOE_PREFILL_REDUCE_2816_OFF` (fused prefill expert reduce at hidden 2816; unsort, multiply and sum),
+  `MLX_SERVE_MOE_PREFILL_FUSED_OFF` (MoE prefill gate, up and GeGLU in one kernel; the stock gathers),
+  `MLX_SERVE_DECODE_OPS_ONLY_COMMIT_OFF` (decode steps on the ops limit alone; the byte limit stays on),
+  `MLX_SERVE_KEEP_WARM_OFF` (a busy core during turns; no spinning thread) and
+  `MLX_SERVE_MOE_PREFILL_FUSED_CHECK` (`=1` compares that kernel with the stock path, first four calls).
 - **Paths under `~/.mlx-serve/`** (models, logs, `kv-cache`, `round-cost`, the per-model settings file) and the log file
   name `mlx-serve-<port>.log`. The API contract test checks `~/.mlx-serve/kv-cache`, and moving the paths would orphan
   caches users already have.
