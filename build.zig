@@ -97,6 +97,7 @@ pub fn build(b: *std.Build) void {
 
     // The volume free-space probe: ARC Objective-C over Foundation.
     mod.addCSourceFile(.{ .file = b.path("src/volume_free.m"), .flags = &.{ "-O3", "-fobjc-arc", "-Wno-deprecated-declarations" } });
+    mod.addCSourceFile(.{ .file = b.path("src/tune_signals.m"), .flags = &.{ "-O3", "-fobjc-arc", "-Wno-deprecated-declarations" } });
 
     // mlx + mlx-c: self-built from the pinned submodules (lib/mlx-src,
     // lib/mlxc-src) into lib/mlx by scripts/build-mlx.sh, with NAX kernels
@@ -146,6 +147,7 @@ pub fn build(b: *std.Build) void {
     addJinja(b, test_mod);
     test_mod.addIncludePath(b.path("lib/jinja_cpp"));
     test_mod.addCSourceFile(.{ .file = b.path("src/volume_free.m"), .flags = &.{ "-O3", "-fobjc-arc", "-Wno-deprecated-declarations" } });
+    test_mod.addCSourceFile(.{ .file = b.path("src/tune_signals.m"), .flags = &.{ "-O3", "-fobjc-arc", "-Wno-deprecated-declarations" } });
     test_mod.linkSystemLibrary("c++", .{});
     addMlxLib(b, test_mod);
 

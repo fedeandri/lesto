@@ -518,6 +518,18 @@ void set_commit_on_ops_limit_only(bool on) {
   commit_on_ops_limit_only = on;
 }
 
+namespace {
+thread_local bool sdpa_d512_multi_query_on = false;
+} // namespace
+
+void set_sdpa_d512_multi_query(bool on) {
+  sdpa_d512_multi_query_on = on;
+}
+
+bool sdpa_d512_multi_query() {
+  return sdpa_d512_multi_query_on;
+}
+
 uint64_t command_buffers_committed() {
   return n_command_buffers_committed.load(std::memory_order_relaxed);
 }

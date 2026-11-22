@@ -13,13 +13,15 @@
 //!   5. Masked LM head (centroid-routed top-K sparse logits) → token logits.
 //!
 //! Position is constant across all `block_size - 1` drafter steps in a round.
-//! Q rotates with `offset = target.cache.step + 1`; K is already RoPE'd by target.
+//! Q rotates at the last cached token's position (`cache.step` before it, kept by
+//! MLX_SERVE_DRAFTER_CACHE_VIEW_OFF=1); K is already RoPE'd by target.
 
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 const model_mod = @import("model.zig");
 const transformer_mod = @import("transformer.zig");
+const io_util = @import("io_util.zig");
 
 const Weights = model_mod.Weights;
 const ModelConfig = model_mod.ModelConfig;
@@ -175,6 +177,13 @@ pub const DrafterLayer = struct {
     down_w_t: mlx.mlx_array, // [intermediate, hidden]
 
     layer_scalar: mlx.mlx_array, // [1]
+
+    // MLX_SERVE_DRAFTER_LAYERS_4BIT=1: the same projections kept 4-bit; null serves the dense ones.
+    q_q4: ?QLin = null,
+    o_q4: ?QLin = null,
+    gate_q4: ?QLin = null,
+    up_q4: ?QLin = null,
+    down_q4: ?QLin = null,
 };
 
 /// Centroid-routed sparse LM head. Mirrors `MaskedEmbedder` in
@@ -217,6 +226,14 @@ pub const DrafterModel = struct {
     /// Map: layer_type → target KV-cache layer index. Filled in `bind`.
     target_kv_layer_for_type: [2]?u32 = .{ null, null },
 
+    /// 4-bit pre/post projections (MLX_SERVE_DRAFTER_LAYERS_4BIT=1), and the tied head cut to the
+    /// target's Latin keep list (`head_idx`, a reference to `Transformer.latin_head_idx`), 4-bit
+    /// (MLX_SERVE_DRAFTER_HEAD_4BIT=1, set in `bind`). Null serves the dense paths.
+    pre_q4: ?QLin = null,
+    post_q4: ?QLin = null,
+    head_q4: ?QLin = null,
+    head_idx: mlx.mlx_array = .{},
+
     pub fn deinit(self: *DrafterModel) void {
         const allocator = self.allocator;
         _ = mlx.mlx_array_free(self.embed_w);
@@ -236,8 +253,15 @@ pub const DrafterModel = struct {
             _ = mlx.mlx_array_free(lw.up_w_t);
             _ = mlx.mlx_array_free(lw.down_w_t);
             _ = mlx.mlx_array_free(lw.layer_scalar);
+            inline for (.{ "q_q4", "o_q4", "gate_q4", "up_q4", "down_q4" }) |f| {
+                if (@field(lw, f)) |*q| q.deinit();
+            }
         }
         allocator.free(self.layers);
+        inline for (.{ "pre_q4", "post_q4", "head_q4" }) |f| {
+            if (@field(self, f)) |*q| q.deinit();
+        }
+        if (self.head_idx.ctx != null) _ = mlx.mlx_array_free(self.head_idx);
 
         if (self.masked) |*m| {
             _ = mlx.mlx_array_free(m.centroids_w_t);
@@ -329,6 +353,56 @@ pub const DrafterModel = struct {
         // bail with `error.TargetCacheUninitialized`. The cross-attn path
         // is exercised on the first prefill anyway.
         try self.dryRunInputPath(target);
+        try self.drafterQuant4BindHead(target);
+    }
+
+    /// With MLX_SERVE_DRAFTER_HEAD_4BIT=1 and a target that carries a Latin keep list, the tied head
+    /// becomes the drafter's embed rows at those ids, 4-bit; the scattered row keeps every other id at -1e30, as the
+    /// target's own cut head does (`latinHeadScatterFull`), so a draft never names a token the target cannot emit.
+    fn drafterQuant4BindHead(self: *DrafterModel, target: *Transformer) !void {
+        // An explicit keep list never falls back to another head; every skip below is an error with it
+        const keep_path = drafterKeepListKeepPath();
+        if (!drafterQuant4Head()) {
+            if (keep_path != null) {
+                log.err("[drafter-keep-list] MLX_SERVE_DRAFTER_HEAD_KEEP_LIST needs MLX_SERVE_DRAFTER_HEAD_4BIT=1\n", .{});
+                return error.DrafterKeepListNeedsHead;
+            }
+            return;
+        }
+        if (self.masked != null or !self.config.tie_word_embeddings) {
+            log.warn("[drafter-4bit] head arm skipped: the drafter's head is not the tied embedding\n", .{});
+            if (keep_path != null) return error.DrafterKeepListNoTiedHead;
+            return;
+        }
+        if (target.latin_head_idx.ctx == null) {
+            log.warn("[drafter-4bit] head arm skipped: the target carries no Latin keep list\n", .{});
+            if (keep_path != null) return error.DrafterKeepListNoLatinList;
+            return;
+        }
+        // MLX_SERVE_DRAFTER_HEAD_KEEP_LIST=<path> names a shorter keep list (a .npy of ascending uint32 ids, each in the
+        // target's Latin list); the head then holds only those rows, and the scatter keeps every other id at -1e30.
+        var keep_own = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(keep_own);
+        if (keep_path) |p| try drafterKeepListLoadKeep(&keep_own, p, target.latin_head_idx, self.config.vocab_size);
+        const keep: mlx.mlx_array = if (keep_path != null) keep_own else target.latin_head_idx;
+        var cut = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cut);
+        try mlx.check(mlx.mlx_take_axis(&cut, self.embed_w, keep, 0, self.s));
+        var q = try quantizeRows(cut, self.s);
+        errdefer q.deinit();
+        var idx = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(idx);
+        try mlx.check(mlx.mlx_array_set(&idx, keep));
+        // both replacements are held before either old one goes, so a failure leaves the old rows with their own ids (Codex)
+        if (self.head_q4) |*old| old.deinit();
+        self.head_q4 = q;
+        if (self.head_idx.ctx != null) _ = mlx.mlx_array_free(self.head_idx);
+        self.head_idx = idx;
+        if (keep_path) |p| {
+            log.info("[drafter-keep-list] head: {d} rows of the keep list {s}, 4-bit group 64 (MLX_SERVE_DRAFTER_HEAD_KEEP_LIST)\n", .{ mlx.getShape(cut)[0], std.mem.span(p) });
+        } else {
+            log.info("[drafter-4bit] head: {d} Latin rows of the tied embedding, 4-bit group 64 (MLX_SERVE_DRAFTER_HEAD_4BIT=1)\n", .{mlx.getShape(cut)[0]});
+        }
     }
 
     /// Run the input-concat + pre_projection portion of `step()` with a
@@ -355,7 +429,7 @@ pub const DrafterModel = struct {
             try mlx.check(mlx.mlx_concatenate_axis(&inputs_embeds, vec, 2, self.s));
         }
 
-        const projected = try matmulFn(inputs_embeds, self.pre_proj_w_t, self.s);
+        const projected = try linFn(inputs_embeds, self.pre_proj_w_t, self.pre_q4, self.s);
         defer _ = mlx.mlx_array_free(projected);
 
         // Force eval to surface any deferred shape/dtype errors here, not
@@ -576,6 +650,234 @@ fn freeAll(arrs: []const mlx.mlx_array) void {
     for (arrs) |a| _ = mlx.mlx_array_free(a);
 }
 
+// ── A 4-bit drafter and a Latin-script head ──
+
+/// Affine 4-bit, group 64: the scheme of mlx-vlm's `nn.quantize(drafter, 64, 4)`.
+pub const DRAFTER_QUANT4_GROUP: c_int = 64;
+pub const DRAFTER_QUANT4_BITS: c_int = 4;
+
+/// A weight kept quantized as `[out, in]` rows: packed uint32, scales and biases.
+pub const QLin = struct {
+    w: mlx.mlx_array,
+    sc: mlx.mlx_array,
+    bi: mlx.mlx_array,
+
+    pub fn deinit(self: *QLin) void {
+        _ = mlx.mlx_array_free(self.w);
+        _ = mlx.mlx_array_free(self.sc);
+        _ = mlx.mlx_array_free(self.bi);
+    }
+};
+
+/// The draft step's scalars (the target embed scale, the GeGLU constants) are bf16 arrays, as the
+/// target's own (`bf16Scalar` in transformer.zig), so a bf16 activation stays bf16. A float32 scalar array promotes it to
+/// float32, and every later dense matmul then promotes its bf16 weight too. MLX_SERVE_DRAFTER_BF16_SCALARS_OFF=1 keeps the float32 scalars.
+pub fn drafterBf16ScalarsOn() bool {
+    const raw = std.c.getenv("MLX_SERVE_DRAFTER_BF16_SCALARS_OFF") orelse return true;
+    return std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+}
+
+/// A scalar for the draft step: bf16, or float32 under MLX_SERVE_DRAFTER_BF16_SCALARS_OFF=1.
+fn stepScalar(val: f32, s: mlx.mlx_stream) !mlx.mlx_array {
+    const f = mlx.mlx_array_new_float(val);
+    if (!drafterBf16ScalarsOn()) return f;
+    defer _ = mlx.mlx_array_free(f);
+    var b = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(b);
+    try mlx.check(mlx.mlx_astype(&b, f, .bfloat16, s));
+    return b;
+}
+
+/// MLX_SERVE_DRAFTER_LAYERS_4BIT=1: every drafter projection (pre and post projection, q, o, gate, up, down) runs 4-bit.
+pub fn drafterQuant4Layers() bool {
+    return envIsOne("MLX_SERVE_DRAFTER_LAYERS_4BIT");
+}
+
+/// The keep list's path, or null when MLX_SERVE_DRAFTER_HEAD_KEEP_LIST is unset or empty.
+fn drafterKeepListKeepPath() ?[*:0]const u8 {
+    const raw = std.c.getenv("MLX_SERVE_DRAFTER_HEAD_KEEP_LIST") orelse return null;
+    if (raw[0] == 0) return null;
+    return raw;
+}
+
+/// Every id of `keep` (ascending) is in `latin` (ascending); both are walked once.
+fn drafterKeepListIsSubset(keep: []const u32, latin: []const u32) bool {
+    var j: usize = 0;
+    for (keep) |id| {
+        while (j < latin.len and latin[j] < id) j += 1;
+        if (j == latin.len or latin[j] != id) return false;
+        j += 1;
+    }
+    return true;
+}
+
+/// Load the keep list (a .npy, 1-D uint32, ascending, in range; `validateKeepList`, as the target's own list
+/// is checked) on the CPU stream and require it to be a subset of the target's Latin list. Any failure stops the bind: a
+/// run that asked for a shorter head never serves the full one silently.
+fn drafterKeepListLoadKeep(out: *mlx.mlx_array, path: [*:0]const u8, latin: mlx.mlx_array, vocab: u32) !void {
+    const cs = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cs);
+    try mlx.check(mlx.mlx_load(out, path, cs));
+    try transformer_mod.validateKeepList(out.*, vocab);
+    try mlx.check(mlx.mlx_array_eval(latin));
+    if (mlx.mlx_array_dtype(latin) != .uint32) return error.DrafterKeepListLatinDtype;
+    const kn = mlx.mlx_array_size(out.*);
+    const ln = mlx.mlx_array_size(latin);
+    const kd = (mlx.mlx_array_data_uint32(out.*) orelse return error.DrafterKeepListUnreadable)[0..kn];
+    const ld = (mlx.mlx_array_data_uint32(latin) orelse return error.DrafterKeepListUnreadable)[0..ln];
+    if (kn >= ln or !drafterKeepListIsSubset(kd, ld)) {
+        log.err("[drafter-keep-list] keep list {s} is not a strict subset of the target's Latin list ({d} ids against {d})\n", .{ std.mem.span(path), kn, ln });
+        return error.DrafterKeepListNotSubset;
+    }
+}
+
+test "drafterKeepListIsSubset walks two ascending lists" {
+    try std.testing.expect(drafterKeepListIsSubset(&.{ 2, 5 }, &.{ 1, 2, 3, 5, 8 }));
+    try std.testing.expect(drafterKeepListIsSubset(&.{}, &.{ 1, 2 }));
+    try std.testing.expect(!drafterKeepListIsSubset(&.{ 2, 4 }, &.{ 1, 2, 3, 5, 8 }));
+    try std.testing.expect(!drafterKeepListIsSubset(&.{9}, &.{ 1, 2, 3, 5, 8 }));
+    try std.testing.expect(!drafterKeepListIsSubset(&.{ 2, 2 }, &.{ 1, 2, 3 }));
+}
+
+/// MLX_SERVE_DRAFTER_HEAD_4BIT=1: the tied head over the target's Latin keep list, 4-bit.
+pub fn drafterQuant4Head() bool {
+    return envIsOne("MLX_SERVE_DRAFTER_HEAD_4BIT");
+}
+
+/// Quantize `[rows, in]` (any layout) to 4-bit affine rows, evaluated now so the source can be freed.
+fn quantizeRows(w: mlx.mlx_array, s: mlx.mlx_stream) !QLin {
+    var wc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wc);
+    try mlx.check(mlx.mlx_contiguous(&wc, w, false, s));
+    var parts = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(parts);
+    try mlx.check(mlx.mlx_quantize(&parts, wc, mlx.mlx_optional_int.some(DRAFTER_QUANT4_GROUP), mlx.mlx_optional_int.some(DRAFTER_QUANT4_BITS), "affine", .{ .ctx = null }, s));
+    if (mlx.mlx_vector_array_size(parts) != 3) return error.DrafterQuant4Quantize;
+    var q = QLin{ .w = mlx.mlx_array_new(), .sc = mlx.mlx_array_new(), .bi = mlx.mlx_array_new() };
+    errdefer q.deinit();
+    try mlx.check(mlx.mlx_vector_array_get(&q.w, parts, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&q.sc, parts, 1));
+    try mlx.check(mlx.mlx_vector_array_get(&q.bi, parts, 2));
+    const ev = [_]mlx.mlx_array{ q.w, q.sc, q.bi };
+    const vec = mlx.mlx_vector_array_new_data(&ev, ev.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    try mlx.check(mlx.mlx_eval(vec));
+    return q;
+}
+
+/// Quantize a pre-transposed `[in, out]` weight back into `[out, in]` rows.
+fn quantizeT(w_t: mlx.mlx_array, s: mlx.mlx_stream) !QLin {
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    const perm = [_]c_int{ 1, 0 };
+    try mlx.check(mlx.mlx_transpose_axes(&w, w_t, &perm, 2, s));
+    return quantizeRows(w, s);
+}
+
+/// `x @ w` for a pre-transposed dense weight, or the 4-bit rows when the arm holds them.
+fn linFn(x: mlx.mlx_array, w_t: mlx.mlx_array, q: ?QLin, s: mlx.mlx_stream) !mlx.mlx_array {
+    const ql = q orelse return matmulFn(x, w_t, s);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out); // a failed op frees its own output
+    try mlx.check(mlx.mlx_quantized_matmul(&out, x, ql.w, ql.sc, ql.bi, true, mlx.mlx_optional_int.some(DRAFTER_QUANT4_GROUP), mlx.mlx_optional_int.some(DRAFTER_QUANT4_BITS), "affine", s));
+    return out;
+}
+
+// ── MLX_SERVE_DRAFT_UBENCH_PARTS=1: the draft step's matmuls timed in isolation ──
+
+/// Zeros `[1, 1, n]` bf16: a one-row input of the right width (timing only).
+fn draftPartsUbenchZeros(n: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    var z = mlx.mlx_array_new();
+    const sh = [_]c_int{ 1, 1, n };
+    try mlx.check(mlx.mlx_zeros(&z, &sh, 3, .bfloat16, s));
+    return z;
+}
+
+const DRAFT_PARTS_UBENCH_OPS = 32;
+
+/// ms per matmul for `DRAFT_PARTS_UBENCH_OPS` independent one-row products evaluated together (one sync amortized over all of them).
+fn draftPartsUbenchTime(tio: std.Io, x: mlx.mlx_array, w_t: mlx.mlx_array, q: ?QLin, s: mlx.mlx_stream) !f64 {
+    var outs: [DRAFT_PARTS_UBENCH_OPS]mlx.mlx_array = undefined;
+    var ns: u64 = 0;
+    for (0..4) |round| {
+        var made: usize = 0;
+        defer for (outs[0..made]) |o| {
+            _ = mlx.mlx_array_free(o);
+        };
+        var sw = io_util.Stopwatch.init(tio);
+        while (made < DRAFT_PARTS_UBENCH_OPS) : (made += 1) outs[made] = try linFn(x, w_t, q, s);
+        const vec = mlx.mlx_vector_array_new_data(&outs, made);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_eval(vec));
+        if (round > 0) ns += sw.read(); // round 0 warms the kernel
+    }
+    return @as(f64, @floatFromInt(ns)) / 1.0e6 / @as(f64, @floatFromInt(3 * DRAFT_PARTS_UBENCH_OPS));
+}
+
+/// The three layouts of one dense projection as the loader keeps it: `ownAndTranspose2D` leaves a transposed VIEW of the
+/// checkpoint's `[out, in]` rows (strides [1, in]), which MLX's `check_transpose` reads as transposed, so the step already runs
+/// the plain gemv kernel (as loaded); the same weight copied to contiguous `[in, out]` (MLX's gemv_t at one row); and 4-bit.
+/// Adds each to `acc`.
+fn draftPartsUbenchProjection(tio: std.Io, w_t: mlx.mlx_array, s: mlx.mlx_stream, acc: *[3]f64) !void {
+    const in_dim = mlx.getShape(w_t)[0];
+    const x = try draftPartsUbenchZeros(in_dim, s);
+    defer _ = mlx.mlx_array_free(x);
+    acc[0] += try draftPartsUbenchTime(tio, x, w_t, null, s);
+    var wc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wc);
+    try mlx.check(mlx.mlx_contiguous(&wc, w_t, false, s));
+    try mlx.check(mlx.mlx_array_eval(wc));
+    acc[1] += try draftPartsUbenchTime(tio, x, wc, null, s);
+    var q = try quantizeT(w_t, s);
+    defer q.deinit();
+    acc[2] += try draftPartsUbenchTime(tio, x, w_t, q, s);
+}
+
+/// Logs the draft step's matmuls by part: the tied head (dense through the per-step transposed view, as `stepArr` takes
+/// it, and 4-bit Latin-cut when bound) and every projection summed over the drafter (pre and post projection plus each
+/// layer's q, o, gate, up, down) in its three layouts (`draftPartsUbenchProjection`). What the parts do not cover of a timed draft is attention and glue.
+pub fn draftPartsUbenchParts(dp: *DrafterModel) !void {
+    const s = dp.s;
+    const tio = std.Io.Threaded.global_single_threaded.io();
+    const x = try draftPartsUbenchZeros(@intCast(dp.config.hidden_size), s);
+    defer _ = mlx.mlx_array_free(x);
+    var ew_t = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ew_t);
+    try mlx.check(mlx.mlx_transpose_axes(&ew_t, dp.embed_w, &[_]c_int{ 1, 0 }, 2, s));
+    const head_dense = try draftPartsUbenchTime(tio, x, ew_t, null, s);
+    const head_q4: f64 = if (dp.head_q4) |hq| try draftPartsUbenchTime(tio, x, .{}, hq, s) else -1;
+    var acc = [3]f64{ 0, 0, 0 };
+    try draftPartsUbenchProjection(tio, dp.pre_proj_w_t, s, &acc);
+    try draftPartsUbenchProjection(tio, dp.post_proj_w_t, s, &acc);
+    for (dp.layers) |*lw| {
+        inline for (.{ "q_w_t", "o_w_t", "gate_w_t", "up_w_t", "down_w_t" }) |f| try draftPartsUbenchProjection(tio, @field(lw, f), s, &acc);
+    }
+    log.info("[draft-parts] head: dense through the transposed view {d:.3} ms, 4-bit Latin {d:.3} ms (-1: not bound)\n", .{ head_dense, head_q4 });
+    log.info("[draft-parts] projections, {d} layers plus pre and post: dense as loaded (a transposed view, plain gemv) {d:.3} ms, dense contiguous [in, out] (gemv_t) {d:.3} ms, 4-bit {d:.3} ms\n", .{ dp.layers.len, acc[0], acc[1], acc[2] });
+}
+
+/// The cut head's `[.., K]` logits scattered into a `[.., vocab]` row, every other id at -1e30.
+fn drafterQuant4ScatterHead(yk: mlx.mlx_array, idx: mlx.mlx_array, vocab: u32, s: mlx.mlx_stream) !mlx.mlx_array {
+    const ys = mlx.getShape(yk);
+    var full_shape: [8]c_int = undefined;
+    @memcpy(full_shape[0..ys.len], ys);
+    full_shape[ys.len - 1] = @intCast(vocab);
+    const neg_val: f32 = -1.0e30;
+    const one = [_]c_int{1};
+    const neg = mlx.mlx_array_new_data(&neg_val, &one, 1, .float32);
+    defer _ = mlx.mlx_array_free(neg);
+    var full = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(full);
+    try mlx.check(mlx.mlx_full(&full, &full_shape, ys.len, neg, mlx.mlx_array_dtype(yk), s));
+    var ib = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ib);
+    try mlx.check(mlx.mlx_broadcast_to(&ib, idx, ys.ptr, ys.len, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_put_along_axis(&out, full, ib, yk, -1, s));
+    return out;
+}
+
 // ── Weight loading ──
 
 /// Load a drafter from `model_dir`. After loading, call `bind(target)`.
@@ -592,7 +894,7 @@ pub fn loadDrafter(
     defer weights.deinit();
 
     if (weights.get("pre_projection.scales") != null) {
-        log.info("[drafter] quantized checkpoint — dequantizing to bf16\n", .{});
+        log.info("[drafter] quantized checkpoint - dequantizing to bf16\n", .{});
     }
 
     // Globals — embed/norm don't need transposing (used in matmul-as-take and rmsnorm).
@@ -623,6 +925,9 @@ pub fn loadDrafter(
             _ = mlx.mlx_array_free(lw.up_w_t);
             _ = mlx.mlx_array_free(lw.down_w_t);
             _ = mlx.mlx_array_free(lw.layer_scalar);
+            inline for (.{ "q_q4", "o_q4", "gate_q4", "up_q4", "down_q4" }) |f| {
+                if (@field(lw, f)) |*q| q.deinit();
+            }
         }
     }
 
@@ -734,6 +1039,24 @@ pub fn loadDrafter(
         rope_freqs_full = freqs_arr;
     }
 
+    // The projections kept 4-bit beside the dense ones (which stay for the off path).
+    var pre_q4: ?QLin = null;
+    errdefer if (pre_q4) |*q| q.deinit();
+    var post_q4: ?QLin = null;
+    errdefer if (post_q4) |*q| q.deinit();
+    if (drafterQuant4Layers()) {
+        pre_q4 = try quantizeT(pre_proj_w_t, s);
+        post_q4 = try quantizeT(post_proj_w_t, s);
+        for (layers) |*lw| {
+            lw.q_q4 = try quantizeT(lw.q_w_t, s);
+            lw.o_q4 = try quantizeT(lw.o_w_t, s);
+            lw.gate_q4 = try quantizeT(lw.gate_w_t, s);
+            lw.up_q4 = try quantizeT(lw.up_w_t, s);
+            lw.down_q4 = try quantizeT(lw.down_w_t, s);
+        }
+        log.info("[drafter-4bit] layers: pre and post projection and {d} layers' q, o, gate, up, down at 4-bit group 64 (MLX_SERVE_DRAFTER_LAYERS_4BIT=1)\n", .{layers.len});
+    }
+
     // Eagerly evaluate all weights so they're materialized on the GPU.
     {
         const eval_vec = mlx.mlx_vector_array_new();
@@ -780,6 +1103,8 @@ pub fn loadDrafter(
         .target_embed_w = mlx.mlx_array_new(),
         .target_embed_scale = 1.0,
         .rope_freqs_full = rope_freqs_full,
+        .pre_q4 = pre_q4,
+        .post_q4 = post_q4,
     };
 }
 
@@ -853,12 +1178,15 @@ fn embedTargetTokenArr(
     id_arr: mlx.mlx_array,
 ) !mlx.mlx_array {
     const emb = try embedTableRow(self.s, target.emb_w, target.emb_s, target.emb_b, &target.config, id_arr);
+    // Owned until returned or freed below (the success paths return after their own free of it).
+    errdefer _ = mlx.mlx_array_free(emb);
 
     // Apply embed_scale (Gemma 4: sqrt(target.hidden_size)).
     if (self.target_embed_scale != 1.0) {
-        const sc = mlx.mlx_array_new_float(self.target_embed_scale);
+        const sc = try stepScalar(self.target_embed_scale, self.s);
         defer _ = mlx.mlx_array_free(sc);
         var scaled = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(scaled);
         try mlx.check(mlx.mlx_multiply(&scaled, emb, sc, self.s));
         _ = mlx.mlx_array_free(emb);
         return scaled;
@@ -893,6 +1221,7 @@ fn embedTableRow(
         defer _ = mlx.mlx_array_free(cast);
         try mlx.check(mlx.mlx_astype(&cast, tw, .bfloat16, s));
         var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out); // owned until returned
         try mlx.check(mlx.mlx_reshape(&out, cast, &out_shape, 3, s));
         return out;
     }
@@ -925,18 +1254,21 @@ fn embedTableRow(
     ));
 
     var emb = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(emb); // owned until returned
     try mlx.check(mlx.mlx_reshape(&emb, dequant, &out_shape, 3, s));
     return emb;
 }
 
 inline fn rmsNormFn(x: mlx.mlx_array, w: mlx.mlx_array, eps: f32, s: mlx.mlx_stream) !mlx.mlx_array {
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out); // a failed op frees its own output
     try mlx.check(mlx.mlx_fast_rms_norm(&out, x, w, eps, s));
     return out;
 }
 
 inline fn matmulFn(x: mlx.mlx_array, w_t: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out); // a failed op frees its own output
     try mlx.check(mlx.mlx_matmul(&out, x, w_t, s));
     return out;
 }
@@ -949,13 +1281,13 @@ fn geglu(gate: mlx.mlx_array, up: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_arr
     // back to `0.5 * gate * (1 + tanh(sqrt(2/pi) * (gate + 0.044715 * gate^3)))`.
     // Simpler exact-equivalent path: use `mlx_gelu_fast_approx` if present.
     // For robust correctness we compute manually with mlx ops.
-    const c0 = mlx.mlx_array_new_float(0.7978845608028654); // sqrt(2/pi)
+    const c0 = try stepScalar(0.7978845608028654, s); // sqrt(2/pi)
     defer _ = mlx.mlx_array_free(c0);
-    const c1 = mlx.mlx_array_new_float(0.044715);
+    const c1 = try stepScalar(0.044715, s);
     defer _ = mlx.mlx_array_free(c1);
-    const half = mlx.mlx_array_new_float(0.5);
+    const half = try stepScalar(0.5, s);
     defer _ = mlx.mlx_array_free(half);
-    const one = mlx.mlx_array_new_float(1.0);
+    const one = try stepScalar(1.0, s);
     defer _ = mlx.mlx_array_free(one);
 
     var g3 = mlx.mlx_array_new();
@@ -994,8 +1326,137 @@ fn geglu(gate: mlx.mlx_array, up: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_arr
     try mlx.check(mlx.mlx_multiply(&gelu_out, half_g, one_plus, s));
 
     var prod = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(prod); // a failed op frees its own output
     try mlx.check(mlx.mlx_multiply(&prod, gelu_out, up, s));
     return prod;
+}
+
+// ── The drafter's query position and sliding view ──
+//
+// Two port defects against mlx-vlm 0.7.10's gemma4_assistant (`speculative/mtp.py` `_mtp_rounds`,
+// `drafters/gemma4_assistant/masks.py` `make_drafter_masks`):
+//   1. The sliding mask compared the query's ABSOLUTE position with the row index of the target's
+//      sliding view, which is a TAIL of the cache (its last row is the newest token). Past about
+//      two windows of context every key was masked, MLX's SDPA returned zeros, and the drafter's three
+//      sliding layers saw no context; between one and two windows they saw only part of it.
+//      Fixed: keep the view's newest `sliding_window` rows, no mask (the query sits on the newest
+//      cached row, so those rows are exactly its bidirectional window).
+//   2. The query rotated at `cache.step`, the position of the token being drafted from, one past
+//      the position mlx-vlm uses (`_mtp_draft_position` = kv length - 1, the token whose hidden is
+//      h_prev). Fixed: the target's own RoPE anchor minus one.
+// MLX_SERVE_DRAFTER_CACHE_VIEW_OFF=1 restores both old behaviours.
+
+var drafter_cache_view_off_cached: ?bool = null;
+var drafter_no_gate_cached: ?bool = null;
+var drafts_early_submit_off_cached: ?bool = null;
+var drafter_round_log_cached: ?bool = null;
+
+fn envIsOne(name: [*:0]const u8) bool {
+    const raw = std.c.getenv(name) orelse return false;
+    return std.mem.eql(u8, std.mem.sliceTo(raw, 0), "1");
+}
+
+/// True when MLX_SERVE_DRAFTER_CACHE_VIEW_OFF=1 keeps the pre-row-153d drafter path. Logs one `[drafter-cache-view]` line the
+/// first time it is read with the fix on.
+pub fn drafterCacheViewOff() bool {
+    if (drafter_cache_view_off_cached) |v| return v;
+    const off = envIsOne("MLX_SERVE_DRAFTER_CACHE_VIEW_OFF");
+    drafter_cache_view_off_cached = off;
+    if (!off) log.info("[drafter-cache-view] Gemma assistant drafter: query at the last cached position, sliding layers read the newest window of the target's view (MLX_SERVE_DRAFTER_CACHE_VIEW_OFF=1 restores the old path)\n", .{});
+    return off;
+}
+
+/// Measurement aid for the acceptance job (not part of the fix): MLX_SERVE_DRAFTER_NO_GATE=1 keeps the
+/// drafter's per-draft runtime gate from switching drafting off.
+/// A drafter round submits its draft chain before it builds the verify, so the GPU runs the drafts while
+/// the host builds the verify's graph. MLX_SERVE_DRAFTS_EARLY_SUBMIT_OFF=1 keeps the single submit of the whole round.
+pub fn draftsEarlySubmitOff() bool {
+    if (drafts_early_submit_off_cached) |v| return v;
+    const off = envIsOne("MLX_SERVE_DRAFTS_EARLY_SUBMIT_OFF");
+    drafts_early_submit_off_cached = off;
+    if (!off) log.info("[drafts-early-submit] drafter round: the drafts are submitted before the verify is built (MLX_SERVE_DRAFTS_EARLY_SUBMIT_OFF=1 keeps one submit)\n", .{});
+    return off;
+}
+
+pub fn drafterNoGate() bool {
+    if (drafter_no_gate_cached) |v| return v;
+    const on = envIsOne("MLX_SERVE_DRAFTER_NO_GATE");
+    drafter_no_gate_cached = on;
+    return on;
+}
+
+/// Measurement aid: MLX_SERVE_DRAFTER_ROUND_LOG=1 logs one `[drafter-round]` line per drafter round.
+var drafter_round_trace_cached: ?bool = null;
+var drafter_rollback_off_cached: ?bool = null;
+
+/// A diagnostic arm: MLX_SERVE_DRAFTER_NO_SNAPSHOT=1 skips a drafter round's cache snapshot when the rollback can
+/// serve every outcome of the round (`KVCache.truncateServesAfterWrite` for the shortest kept length), so no second
+/// reference to the K/V buffers exists during the verify's write. A round the prediction misjudged fails the request
+/// (`error.DrafterNoSnapshotMisjudged`) instead of restoring. Logs one `[drafter-no-snapshot]` line the first time it is read with the arm on.
+var drafter_no_snapshot_cached: ?bool = null;
+pub fn drafterNoSnapshotOn() bool {
+    if (drafter_no_snapshot_cached) |v| return v;
+    const on = envIsOne("MLX_SERVE_DRAFTER_NO_SNAPSHOT");
+    drafter_no_snapshot_cached = on;
+    if (on) log.info("[drafter-no-snapshot] a round the rollback can serve takes no cache snapshot (diagnostic arm)\n", .{});
+    return on;
+}
+
+/// A partial accept keeps the verify's own K/V (an offset rollback) and takes the next round's
+/// hidden from the verify's capture at the accepted row, so no restore and no re-forward run. MLX_SERVE_DRAFTER_ROLLBACK_OFF=1 keeps
+/// the restore and the re-forward. Logs one `[drafter-rollback]` line the first time it is read with the change on.
+pub fn drafterRollbackOff() bool {
+    if (drafter_rollback_off_cached) |v| return v;
+    const off = envIsOne("MLX_SERVE_DRAFTER_ROLLBACK_OFF");
+    drafter_rollback_off_cached = off;
+    if (!off) log.info("[drafter-rollback] a partial accept rolls the cache back to the kept rows and reuses the verify's hidden (MLX_SERVE_DRAFTER_ROLLBACK_OFF=1 restores and re-runs the target)\n", .{});
+    return off;
+}
+
+/// Measurement aid (a probe): MLX_SERVE_DRAFTER_ROUND_TRACE=1 times each drafter round on the host, the drafts and
+/// verify to their sync, the partial-accept re-forward forced to its own sync, and whether the round follows a `restore`;
+/// one `[drafter-round-time]` line a round. The forced sync changes the overlap a plain round has, so it is never on in a timed pair.
+pub fn drafterRoundTraceOn() bool {
+    if (drafter_round_trace_cached) |v| return v;
+    const on = envIsOne("MLX_SERVE_DRAFTER_ROUND_TRACE");
+    drafter_round_trace_cached = on;
+    if (on) log.info("[drafter-round-time] drafter round times on (probe; forces a sync after the partial-accept re-forward)\n", .{});
+    return on;
+}
+
+pub fn drafterRoundLog() bool {
+    if (drafter_round_log_cached) |v| return v;
+    const on = envIsOne("MLX_SERVE_DRAFTER_ROUND_LOG");
+    drafter_round_log_cached = on;
+    return on;
+}
+
+/// The drafter's RoPE position for a round: the last cached token's, whose hidden is h_prev
+/// (mlx-vlm `_mtp_draft_position(kv_valid_len)` = `max(kv_valid_len - 1, 0)`). `anchor` is the
+/// number of cached tokens as the target's RoPE counts them.
+pub fn drafterCacheViewQueryPos(anchor: usize) c_int {
+    return @intCast(if (anchor > 0) anchor - 1 else 0);
+}
+
+/// Rows of a sliding layer's view the drafter query attends: the newest `window`. The view ends at
+/// the newest cached row, which is the query's own position, so a key `window` or more rows back is
+/// outside the bidirectional window (HF and mlx-vlm: `|q - k| < window`).
+pub fn drafterCacheViewSlidingRows(kv_len: c_int, window: c_int) c_int {
+    if (window <= 0 or kv_len <= window) return kv_len;
+    return window;
+}
+
+/// The last `rows` entries of a `[B, H, T, D]` array along axis 2. Caller frees.
+fn sliceTailRows(s: mlx.mlx_stream, arr: mlx.mlx_array, rows: c_int) !mlx.mlx_array {
+    const shape = mlx.getShape(arr);
+    if (shape.len != 4 or rows > shape[2]) return error.DrafterKvShape;
+    const start = [_]c_int{ 0, 0, shape[2] - rows, 0 };
+    const stop = [_]c_int{ shape[0], shape[1], shape[2], shape[3] };
+    const strides = [_]c_int{ 1, 1, 1, 1 };
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_slice(&out, arr, &start, 4, &stop, 4, &strides, 4, s));
+    return out;
 }
 
 /// Build a bidirectional sliding-window mask of shape `[1, 1, query_len, kv_len]`.
@@ -1130,7 +1591,7 @@ fn layerForward(
     defer _ = mlx.mlx_array_free(x_normed);
 
     // ── Q projection + Q norm + RoPE ──
-    const q_proj = try matmulFn(x_normed, layer.q_w_t, s);
+    const q_proj = try linFn(x_normed, layer.q_w_t, layer.q_q4, s);
     defer _ = mlx.mlx_array_free(q_proj);
 
     const q_shape = [_]c_int{ 1, 1, n_heads, head_dim };
@@ -1181,21 +1642,45 @@ fn layerForward(
     defer if (mask_owned) |m| {
         _ = mlx.mlx_array_free(m);
     };
-    mask_owned = if (layer.layer_type == .sliding_attention)
-        try buildSwaMask(rope_offset, kv_len, @intCast(self.config.sliding_window), s)
-    else
-        try buildFullMask(rope_offset, kv_len, s);
+    // The view's rows are relative to its tail, not absolute positions. A sliding
+    // layer keeps the newest `sliding_window` rows and needs no mask; a full layer's view holds
+    // exactly the cached rows, so it needs none either (mlx-vlm `bidirectional_full_mask` is None
+    // when every key is inside the valid length).
+    var tail_k: mlx.mlx_array = .{ .ctx = null };
+    defer if (tail_k.ctx != null) {
+        _ = mlx.mlx_array_free(tail_k);
+    };
+    var tail_v: mlx.mlx_array = .{ .ctx = null };
+    defer if (tail_v.ctx != null) {
+        _ = mlx.mlx_array_free(tail_v);
+    };
+    if (!drafterCacheViewOff()) {
+        if (layer.layer_type == .sliding_attention) {
+            const keep_rows = drafterCacheViewSlidingRows(kv_len, @intCast(self.config.sliding_window));
+            if (keep_rows < kv_len) {
+                tail_k = try sliceTailRows(s, full_k, keep_rows);
+                tail_v = try sliceTailRows(s, full_v, keep_rows);
+            }
+        }
+    } else {
+        mask_owned = if (layer.layer_type == .sliding_attention)
+            try buildSwaMask(rope_offset, kv_len, @intCast(self.config.sliding_window), s)
+        else
+            try buildFullMask(rope_offset, kv_len, s);
+    }
+    const att_k = if (tail_k.ctx != null) tail_k else full_k;
+    const att_v = if (tail_v.ctx != null) tail_v else full_v;
 
     // SDPA
     const scale: f32 = 1.0; // Gemma 4 uses scale=1.0 (q_norm absorbs it)
     var attn_out = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(attn_out);
     if (mask_owned) |mask| {
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, scale, "array", mask, .{ .ctx = null }, false, s));
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, att_k, att_v, scale, "array", mask, .{ .ctx = null }, false, s));
     } else {
         const none_mask = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(none_mask);
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, scale, "", none_mask, .{ .ctx = null }, false, s));
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, att_k, att_v, scale, "", none_mask, .{ .ctx = null }, false, s));
     }
 
     // [B, H, S, D] → [B, S, H*D]
@@ -1209,13 +1694,18 @@ fn layerForward(
     try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &flat_shape, 3, s));
 
     // O projection
-    const o_proj = try matmulFn(attn_flat, layer.o_w_t, s);
+    const o_proj = try linFn(attn_flat, layer.o_w_t, layer.o_q4, s);
     defer _ = mlx.mlx_array_free(o_proj);
 
     // post_attn_norm + residual add
     const o_normed = try rmsNormFn(o_proj, layer.post_attn_norm, eps, s);
     defer _ = mlx.mlx_array_free(o_normed);
     var h_attn = mlx.mlx_array_new();
+    // H_attn is freed below once the MLP's residual add has read it; until then a failing op frees it.
+    var h_attn_live = true;
+    errdefer if (h_attn_live) {
+        _ = mlx.mlx_array_free(h_attn);
+    };
     try mlx.check(mlx.mlx_add(&h_attn, residual, o_normed, s));
 
     // ── MLP ──
@@ -1223,27 +1713,34 @@ fn layerForward(
     const ff_in = try rmsNormFn(h_attn, layer.pre_ff_norm, eps, s);
     defer _ = mlx.mlx_array_free(ff_in);
 
-    const gate = try matmulFn(ff_in, layer.gate_w_t, s);
+    const gate = try linFn(ff_in, layer.gate_w_t, layer.gate_q4, s);
     defer _ = mlx.mlx_array_free(gate);
-    const up = try matmulFn(ff_in, layer.up_w_t, s);
+    const up = try linFn(ff_in, layer.up_w_t, layer.up_q4, s);
     defer _ = mlx.mlx_array_free(up);
 
     const act = try geglu(gate, up, s);
     defer _ = mlx.mlx_array_free(act);
-    const down = try matmulFn(act, layer.down_w_t, s);
+    const down = try linFn(act, layer.down_w_t, layer.down_q4, s);
     defer _ = mlx.mlx_array_free(down);
 
     const ff_normed = try rmsNormFn(down, layer.post_ff_norm, eps, s);
     defer _ = mlx.mlx_array_free(ff_normed);
 
     var h_ff = mlx.mlx_array_new();
+    var h_ff_live = true;
+    errdefer if (h_ff_live) {
+        _ = mlx.mlx_array_free(h_ff);
+    };
     try mlx.check(mlx.mlx_add(&h_ff, ff_residual, ff_normed, s));
     _ = mlx.mlx_array_free(ff_residual);
+    h_attn_live = false;
 
     // Layer scalar (broadcast multiply).
     var h_scaled = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(h_scaled);
     try mlx.check(mlx.mlx_multiply(&h_scaled, h_ff, layer.layer_scalar, s));
     _ = mlx.mlx_array_free(h_ff);
+    h_ff_live = false;
 
     return h_scaled;
 }
@@ -1365,6 +1862,7 @@ fn maskedLmHead(
 
     // sel_logits is bf16 already (drafter weights are bf16), no cast needed.
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out); // a failed op frees its own output
     try mlx.check(mlx.mlx_put_along_axis(&out, bg, selected_canonical, sel_logits, -1, s));
     return out;
 }
@@ -1379,9 +1877,9 @@ fn maskedLmHead(
 ///       config). The KV cache to read from is supplied separately as `cache`.
 ///   `cache` — KV cache to cross-attend into. Phase 2 makes this per-slot;
 ///       legacy single-slot callers pass `&target.cache`.
-///   `rope_offset` — Q rotation position. Caller passes `cache.step` on the
-///       first draft of a round; subsequent drafts in the same round use the
-///       SAME offset (per upstream `set_shared_kv`).
+///   `rope_offset`: Q rotation position, the last cached token's;
+///       `cache.step` under MLX_SERVE_DRAFTER_CACHE_VIEW_OFF=1). Every draft in a round
+///       uses the SAME offset (per upstream `set_shared_kv`).
 ///
 /// Output: `DrafterStepOut` — caller frees both arrays.
 pub fn step(
@@ -1426,13 +1924,18 @@ pub fn stepArr(
     {
         const vec = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(vec);
-        _ = mlx.mlx_vector_array_append_value(vec, tok_embed);
-        _ = mlx.mlx_vector_array_append_value(vec, target_hidden);
+        try mlx.check(mlx.mlx_vector_array_append_value(vec, tok_embed));
+        try mlx.check(mlx.mlx_vector_array_append_value(vec, target_hidden));
         try mlx.check(mlx.mlx_concatenate_axis(&inputs_embeds, vec, 2, s));
     }
 
     // ── pre_projection: 2*backbone → drafter hidden ──
-    var h = try matmulFn(inputs_embeds, self.pre_proj_w_t, s);
+    var h = try linFn(inputs_embeds, self.pre_proj_w_t, self.pre_q4, s);
+    // Every intermediate is owned until it is freed or returned, so a failing later op leaks none of them.
+    var h_owned = true;
+    errdefer if (h_owned) {
+        _ = mlx.mlx_array_free(h);
+    };
 
     // ── Forward through drafter layers (cross-attn into target's KV) ──
     for (self.layers) |*lw| {
@@ -1444,10 +1947,19 @@ pub fn stepArr(
     // ── Final norm + post_projection (next-step h_prev) ──
     const h_normed = try rmsNormFn(h, self.norm_w, self.config.rms_norm_eps, s);
     _ = mlx.mlx_array_free(h);
-    const h_post = try matmulFn(h_normed, self.post_proj_w_t, s);
+    h_owned = false;
+    // Also freed explicitly below on the success path, right before the return, which nothing fallible precedes.
+    errdefer _ = mlx.mlx_array_free(h_normed);
+    const h_post = try linFn(h_normed, self.post_proj_w_t, self.post_q4, s);
+    errdefer _ = mlx.mlx_array_free(h_post);
 
     // ── LM head ──
-    const logits = if (self.masked != null)
+    const logits = if (self.head_q4) |hq| blk: {
+        // The Latin-cut 4-bit head, scattered back to the full vocab.
+        const yk = try linFn(h_normed, .{}, hq, s);
+        defer _ = mlx.mlx_array_free(yk);
+        break :blk try drafterQuant4ScatterHead(yk, self.head_idx, self.config.vocab_size, s);
+    } else if (self.masked != null)
         try maskedLmHead(self, h_normed)
     else if (self.config.tie_word_embeddings) blk: {
         // Tied: logits = h_normed @ embed_w.T. embed_w is [vocab, hidden] so
@@ -1513,8 +2025,8 @@ test "drafter: embedTableRow handles dense bf16 and mixed-quant target tables (b
     try mlx.check(mlx.mlx_astype(&emb_f32, emb, .float32, s));
     try mlx.check(mlx.mlx_array_eval(emb_f32));
     const vals = mlx.mlx_array_data_float32(emb_f32).?;
-    try testing.expect(@abs(vals[0] - 3.0) < 0.05); // row 3, col 0
-    try testing.expect(@abs(vals[10] - 3.10) < 0.05); // row 3, col 10
+    try testing.expect(@abs(vals[0] - 3.0) < 0.05); // the fourth row, first column
+    try testing.expect(@abs(vals[10] - 3.10) < 0.05); // the fourth row, eleventh column
 
     // Mixed-precision target: the table quantized 8-bit/gs32 while the
     // config declares 4-bit/gs64 (the OptiQ class). Config-global
@@ -1856,6 +2368,68 @@ test "DrafterConfig.layerHeadDim respects per-layer-type" {
     try testing.expectEqual(@as(u32, 512), cfg.layerHeadDim(1));
 }
 
+test "drafter-cache-view: the drafter query sits on the last cached token (mlx-vlm _mtp_draft_position)" {
+    try testing.expectEqual(@as(c_int, 0), drafterCacheViewQueryPos(0));
+    try testing.expectEqual(@as(c_int, 0), drafterCacheViewQueryPos(1));
+    try testing.expectEqual(@as(c_int, 7999), drafterCacheViewQueryPos(8000));
+}
+
+test "drafter-cache-view: a sliding layer keeps the newest window of its view" {
+    try testing.expectEqual(@as(c_int, 500), drafterCacheViewSlidingRows(500, 1024));
+    try testing.expectEqual(@as(c_int, 1024), drafterCacheViewSlidingRows(1024, 1024));
+    // A verify of 6 rows leaves a view of window + 5 rows.
+    try testing.expectEqual(@as(c_int, 1024), drafterCacheViewSlidingRows(1029, 1024));
+    // No window configured: the whole view.
+    try testing.expectEqual(@as(c_int, 5000), drafterCacheViewSlidingRows(5000, 0));
+}
+
+test "drafter-cache-view: the old absolute-position sliding mask hides every key of a long context's tail view" {
+    // The defect the drafter cache view fixes: at 8,000 cached tokens the target's sliding view holds its newest
+    // 1,029 rows (window 1,024 plus a 6-row verify), indexed 0 to 1,028, while the old mask placed
+    // the query at absolute position 8,000. Every key fell outside the window, so MLX's SDPA
+    // returned zeros for all three sliding layers.
+    const s = mlx.gpuStream();
+    const mask = (try buildSwaMask(8000, 1029, 1024, s)) orelse return error.TestExpectedMask;
+    defer _ = mlx.mlx_array_free(mask);
+    var mask_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mask_f32);
+    try mlx.check(mlx.mlx_astype(&mask_f32, mask, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(mask_f32));
+    const vals = mlx.mlx_array_data_float32(mask_f32).?;
+    for (vals[0..1029]) |v| try testing.expect(std.math.isInf(v) and v < 0);
+    // Short context (whole history in the view): the old mask was a no-op, as it should be.
+    try testing.expect((try buildSwaMask(500, 500, 1024, s)) == null);
+}
+
+test "drafter-cache-view: sliceTailRows keeps the newest rows of a [B, H, T, D] view" {
+    const s = mlx.gpuStream();
+    var data: [1 * 2 * 6 * 4]f32 = undefined;
+    for (0..2) |hh| {
+        for (0..6) |t| {
+            for (0..4) |d| data[(hh * 6 + t) * 4 + d] = @floatFromInt(t);
+        }
+    }
+    const shape = [_]c_int{ 1, 2, 6, 4 };
+    const arr = mlx.mlx_array_new_data(&data, &shape, 4, .float32);
+    defer _ = mlx.mlx_array_free(arr);
+    const tail = try sliceTailRows(s, arr, 3);
+    defer _ = mlx.mlx_array_free(tail);
+    const tshape = mlx.getShape(tail);
+    try testing.expectEqual(@as(c_int, 3), tshape[2]);
+    try testing.expectEqual(@as(c_int, 4), tshape[3]);
+    // Reshape materializes row-major before the raw read.
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    const flat_shape = [_]c_int{2 * 3 * 4};
+    try mlx.check(mlx.mlx_reshape(&flat, tail, &flat_shape, 1, s));
+    try mlx.check(mlx.mlx_array_eval(flat));
+    const vals = mlx.mlx_array_data_float32(flat).?;
+    try testing.expectEqual(@as(f32, 3.0), vals[0]); // head 0, oldest kept row = the fourth row
+    try testing.expectEqual(@as(f32, 5.0), vals[2 * 4]); // head 0, newest row
+    try testing.expectEqual(@as(f32, 3.0), vals[3 * 4]); // head 1, oldest kept row
+    try testing.expectError(error.DrafterKvShape, sliceTailRows(s, arr, 7));
+}
+
 test "LayerType.fromString" {
     try testing.expectEqual(LayerType.sliding_attention, try LayerType.fromString("sliding_attention"));
     try testing.expectEqual(LayerType.full_attention, try LayerType.fromString("full_attention"));
@@ -1908,4 +2482,124 @@ test "recommendedBlockSize per-target table (Gemma 4 family)" {
     c_other.model_type = "qwen3";
     c_other.num_hidden_layers = 60;
     try testing.expectEqual(DEFAULT_BLOCK_SIZE, recommendedBlockSize(&c_other));
+}
+
+test "drafter-quant4: a 4-bit projection tracks the dense one, and the cut head scatters back to its ids" {
+    const s = mlx.gpuStream();
+    const IN = 128;
+    const OUT = 64;
+    var wf: [IN * OUT]f32 = undefined;
+    for (0..IN) |i| {
+        for (0..OUT) |o| wf[i * OUT + o] = @sin(@as(f32, @floatFromInt(i * 7 + o * 3))) * 0.05;
+    }
+    const wsh = [_]c_int{ IN, OUT };
+    const w_raw = mlx.mlx_array_new_data(&wf, &wsh, 2, .float32);
+    defer _ = mlx.mlx_array_free(w_raw);
+    var w_t = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w_t);
+    try mlx.check(mlx.mlx_astype(&w_t, w_raw, .bfloat16, s));
+    var xf: [IN]f32 = undefined;
+    for (0..IN) |i| xf[i] = @cos(@as(f32, @floatFromInt(i))) * 0.5;
+    const xsh = [_]c_int{ 1, 1, IN };
+    const x_raw = mlx.mlx_array_new_data(&xf, &xsh, 3, .float32);
+    defer _ = mlx.mlx_array_free(x_raw);
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_astype(&x, x_raw, .bfloat16, s));
+
+    const dense = try linFn(x, w_t, null, s);
+    defer _ = mlx.mlx_array_free(dense);
+    var q = try quantizeT(w_t, s);
+    defer q.deinit();
+    const quant = try linFn(x, w_t, q, s);
+    defer _ = mlx.mlx_array_free(quant);
+    try testing.expectEqual(@as(c_int, OUT), mlx.getShape(quant)[2]);
+    var df = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(df);
+    try mlx.check(mlx.mlx_astype(&df, dense, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(df));
+    var qf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(qf);
+    try mlx.check(mlx.mlx_astype(&qf, quant, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(qf));
+    const dv = mlx.mlx_array_data_float32(df).?;
+    const qv = mlx.mlx_array_data_float32(qf).?;
+    // Orientation: the 4-bit path equals x times its own dequantized rows, transposed (tight); against the dense
+    // weight it only tracks within 4-bit error (loose).
+    var deq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(deq);
+    try mlx.check(mlx.mlx_dequantize(&deq, q.w, q.sc, q.bi, mlx.mlx_optional_int.some(DRAFTER_QUANT4_GROUP), mlx.mlx_optional_int.some(DRAFTER_QUANT4_BITS), "affine", .{}, .{ .value = .bfloat16, .has_value = true }, s));
+    var deq_t = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(deq_t);
+    try mlx.check(mlx.mlx_transpose_axes(&deq_t, deq, &[_]c_int{ 1, 0 }, 2, s));
+    const ref = try linFn(x, deq_t, null, s);
+    defer _ = mlx.mlx_array_free(ref);
+    var rf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(rf);
+    try mlx.check(mlx.mlx_astype(&rf, ref, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(rf));
+    const rv = mlx.mlx_array_data_float32(rf).?;
+    var max_ref: f32 = 0;
+    var max_err_dense: f32 = 0;
+    var max_err_deq: f32 = 0;
+    for (0..OUT) |o| {
+        // @max drops a NaN, so a nonfinite output would pass the tolerances below: reject it first (Codex).
+        try testing.expect(std.math.isFinite(qv[o]) and std.math.isFinite(dv[o]) and std.math.isFinite(rv[o]));
+        max_ref = @max(max_ref, @abs(dv[o]));
+        max_err_dense = @max(max_err_dense, @abs(dv[o] - qv[o]));
+        max_err_deq = @max(max_err_deq, @abs(rv[o] - qv[o]));
+    }
+    try testing.expect(max_ref > 0.01);
+    try testing.expect(max_err_deq < 0.02 * max_ref + 1.0e-3);
+    try testing.expect(max_err_dense < 0.5 * max_ref);
+
+    // Cut head: K = 3 kept ids {5, 0, 7} of a vocab of 8.
+    const ykf = [_]f32{ 1.0, 2.0, 3.0 };
+    const yksh = [_]c_int{ 1, 1, 3 };
+    const yk = mlx.mlx_array_new_data(&ykf, &yksh, 3, .float32);
+    defer _ = mlx.mlx_array_free(yk);
+    const ids = [_]i32{ 5, 0, 7 };
+    const idsh = [_]c_int{3};
+    const idx = mlx.mlx_array_new_data(&ids, &idsh, 1, .int32);
+    defer _ = mlx.mlx_array_free(idx);
+    const full = try drafterQuant4ScatterHead(yk, idx, 8, s);
+    defer _ = mlx.mlx_array_free(full);
+    try mlx.check(mlx.mlx_array_eval(full));
+    const fsh = mlx.getShape(full);
+    try testing.expectEqual(@as(c_int, 8), fsh[2]);
+    const fv = mlx.mlx_array_data_float32(full).?;
+    try testing.expectEqual(@as(f32, 2.0), fv[0]);
+    try testing.expectEqual(@as(f32, 1.0), fv[5]);
+    try testing.expectEqual(@as(f32, 3.0), fv[7]);
+    for ([_]usize{ 1, 2, 3, 4, 6 }) |i| try testing.expect(fv[i] < -1.0e29);
+}
+
+test "drafter-bf16-scalars: a float32 scalar array promotes a bf16 activation, the step's bf16 scalars keep GeGLU in bf16" {
+    const s = mlx.gpuStream();
+    const N = 64;
+    var gf: [N]f32 = undefined;
+    for (0..N) |i| gf[i] = @sin(@as(f32, @floatFromInt(i))) * 2.0;
+    const sh = [_]c_int{ 1, 1, N };
+    const g_raw = mlx.mlx_array_new_data(&gf, &sh, 3, .float32);
+    defer _ = mlx.mlx_array_free(g_raw);
+    var g = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g);
+    try mlx.check(mlx.mlx_astype(&g, g_raw, .bfloat16, s));
+
+    // The mechanism: bf16 times a float32 0-d array is float32 in MLX.
+    const f = mlx.mlx_array_new_float(0.5);
+    defer _ = mlx.mlx_array_free(f);
+    var promoted = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(promoted);
+    try mlx.check(mlx.mlx_multiply(&promoted, g, f, s));
+    try testing.expectEqual(mlx.mlx_dtype.float32, mlx.mlx_array_dtype(promoted));
+
+    // The fix (default, MLX_SERVE_DRAFTER_BF16_SCALARS_OFF unset in tests): the step scalar is bf16 and GeGLU stays bf16.
+    if (!drafterBf16ScalarsOn()) return error.SkipZigTest;
+    const sc = try stepScalar(0.5, s);
+    defer _ = mlx.mlx_array_free(sc);
+    try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(sc));
+    const out = try geglu(g, g, s);
+    defer _ = mlx.mlx_array_free(out);
+    try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(out));
 }

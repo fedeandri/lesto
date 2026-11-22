@@ -249,7 +249,7 @@ pub fn renderPrometheus(m: *const Metrics, w: *std.Io.Writer) !void {
 
     // --- Counters ---
     try writeCounter(w, "vllm:prompt_tokens_total", "Total prompt tokens processed", m.prompt_tokens_total.load());
-    try writeCounter(w, "mlx_serve:prefill_tokens_total", "Prompt tokens actually forwarded through prefill (excludes prefix-cache restores) — the correct numerator for prefill tok/s", m.prefill_tokens_total.load());
+    try writeCounter(w, "mlx_serve:prefill_tokens_total", "Prompt tokens actually forwarded through prefill (excludes prefix-cache restores) - the correct numerator for prefill tok/s", m.prefill_tokens_total.load());
     try writeCounter(w, "mlx_serve:prefix_cache_tokens_total", "Prompt tokens restored from the hot prefix cache instead of being computed", m.prefix_cache_tokens_total.load());
     try writeCounter(w, "vllm:generation_tokens_total", "Total generated tokens", m.generation_tokens_total.load());
     try writeCounter(w, "vllm:request_success_total", "Completed requests", m.requests_success_total.load());

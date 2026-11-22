@@ -1702,6 +1702,26 @@ pub fn promptTailOpensThink(tail: []const u8) bool {
     return endsWithThinkOpenTag(trimmed) != null;
 }
 
+/// The empty, closed thought Gemma 4's chat template appends to the generation
+/// prompt when thinking is off: the reply that follows is meant to be the answer.
+pub const CLOSED_EMPTY_THOUGHT = "<|channel>thought\n<channel|>";
+
+/// True when a rendered generation prompt ENDS with `CLOSED_EMPTY_THOUGHT`
+/// (trailing whitespace ignored). Callers decode the last few prompt tokens.
+pub fn promptTailClosesEmptyThought(tail: []const u8) bool {
+    const trimmed = std.mem.trimEnd(u8, tail, "\n\r\t ");
+    return std.mem.endsWith(u8, trimmed, CLOSED_EMPTY_THOUGHT);
+}
+
+test "promptTailClosesEmptyThought: only the closed empty thought at the end matches" {
+    try std.testing.expect(promptTailClosesEmptyThought("<|turn>model\n<|channel>thought\n<channel|>"));
+    try std.testing.expect(promptTailClosesEmptyThought("<|turn>model\n<|channel>thought\n<channel|>\n"));
+    try std.testing.expect(!promptTailClosesEmptyThought("<|turn>model\n"));
+    try std.testing.expect(!promptTailClosesEmptyThought("<|turn>model\n<|channel>thought\n"));
+    try std.testing.expect(!promptTailClosesEmptyThought("<|channel>thought\n<channel|>more<|turn>model\n"));
+    try std.testing.expect(!promptTailClosesEmptyThought(""));
+}
+
 /// Narrow form used by generation-side phase switches: only a bare `<think>`
 /// tail arms the bare `</think>` boundary.
 pub fn promptTailOpensBareThink(tail: []const u8) bool {
@@ -3458,7 +3478,7 @@ pub fn filterInferredBySchema(
             calls[kept] = tc;
             kept += 1;
         } else {
-            log.warn("  [tool-parse] dropped inferred raw-JSON call '{s}' — name not among the request's tools (data object, not a call)\n", .{tc.name});
+            log.warn("  [tool-parse] dropped inferred raw-JSON call '{s}' - name not among the request's tools (data object, not a call)\n", .{tc.name});
             allocator.free(tc.name);
             allocator.free(tc.arguments);
         }
@@ -6355,7 +6375,7 @@ test "inferBareJsonToolCalls refuses ambiguous and non-matching objects" {
 test "inferBareJsonToolCalls ignores JSON that does not lead the content" {
     const allocator = testing.allocator;
     // Example object mid-prose must never be promoted to a call.
-    const text = "Here is an example of the payload you could send: {\"command\": \"ls\"} — adjust as needed.";
+    const text = "Here is an example of the payload you could send: {\"command\": \"ls\"} - adjust as needed.";
     try testing.expect((try inferBareJsonToolCalls(allocator, text, test_tools_write_bash)) == null);
 }
 
@@ -8550,7 +8570,7 @@ test "streamShouldBufferForTools: Gemma 4 <|tool_call" {
     try testing.expect(streamShouldBufferForTools("hello <|tool_call name=\"x\">"));
 }
 
-test "streamShouldBufferForTools: false positives — <toolkit> etc." {
+test "streamShouldBufferForTools: false positives - <toolkit> etc." {
     // `<toolkit>` and `<toolbar>` have `<tool` as a prefix but the char
     // after is `k` / `b` — not a tag terminator. Must NOT buffer.
     try testing.expect(!streamShouldBufferForTools("here is <toolkit>"));
@@ -9727,7 +9747,7 @@ test "coerceToolArgsToSchema: an explicit JSON null satisfies any typed param (n
     try testing.expectEqualStrings(before, calls[0].arguments);
 }
 
-test "coerceToolArgsToSchema: coercion is SHALLOW — values nested inside a param are untouched" {
+test "coerceToolArgsToSchema: coercion is SHALLOW - values nested inside a param are untouched" {
     // Documented boundary: the layer coerces TOP-LEVEL params against the tool's
     // declared property types. It does NOT recurse into array/object element
     // properties (the tool schema's `items`/nested `properties` are the client's
@@ -10506,7 +10526,7 @@ test "streamShouldBufferForTools: EVERY growing prefix of <function holds" {
     }
 }
 
-test "streamShouldBufferForTools: false positive — bare <function> with no attribute" {
+test "streamShouldBufferForTools: false positive - bare <function> with no attribute" {
     try testing.expect(!streamShouldBufferForTools("here is <function>"));
     try testing.expect(!streamShouldBufferForTools("Wrap it in a <functional> block"));
 }

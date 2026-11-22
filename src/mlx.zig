@@ -118,6 +118,8 @@ pub extern "c" fn mlx_metal_is_available(res: *bool) c_int;
 // Lesto's additions to mlx-c (lib/mlxc-src/mlx/c/metal.cpp): the command-buffer commit policy for what the calling thread encodes.
 pub extern "c" fn mlx_lesto_commit_on_ops_limit_only(on: bool) c_int;
 pub extern "c" fn mlx_lesto_command_buffers_committed() u64;
+// Head-dim-512 SDPA keeps MLX's vector kernel for 2 to 8 queries while on (the calling thread's graph builds).
+pub extern "c" fn mlx_lesto_sdpa_d512_multi_query(on: bool) c_int;
 pub extern "c" fn _mlx_array_is_available(res: *bool, arr: mlx_array) c_int;
 
 // Array creation
@@ -212,6 +214,7 @@ pub extern "c" fn mlx_map_string_to_string_insert(map: mlx_map_string_to_string,
 pub extern "c" fn mlx_map_string_to_string_get(value: *[*:0]const u8, map: mlx_map_string_to_string, key: [*:0]const u8) c_int;
 
 // IO
+pub extern "c" fn mlx_load(res: *mlx_array, file: [*:0]const u8, s: mlx_stream) c_int;
 pub extern "c" fn mlx_load_safetensors(res_0: *mlx_map_string_to_array, res_1: *mlx_map_string_to_string, file: [*:0]const u8, s: mlx_stream) c_int;
 pub const mlx_io_reader = extern struct { ctx: ?*anyopaque = null };
 /// A custom reader's callbacks over its own descriptor (mlx/c/io_types.h `mlx_io_vtable`).
@@ -1043,7 +1046,7 @@ fn latchMlxError(msg: [*:0]const u8, data: ?*anyopaque) callconv(.c) void {
 pub fn installErrorHandler() void {
     if (std.c.getenv("MLX_SERVE_MLX_ERROR_LATCH")) |p| {
         if (std.mem.eql(u8, std.mem.span(p), "0")) {
-            log.info("[mlx] error latch disabled — an MLX error will exit the process\n", .{});
+            log.info("[mlx] error latch disabled - an MLX error will exit the process\n", .{});
             return;
         }
     }

@@ -1395,7 +1395,7 @@ pub fn resolveWeightPrefix(config: *ModelConfig, weights: *const Weights) void {
     for (candidates) |p| {
         if (std.mem.eql(u8, config.weight_prefix, p)) continue;
         if (!hasWeightsUnder(weights, p)) continue;
-        log.info("weight prefix: config implies \"{s}\", checkpoint uses \"{s}\" — using the checkpoint's\n", .{ config.weight_prefix, p });
+        log.info("weight prefix: config implies \"{s}\", checkpoint uses \"{s}\" - using the checkpoint's\n", .{ config.weight_prefix, p });
         config.weight_prefix = p;
         return;
     }
@@ -1458,7 +1458,7 @@ pub fn loadWeightsSingleFile(allocator: std.mem.Allocator, abs_path: []const u8)
     try loadSafetensorsFile(allocator, &weights, pathz, s, .{});
 
     if (weights.count() == 0) {
-        log.err("no usable weights loaded from {s} — corrupt or empty safetensors file?\n", .{abs_path});
+        log.err("no usable weights loaded from {s} - corrupt or empty safetensors file?\n", .{abs_path});
         return error.NoWeightFiles;
     }
     return weights;

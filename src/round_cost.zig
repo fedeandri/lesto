@@ -1584,7 +1584,7 @@ test "round_cost: the legacy layout is the six-bucket grid, writes rc1 and reads
     try testing.expect(parse("rc1\ns 3 16.0 1.0 3\n", .legacy) == null);
 }
 
-test "round_cost: the long layout warm-starts from a legacy file — no user boots cold" {
+test "round_cost: the long layout warm-starts from a legacy file - no user boots cold" {
     var legacy = Table{ .layout = .legacy };
     for (0..MIN_SAMPLES) |_| {
         _ = legacy.observe(2, 1000, 20.0, 2.0, true, false); // bucket 0

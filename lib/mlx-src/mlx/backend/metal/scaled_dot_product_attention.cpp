@@ -804,7 +804,8 @@ std::tuple<bool, std::string> has_fused_kernel(
     if (query_head_dim == 512) {
       int min_key_sequence_length = env::get_var("MLX_SDPA_D512_MIN_KL", 1024);
       bool always = (min_key_sequence_length == 0);
-      if (!always && query_sequence_length != 1) {
+      if (!always && query_sequence_length != 1 &&
+          !metal::sdpa_d512_multi_query()) {
         msg << "the vector attention kernel for head dim 512 defaults to "
                "single-token queries; got query length "
             << query_sequence_length << ".";

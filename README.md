@@ -62,7 +62,7 @@ scripts/build-mlx.sh            # the vendored MLX and mlx-c sources in lib/
 zig build -Doptimize=ReleaseFast
 ```
 
-The binary is `zig-out/bin/lesto` and needs macOS 26.2. The commands it knows are `serve`, `--help` and `--version`.
+The binary is `zig-out/bin/lesto` and needs macOS 26.2. The commands it knows are `serve`, `tune`, `--help` and `--version`.
 
 A build for macOS 14 is made on a macOS 26 Mac, in a separate copy of the tree where the first three commands above have run (the script needs `zig` on `PATH`): `scripts/build-macos14.sh <out-dir>` (Xcode 26.5 or later). It builds MLX itself and checks that the binary and its libraries target macOS 14.0.
 
@@ -79,6 +79,31 @@ Lesto loads MLX-format models. MLX conversions of Gemma 4 are published on [Hugg
 **The server binds `0.0.0.0` by default**, so it is reachable from the local network. Use `--host 127.0.0.1` to keep it on the machine, and `--api-key <token>` to require a key; see [SECURITY.md](SECURITY.md).
 
 Lesto keeps mlx-serve's paths: models are discovered under `~/.mlx-serve/models` when `--model-dir` is not given, logs go to `~/.mlx-serve/logs/`, and saved prefixes persist under `~/.mlx-serve/kv-cache`. The `MLX_SERVE_*` environment switches keep their names too.
+
+## Tuning for your Mac (`lesto tune`)
+
+For Gemma 4 26B-A4B, the verify step runs two MoE expert kernels (gate/up and down) many times a second, and each can be launched in several thread layouts. Lesto ships built-in layouts for two GPU generations (not phones) and turns them on by default: a layout pair chosen on an M4 Pro for the M4 generation, and for the M3 generation a down-kernel layout with the array body chosen on an M3 Pro (its gate/up keeps the previous layout). Every other Mac keeps the previous layouts. `lesto tune` searches the layouts on your own Mac instead and, for the down kernel, which of its two bodies to run (the same arithmetic written two ways, one faster on some GPUs). It keeps a choice only if the kernel's outputs are identical, bit for bit, to the served kernel's, so replies do not change. It writes the result to `~/.mlx-serve/tune/kernel-plans.json`, and `lesto serve` reads that file at its next start. A table written by 0.26.0 is refused after the upgrade (the log says `unknown_schema`); run `lesto tune` again to write a new one.
+
+The tune starts GPU work only while you are away: no input for 5 minutes by default, on AC power, not in Low Power Mode and with no thermal pressure. It stops within seconds of the next key press, mouse move, unplugging or Low Power Mode, throws away the batch it was timing and picks up where it stopped the next time the Mac is idle.
+
+```bash
+lesto tune                       # tune in this terminal, waiting for idle windows
+lesto tune --background          # install a LaunchAgent that tunes while the Mac is idle
+lesto tune --stop                # remove the LaunchAgent and stop a running tune
+lesto tune --show                # the table, the layouts the engine would use, the progress
+lesto tune --verify              # re-check the table's layouts after a macOS update
+lesto tune --reset               # delete the table and the progress
+lesto tune --idle-minutes 10     # a longer wait before a window opens (default 5)
+```
+
+`--background` shows a macOS "Background Items Added" notice for `lesto`; `lesto tune --stop` removes the agent, and the agent removes itself when it is done. A table applies at the next `lesto serve` start: a running server keeps the layouts it chose at its first MoE load.
+
+To go back to the previous layouts, either of these is enough, and neither deletes anything:
+
+- `MLX_SERVE_KERNEL_TABLE=off` makes `lesto serve` ignore the local table (a path in that variable names another table file to read);
+- `MLX_SERVE_MOE_ROWS_LAYOUT=0` turns the MoE rows layouts off altogether, built-in ones included.
+
+[docs/kernel-tune.md](docs/kernel-tune.md) has the table format, the checks, the exit codes and the LaunchAgent.
 
 ## HTTP API
 

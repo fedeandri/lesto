@@ -895,7 +895,7 @@ pub const DflashModel = struct {
         }
         target.config.dflash_bound = true;
         self.buildDraftHead(target, draftHeadBitsFromEnv()) catch |err| {
-            log.warn("[dflash] draft lm_head build failed ({s}) — drafts use the trunk head\n", .{@errorName(err)});
+            log.warn("[dflash] draft lm_head build failed ({s}) - drafts use the trunk head\n", .{@errorName(err)});
         };
     }
 
@@ -2330,7 +2330,7 @@ fn softmaxShare(scores: []const f32, i: usize) f32 {
 /// the anchor row) and the 16-wide trace runs on host — same math as the
 /// reference's sequential loop, chosen path identical, no per-step sync.
 ///
-/// `blk_hidden` is the POST-final-norm block hidden `[1, bs, H]` (row 0 =
+/// `blk_hidden` is the POST-final-norm block hidden `[1, bs, H]` (the first row =
 /// anchor, dropped here — the reference's `logits_start=1`); `draft_logits`
 /// already has the anchor row dropped (`[1, m, V]`).
 pub fn selectPath(
@@ -2506,7 +2506,7 @@ fn projectHeadsNoNorm(
 /// trunk embedding lookup `[1, q_len, hidden]` of `[anchor, mask…]`;
 /// `anchor_pos` is the anchor's absolute position (== trunk `cache.step`).
 /// Returns the post-final-norm hidden `[1, q_len, hidden]` (caller frees;
-/// the caller projects through the trunk lm_head and DROPS row 0). Block
+/// the caller projects through the trunk lm_head and DROPS the first row). Block
 /// K/V transit through the cache's spare capacity and are truncated back
 /// out before returning — the context cache is unchanged.
 pub fn forwardBlock(
@@ -3070,7 +3070,7 @@ test "dflash: no wide verify lane caps the block at the split-K width" {
     try testing.expectEqual(@as(u32, 10), resolveBlockSize(16, 10, true, false, 8));
 }
 
-test "dflash: per-silicon cap table — M3 Ultra rides oMLX's block-8 evidence" {
+test "dflash: per-silicon cap table - M3 Ultra rides oMLX's block-8 evidence" {
     // The cap is a MACHINE measurement, keyed on the CPU brand string (the
     // GPU arch cannot tell Ultra from Max). M3 Ultra -> 8 (oMLX PR #2850:
     // 1.33-1.43x at block 8 on the same pairing); everything else without a
@@ -4422,8 +4422,8 @@ test "dflash: sliding window hides out-of-window context from the block, in-wind
     m.layers[1].layer_type = .sliding_attention;
 
     // ctx_len 12, window 8, block 4 at anchor 12: queries at 12..15.
-    // ctx row 0 (abs 0) is ≥ 8 away from every query → invisible.
-    // ctx row 11 (abs 11) is ≤ 4 away → visible to all queries.
+    // the first ctx row (abs 0) is ≥ 8 away from every query → invisible.
+    // the twelfth ctx row (abs 11) is ≤ 4 away → visible to all queries.
     const Run = struct {
         fn f(mm: *DflashModel, alloc: std.mem.Allocator, st: mlx.mlx_stream, perturb_row: ?usize) ![]f32 {
             var ctx = try DflashCtx.init(alloc, mm, 0);

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const mlx = @import("mlx.zig");
 const keyed_sample = @import("keyed_sample.zig");
 const transformer_mod = @import("transformer.zig");
@@ -18,6 +19,7 @@ const round_cost = @import("round_cost.zig");
 const dflash_policy = @import("dflash_policy.zig");
 const sys_info = @import("sys_info.zig");
 const scheduler_mod = @import("scheduler.zig");
+const restore_dump = @import("restore_dump.zig");
 
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -251,6 +253,53 @@ fn readEnvUsize(name: [:0]const u8, default: usize) usize {
     return std.fmt.parseInt(usize, slice, 10) catch default;
 }
 
+/// A probe: `MLX_SERVE_KROW_FORWARD_PROBE_REPS` rounds (default 8) of k-row forwards, k = 1 to `MLX_SERVE_KROW_FORWARD_PROBE_KMAX`
+/// (default 7, at most 16), the order rotated each round. Each forward takes the prompt's last k ids (real, distinct
+/// tokens, so the experts' union is not one token's), routes at the top-k schedule's steady k (its count set past the
+/// first-k window before each forward, restored after), and is timed to its logits' evaluation. One line per forward.
+fn krowForwardProbeProbe(io: std.Io, xfm: *Transformer, ctx: *ForwardCtx, prompt_ids: []const u32, first_logits: mlx.mlx_array) !void {
+    try mlx.check(mlx.mlx_array_eval(first_logits));
+    const reps = readEnvUsize("MLX_SERVE_KROW_FORWARD_PROBE_REPS", 8);
+    const kmax = @min(@max(readEnvUsize("MLX_SERVE_KROW_FORWARD_PROBE_KMAX", 7), 1), 16);
+    if (prompt_ids.len < kmax) return;
+    const sched = Transformer.topKSchedule();
+    const df_snap = xfm.decode_forwards;
+    const ta_snap = xfm.topk_active;
+    Transformer.topk_verify_advance_quiet = true; // the injected counts are not a reply's (Codex)
+    defer {
+        xfm.decode_forwards = df_snap;
+        xfm.topk_active = ta_snap;
+        Transformer.topk_verify_advance_quiet = false;
+    }
+    // Paired mode (MLX_SERVE_KROW_FORWARD_PROBE_BOTH_K=1, with a schedule): each forward runs twice, at the steady k (count set
+    // to the window's end) and at the first k (count 0), the order alternating by rep, so the two are paired.
+    const both = readEnvBool("MLX_SERVE_KROW_FORWARD_PROBE_BOTH_K") and sched != null;
+    var buf: [16]i32 = undefined;
+    var rep: usize = 0;
+    while (rep < reps) : (rep += 1) {
+        var j: usize = 0;
+        while (j < kmax) : (j += 1) {
+            const k = 1 + (j + rep) % kmax;
+            for (0..k) |i| buf[i] = @intCast(prompt_ids[prompt_ids.len - k + i]);
+            const shape = [_]c_int{ 1, @intCast(k) };
+            const input = mlx.mlx_array_new_data(&buf, &shape, 2, .int32);
+            defer _ = mlx.mlx_array_free(input);
+            const arms: usize = if (both) 2 else 1;
+            for (0..arms) |a| {
+                const first = both and ((a + rep) % 2 == 1);
+                if (sched) |sch| xfm.decode_forwards = if (first) 0 else sch.n;
+                const pos = ctx.cache.step;
+                const sw = io_util.Stopwatch.init(io);
+                const out = try xfm.forwardWith(ctx, input);
+                defer _ = mlx.mlx_array_free(out);
+                try mlx.check(mlx.mlx_array_eval(out));
+                const ns = sw.read();
+                std.debug.print("  [krow-forward-probe] pos={d} k={d} rep={d} us={d} topk={d}\n", .{ pos, k, rep, ns / std.time.ns_per_us, xfm.topk_active });
+            }
+        }
+    }
+}
+
 /// Truthy if the env var is exactly "1". Anything else (unset, "0", "true",
 /// "yes") is false — keep matching surface tight to avoid surprises.
 fn readEnvBool(name: [:0]const u8) bool {
@@ -349,6 +398,32 @@ test "forced recovery leaves room for the whole transition and one answer token"
     try std.testing.expect(!forcedBoundaryCanContinue(0, 3, 3));
     // An in-place activation needs no transition token.
     try std.testing.expect(forcedBoundaryCanContinue(0, 1, 0));
+}
+
+/// The mask the head tail reduces under for a request's forwards: `answer_mask` exactly when the request samples
+/// under it, as `initWithOptions` picks `sampling.suppress_mask`, so the head tail never prepares the other mask first.
+pub fn headTailAnswerFor(sampling: SamplingParams) bool {
+    return sampling.answer_only;
+}
+
+test "head tail mask choice: the head tail's mask choice follows the request, for both kinds and in any order" {
+    const off = SamplingParams{ .temperature = 0.0, .answer_only = true }; // thinking off: samples under answer_mask
+    const on = SamplingParams{ .temperature = 0.0, .answer_only = false }; // thinking on, tools or schema: suppress_mask
+    try std.testing.expect(headTailAnswerFor(off));
+    try std.testing.expect(!headTailAnswerFor(on));
+    // A server alternating the two kinds: each request's choice is its own, never the previous request's.
+    const seq = [_]SamplingParams{ off, on, on, off, off, on };
+    for (seq) |sp| try std.testing.expectEqual(sp.answer_only, headTailAnswerFor(sp));
+}
+
+test "head tail mask choice: initWithOptions sets the head tail's mask choice before its first forward" {
+    const src = @embedFile("generate.zig");
+    const start = std.mem.indexOf(u8, src, "pub fn init" ++ "WithOptions(") orelse return error.CallSiteMoved;
+    const tail = src[start..];
+    const set_at = std.mem.indexOf(u8, tail, "ctx.head_tail_answer = headTail" ++ "AnswerFor(sampling);") orelse return error.FlagNotSet;
+    const ctx_at = std.mem.indexOf(u8, tail, "var ctx: ForwardCtx = options.ctx orelse") orelse return error.CallSiteMoved;
+    const fwd_at = std.mem.indexOf(u8, tail, "forwardWith(&ctx") orelse return error.CallSiteMoved;
+    try std.testing.expect(ctx_at < set_at and set_at < fwd_at);
 }
 
 test "forced recovery is committed and counted exactly once" {
@@ -470,6 +545,12 @@ pub const SamplingParams = struct {
     /// sampling policy. Null = no suppression (kill switch, no-template
     /// models, every non-suppressing arch).
     suppress_mask: ?mlx.mlx_array = null,
+    /// The request's prompt closes an empty thought with thinking off (Gemma 4's
+    /// template, `chat.CLOSED_EMPTY_THOUGHT`): its reply is the answer, so
+    /// `initWithOptions` samples it under `Transformer.answer_mask`, which also
+    /// masks the thought-channel opener. A channel the model opened anyway was
+    /// filed as reasoning and left `content` empty.
+    answer_only: bool = false,
     /// Seeded draws go through `keyed_sample`: a token's noise is a hash of
     /// (seed, position, id), so a draft shares the draw its verify row makes
     /// (row-exact archs, `ModelConfig.rowExactDecode`).
@@ -556,24 +637,78 @@ pub fn installSuppressMask(xfm: *Transformer, tok: *const Tokenizer, chat_templa
         logits_dim - defined_vocab
     else
         0;
-    if (ids.len == 0 and pad_rows == 0) return;
-    xfm.suppress_mask = buildSuppressMask(ids, defined_vocab, logits_dim, xfm.s) catch |err| {
-        log.warn("[suppress] mask build failed ({s}); reserved-token suppression off\n", .{@errorName(err)});
+    if (ids.len != 0 or pad_rows != 0) {
+        xfm.suppress_mask = buildSuppressMask(ids, defined_vocab, logits_dim, xfm.s) catch |err| {
+            log.warn("[suppress] mask build failed ({s}); reserved-token suppression off\n", .{@errorName(err)});
+            return;
+        };
+        log.info(
+            "[suppress] {d} of {d} flagged specials masked from sampling (template + eos exempt); {d} padding rows past id {d} of {d}\n",
+            .{ ids.len, tok.flagged_specials.len, pad_rows, defined_vocab, logits_dim },
+        );
+    }
+    installAnswerMask(xfm, tok, ids, defined_vocab, logits_dim);
+}
+
+/// The thought-channel opener a thinking-off Gemma 4 reply must not emit (`answerMaskIds`).
+pub const THOUGHT_OPEN = "<|channel>";
+
+/// The answer mask's ids: the reserved set plus the thought-channel opener. Caller owns the slice.
+pub fn answerMaskIds(allocator: std.mem.Allocator, reserved: []const u32, open_id: u32) ![]u32 {
+    const out = try allocator.alloc(u32, reserved.len + 1);
+    @memcpy(out[0..reserved.len], reserved);
+    out[reserved.len] = open_id;
+    return out;
+}
+
+/// `MLX_SERVE_ANSWER_MASK_OFF=1`: answer-only requests sample under `suppress_mask`, as before the answer mask.
+pub fn answerMaskDisabled() bool {
+    const v = std.c.getenv("MLX_SERVE_ANSWER_MASK_OFF") orelse return false;
+    return v[0] == '1';
+}
+
+/// Build `Transformer.answer_mask` beside `suppress_mask`. A tokenizer without the opener, the kill
+/// switch, or any failure leaves it null, and answer-only requests then sample under `suppress_mask`.
+fn installAnswerMask(xfm: *Transformer, tok: *const Tokenizer, reserved: []const u32, defined_vocab: usize, logits_dim: usize) void {
+    if (answerMaskDisabled()) {
+        log.info("[suppress] answer mask disabled by env\n", .{});
+        return;
+    }
+    const open_id = tok.specialTokenId(THOUGHT_OPEN) orelse return;
+    if (open_id >= logits_dim) return;
+    const ids = answerMaskIds(xfm.allocator, reserved, open_id) catch |err| {
+        log.warn("[suppress] answer mask ids failed ({s}); answer-only requests keep the reserved mask\n", .{@errorName(err)});
         return;
     };
-    log.info(
-        "[suppress] {d} of {d} flagged specials masked from sampling (template + eos exempt); {d} padding rows past id {d} of {d}\n",
-        .{ ids.len, tok.flagged_specials.len, pad_rows, defined_vocab, logits_dim },
-    );
+    defer xfm.allocator.free(ids);
+    xfm.answer_mask = buildSuppressMask(ids, defined_vocab, logits_dim, xfm.s) catch |err| {
+        log.warn("[suppress] answer mask build failed ({s}); answer-only requests keep the reserved mask\n", .{@errorName(err)});
+        return;
+    };
+    log.info("[suppress] answer mask: the reserved set plus the thought-channel opener (id {d}), for thinking-off prompts that close an empty thought\n", .{open_id});
 }
 
 /// `out = where(mask, -inf, logits)` — the masked lanes get EXACTLY -inf
 /// (never an additive -inf, whose 0×-inf/NaN edge the parity rules exist
 /// for). `[V]` broadcasts over both `[1, V]` and `[1, 1, V]` logits.
 fn applySuppressMask(out: *mlx.mlx_array, logits: mlx.mlx_array, mask: mlx.mlx_array, s: mlx.mlx_stream) !void {
-    const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+    return applySuppressMaskFor(out, logits, mask, false, s);
+}
+
+/// `argmax_next`: the caller's next op on `out` is an argmax (a greedy draw): then the -inf is built in the
+/// logits' own dtype, so a bf16 row stays bf16 instead of being widened to float32 (the argmax is the same either way).
+/// Every other caller keeps the float32 row: its softmax keeps its input dtype, so a bf16 row would round the
+/// probabilities (Codex, 2026-11-13). MLX_SERVE_SUPPRESS_MASK_NATIVE_DTYPE_OFF=1 keeps the float32 scalar everywhere.
+fn applySuppressMaskFor(out: *mlx.mlx_array, logits: mlx.mlx_array, mask: mlx.mlx_array, argmax_next: bool, s: mlx.mlx_stream) !void {
+    const neg_inf = if (argmax_next and suppressMaskNativeDtypeOn()) try scalarLike(-std.math.inf(f32), logits, s) else mlx.mlx_array_new_float(-std.math.inf(f32));
     defer _ = mlx.mlx_array_free(neg_inf);
     try mlx.check(mlx.mlx_where(out, mask, neg_inf, logits, s));
+}
+
+/// The native-dtype switch: on unless MLX_SERVE_SUPPRESS_MASK_NATIVE_DTYPE_OFF is set to anything but "0".
+fn suppressMaskNativeDtypeOn() bool {
+    const raw = std.c.getenv("MLX_SERVE_SUPPRESS_MASK_NATIVE_DTYPE_OFF") orelse return true;
+    return std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
 }
 
 /// A scalar in the array's own dtype, so a masked bf16 block is not widened to
@@ -920,12 +1055,12 @@ test "treeTable: a chain reads t + tap, a branch reads its own ancestors" {
     for (0..4) |t| for (0..4) |tap| try std.testing.expectEqual(@as(i32, @intCast(t + tap)), out[4 + t * 4 + tap]);
     var tree: [6 * 3]i32 = undefined;
     treeTable(&.{ -1, 0, 0 }, &tree);
-    // row 2 (depth 1, parent 0): conv rows 1, 2, then window rows 0 and 2.
+    // the third row (depth 1, parent 0): conv entries 1 and 2, then window entries 0 and 2.
     try std.testing.expectEqualSlices(i32, &.{ 1, 2, 3, 5 }, tree[3 + 8 .. 3 + 12]);
 }
 
 pub const Generator = struct {
-    /// The verify forward's inputs for a draft tree of `parents` (row 0 the root,
+    /// The verify forward's inputs for a draft tree of `parents` (the first row the root,
     /// -1) at `depth`: the tree table and each row's ancestor path.
     pub fn specTreeFor(parents: []const i32, depth: []const i32, max_depth: i32) transformer_mod.SpecTree {
         const MAX_W = 16;
@@ -1006,6 +1141,9 @@ pub const Generator = struct {
     // Deferred token: lazy array from async pipeline, eval'd at start of next iteration
     pending_token: mlx.mlx_array = .{},
     has_pending_token: bool = false,
+    /// T1's one-token forward, built in init against a shadow of the cache; next() adopts it in place of
+    /// the step 0 shim when nothing moved since, and every other consumer sees the unseeded state.
+    prebuilt: ?Prebuilt = null,
 
     // ── Spec-decode shared state (PLD + drafter) ──
     // Post-final-norm hidden state at the last produced token's position.
@@ -1151,6 +1289,12 @@ pub const Generator = struct {
     // per-step verify overhead. The flag is sticky for the rest of the
     // generation; we never re-enable speculation within a single request.
     spec_disabled_runtime: bool = false,
+    /// A probe (`drafter_mod.drafterRoundTraceOn`): the previous drafter round ended in a cache `restore`.
+    drafter_round_trace_prev_restored: bool = false,
+    /// A probe: the previous drafter round ended in a cache rollback (a cache `truncate`).
+    drafter_kv_move_prev_rolled: bool = false,
+    /// Partial accepts that fell back to the restore because a sliding ring refused the rollback.
+    drafter_rollback_fallbacks: u64 = 0,
     /// Why `spec_disabled_runtime` was set, for `[spec-stats]`.
     spec_disable_reason: SpecDisableReason = .none,
     /// Yield-gate counters: enabled-mode `nextPld` steps and drafted tokens
@@ -1509,7 +1653,7 @@ pub const Generator = struct {
         /// callers pass `hot_matched`.
         prefix_pos_offset: usize = 0,
         /// Placeholder rows inside a restored prefix (prefix-cache hit on an
-        /// image prompt): the vision splice starts here, not at row 0.
+        /// image prompt): the vision splice starts here, not at the first row.
         vision_rows_before: usize = 0,
         /// A DFlash assistant context restored from the prefix cache, whose
         /// `absLen()` already equals `prefix_pos_offset`. Ownership
@@ -1613,7 +1757,7 @@ pub const Generator = struct {
         // stochastic-verify filters, batched decode via `gen.sampling`)
         // inherits the model's mask without per-site wiring.
         var sampling = sampling_in;
-        sampling.suppress_mask = xfm.suppress_mask;
+        sampling.suppress_mask = if (sampling_in.answer_only and xfm.answer_mask != null) xfm.answer_mask else xfm.suppress_mask;
         sampling.keyed = xfm.config.rowExactDecode() and mlx.metalKernelsAvailable(); // the keyed sampler is a Metal kernel
         sampling.position_base = pickLookupPromptSource(prompt_ids, options_in.lookup_prompt).len;
         // Spec drafts and verify rows share the serial sampler's keys, so an
@@ -1634,6 +1778,11 @@ pub const Generator = struct {
         // `&ctx` to every forward call below; the cache/moe/state fields
         // mutate in-place through their pointers.
         var ctx: ForwardCtx = options.ctx orelse xfm.defaultCtx();
+        // The head tail's prepared state is cached for one mask (`headTailPrepare`), chosen per forward by
+        // `ctx.head_tail_answer`. Set it from this request before its first forward: left at its default (false), or at the
+        // previous request's value, the first decode forward of a thinking-off request prepared `suppress_mask` and the next
+        // `answer_mask`, a rebuild on every request.
+        ctx.head_tail_answer = headTailAnswerFor(sampling);
 
         const ids_i32 = try allocator.alloc(i32, prompt_ids.len);
         defer allocator.free(ids_i32);
@@ -1819,6 +1968,10 @@ pub const Generator = struct {
                 errdefer if (dflash_active) {
                     for (dfl_out_buf) |a| _ = mlx.mlx_array_free(a);
                 };
+                // Nothing below reads this chunk's output unless prompt logprobs, DFlash or a hidden capture asks.
+                ctx.prefill_output_unused = options.prompt_logprobs == null and !dflash_active and ctx.capture_layers == null and
+                    ctx.capture_hidden == null and ctx.capture_hidden_all == null;
+                defer ctx.prefill_output_unused = false;
                 // The compiled forward bypasses `forwardWith`, so the top-k schedule (MLX_SERVE_TOPK_SCHEDULE) never reaches it.
                 const chunk_logits = if (xfm.compiled_forward != null and
                     Transformer.topKSchedule() == null and
@@ -1849,11 +2002,9 @@ pub const Generator = struct {
                 {
                     const eval_vec = mlx.mlx_vector_array_new();
                     defer _ = mlx.mlx_vector_array_free(eval_vec);
-                    for (ctx.cache.entries) |*entry| {
-                        if (!entry.initialized) continue;
-                        _ = mlx.mlx_vector_array_append_value(eval_vec, entry.keys);
-                        _ = mlx.mlx_vector_array_append_value(eval_vec, entry.values);
-                    }
+                    // Every layer's K/V, and its affine scales and biases when the cache is quantized: with the skipped
+                    // last-layer eval, nothing else materializes the last layer's quantized buffers at this boundary.
+                    ctx.cache.appendEvalArrays(eval_vec);
                     // Same discipline for the DFlash context appended above.
                     if (dflash_ctx) |*dc| dc.appendEvalArrays(eval_vec);
                     _ = mlx.mlx_eval(eval_vec);
@@ -1934,7 +2085,7 @@ pub const Generator = struct {
 
         // Chunked vision: the final-span forward continues the row scatter
         // where the chunk loop left it (an image ending in the final span
-        // otherwise re-splices from row 0). One-shot engagement line — the
+        // otherwise re-splices from the first row). One-shot engagement line, the
         // silent-no-op class; tests grep for it per arm.
         if (has_vision) {
             ctx.vision_splice_offset = vision_rows_consumed;
@@ -1968,12 +2119,23 @@ pub const Generator = struct {
         errdefer if (dflash_active) {
             for (dfl_out_buf) |a| _ = mlx.mlx_array_free(a);
         };
+        // Owned from here, before the first fallible call that can install or fill it (the forward, the
+        // prompt logprobs, the tail slice). Freeing a never-written mlx_array_new() handle is a no-op, so an early exit is safe.
+        errdefer if (has_captured_hidden) {
+            _ = mlx.mlx_array_free(captured_hidden);
+        };
+        if (builtin.is_test) init_final_from = mlx.op_count.load(.monotonic);
         const raw_logits = if (need_capture) blk: {
             has_captured_hidden = true;
             break :blk try xfm.forwardWithCapture(&ctx, last_input, &captured_hidden);
         } else try xfm.forwardWith(&ctx, last_input);
+        if (builtin.is_test) init_final_to = mlx.op_count.load(.monotonic);
         // The prompt's last forward has run: the first reply token's forward (the lazy pre-forward below) is counted.
         xfm.endTopKPrefill();
+        // A probe only (MLX_SERVE_KROW_FORWARD_PROBE=1): time k-row forwards at the prompt's end, the forward a
+        // speculative verify of k - 1 drafts runs. The forwards append and are not rewound, so the request's reply after
+        // its first token is meaningless: run it with max_tokens 1 and no prefix cache.
+        if (readEnvBool("MLX_SERVE_KROW_FORWARD_PROBE")) try krowForwardProbeProbe(io, xfm, &ctx, prompt_ids, raw_logits);
         if (dflash_active) {
             ctx.capture_layers = null;
             try dflash_mod.appendContext(options.dflash.?, &dflash_ctx.?, dfl_out_buf, pos_offset + final_start);
@@ -1993,6 +2155,7 @@ pub const Generator = struct {
             defer _ = mlx.mlx_array_free(raw_logits);
             const lshape = mlx.getShape(raw_logits);
             var sliced = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(sliced); // a failed op frees its own output
             const start = [_]c_int{ 0, lshape[1] - 1, 0 };
             const stop = [_]c_int{ lshape[0], lshape[1], lshape[2] };
             const strides = [_]c_int{ 1, 1, 1 };
@@ -2020,10 +2183,6 @@ pub const Generator = struct {
                 },
             );
         }
-        errdefer if (has_captured_hidden) {
-            _ = mlx.mlx_array_free(captured_hidden);
-        };
-
         // Constrained generation skips the lazy first-sample fast path: we cannot
         // sample the first token until we have applied the grammar mask, and we
         // cannot pipeline because grammar advancement depends on the realized id.
@@ -2069,6 +2228,9 @@ pub const Generator = struct {
         if (drafter_active or pld_active or dflash_active) {
             const sample_lazy = sampleTokenLazy(logits, sampling, s);
             _ = mlx.mlx_array_free(logits);
+            // The sample is owned until freed below; the errdefer runs only on an error exit, and nothing
+            // fallible follows its explicit free.
+            errdefer _ = mlx.mlx_array_free(sample_lazy);
             try mlx.check(mlx.mlx_array_eval(sample_lazy));
             var first_val: i32 = 0;
             try mlx.check(mlx.mlx_array_item_int32(&first_val, sample_lazy));
@@ -2132,16 +2294,63 @@ pub const Generator = struct {
         // PLD / drafter init path's invariant. Generator.next's transition
         // shim handles the bootstrap on the first decode tick.
         if (options.skip_lazy_preforward) {
+            if (builtin.is_test) {
+                init_tail_mark = mlx.op_count.load(.monotonic);
+                init_forward_from = 0;
+                init_forward_to = 0;
+            }
+            // Every error exit of this tail frees what it owns (the prefill logits and the sample).
+            var logits_owned = true;
+            errdefer if (logits_owned) {
+                _ = mlx.mlx_array_free(logits);
+            };
             const sample_lazy = sampleTokenLazy(logits, sampling, s);
+            var sample_owned = true;
+            errdefer if (sample_owned) {
+                _ = mlx.mlx_array_free(sample_lazy);
+            };
+            // Where next()'s shim would forward [t1] at step 0 (its own gate: no constraint, no logprobs, a
+            // token to draw), submit the sample, build that forward against a shadow cache (`Prebuilt`), then sync the
+            // sample, so the build's host time overlaps the GPU's last prefill work. Not under modes whose build evaluates
+            // or that dump the cache before step 0.
+            var prebuilt: ?Prebuilt = null;
+            errdefer if (prebuilt) |*p| p.deinit();
+            if (firstTokenPrebuildOn() and sampling.constraint == null and options.logprobs_n == 0 and max_tokens > 0 and
+                !xfm.buildEvaluates() and restore_dump.dumpRestoreDir() == null and Prebuilt.eligible(&ctx) and
+                mlx.peekErrorName() == null) // never built over another operation's latched error, which stays its own
+            {
+                const arr = [_]mlx.mlx_array{sample_lazy};
+                const vec = mlx.mlx_vector_array_new_data(&arr, 1);
+                const submit_rc = mlx.mlx_async_eval(vec);
+                _ = mlx.mlx_vector_array_free(vec);
+                // A failed submit keeps its own latched error for the sync below and the checkpoints; no build then.
+                if (submit_rc == 0 and mlx.peekErrorName() == null) {
+                    // A failed build is only a lost head start: the shim builds the same forward at step 0. The error the
+                    // build returned is the one it latched (none was latched before it, the submit's included), so it is
+                    // consumed here and no checkpoint fails the request for it; a build that returns normally consumes
+                    // nothing, whatever else is latched meanwhile.
+                    prebuilt = Prebuilt.build(xfm, &ctx, sample_lazy) catch |err| blk: {
+                        // only an MLX call's failure (mlx.check's MlxError) latched what is taken; a host failure such as
+                        // the shadow's allocation leaves any latched error to its owner's checkpoint
+                        var ebuf: [512]u8 = undefined;
+                        const msg = if (err == error.MlxError) mlx.takeError(&ebuf) orelse "none latched" else "not an MLX call";
+                        log.warn("[first-token-prebuild] the forward built ahead failed ({s}: {s}); step 0's shim builds it\n", .{ @errorName(err), msg });
+                        break :blk null;
+                    };
+                }
+            }
             try mlx.check(mlx.mlx_array_eval(sample_lazy));
             var first_val: i32 = 0;
             try mlx.check(mlx.mlx_array_item_int32(&first_val, sample_lazy));
             _ = mlx.mlx_array_free(sample_lazy);
+            sample_owned = false;
+            if (prebuilt) |*p| p.token = @intCast(first_val);
             // t1's own distribution comes from the prefill's final forward and
             // is invisible to the decode loop — read it here or the first
             // returned token has no logprobs and the array shifts by one.
             const first_lp = try firstTokenLogprobs(allocator, logits, @intCast(first_val), options.logprobs_n, s);
             _ = mlx.mlx_array_free(logits);
+            logits_owned = false;
 
             const gen = Generator{
                 .pending_logprob = first_lp,
@@ -2169,14 +2378,32 @@ pub const Generator = struct {
                 .prng = std.Random.DefaultPrng.init(sampling.seed orelse @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds())),
                 .prompt_ids_owned = prompt_owned,
                 .prompt_ids_alloc = allocator,
+                .prebuilt = prebuilt,
             };
             return gen;
         }
 
         // Regular path: sample first token lazily, then build the next forward pass
+        if (builtin.is_test) init_tail_mark = mlx.op_count.load(.monotonic);
+        // Every error exit of this tail frees what it owns (the prefill logits, the lazy first token and the
+        // next step's logits).
+        var logits_owned = true;
+        errdefer if (logits_owned) {
+            _ = mlx.mlx_array_free(logits);
+        };
         const lazy_token = sampleTokenLazy(logits, sampling, s);
+        var token_owned = true;
+        errdefer if (token_owned) {
+            _ = mlx.mlx_array_free(lazy_token);
+        };
 
+        if (builtin.is_test) init_forward_from = mlx.op_count.load(.monotonic);
         const next_logits = try lazyForward(xfm, &ctx, lazy_token);
+        if (builtin.is_test) init_forward_to = mlx.op_count.load(.monotonic);
+        var next_owned = true;
+        errdefer if (next_owned) {
+            _ = mlx.mlx_array_free(next_logits);
+        };
 
         // Async-eval the decode pipeline (single-token graphs, much smaller)
         {
@@ -2192,11 +2419,14 @@ pub const Generator = struct {
         var val: i32 = 0;
         try mlx.check(mlx.mlx_array_item_int32(&val, lazy_token));
         _ = mlx.mlx_array_free(lazy_token);
+        token_owned = false;
         // See the skip_lazy_preforward branch: t1's distribution lives only in
         // the prefill's own output, so it is read here, against the id that was
         // actually drawn.
         const first_lp = try firstTokenLogprobs(allocator, logits, @intCast(val), options.logprobs_n, s);
         _ = mlx.mlx_array_free(logits);
+        logits_owned = false;
+        next_owned = false; // the generator owns it from here (no error exit follows)
 
         var gen = Generator{
             .pending_logprob = first_lp,
@@ -2400,7 +2630,50 @@ pub const Generator = struct {
         return @min(self.loop_guard_start, self.generated_ids.items.len);
     }
 
+    /// Free a forward built in init without using it. Every consumer other than next() calls this first;
+    /// the state it sees is the unseeded one either way, this only releases the shadow's graph early.
+    pub fn dropPrebuilt(self: *Generator) void {
+        if (self.prebuilt) |*p| {
+            p.deinit();
+            first_token_prebuild_counts.dropped += 1;
+        }
+        self.prebuilt = null;
+    }
+
+    /// Take the forward built in init as the shim's own, exactly when the shim would run now on the inputs
+    /// that forward read: the same token, the cache and MoE position untouched since, the same top-k count in the same
+    /// request epoch. Otherwise drop it, and the shim builds the forward itself.
+    fn adoptPrebuilt(self: *Generator) void {
+        const p = if (self.prebuilt) |*pp| pp else return;
+        const same = p.token == self.next_token_id and self.step == 0 and Prebuilt.eligible(&self.ctx) and
+            !self.has_pending_logits and !self.has_pending_token and
+            self.step < self.max_tokens and self.logprobs_n == 0 and
+            self.ctx.cache.step == p.step_before and self.ctx.cache.sameStateAs(&p.orig) and
+            self.ctx.moe_seq_offset.* == p.moe_before and
+            self.xfm.decode_forwards == p.df_before and self.xfm.topk_active == p.ta_before and
+            self.xfm.topk_epoch == p.epoch;
+        if (!same) {
+            self.dropPrebuilt();
+            return;
+        }
+        self.ctx.cache.adoptShadow(&p.cache);
+        self.ctx.moe_seq_offset.* = p.moe_after;
+        self.xfm.decode_forwards = p.df_after;
+        self.xfm.topk_active = p.ta_after;
+        if (p.head_tail_touched) {
+            Transformer.headTailSlotPut(p.head_tail);
+            p.head_tail = .{};
+        }
+        self.pending_logits = p.logits;
+        self.has_pending_logits = true;
+        p.logits = mlx.mlx_array_new();
+        p.deinit(); // the emptied shadow and the references `orig` held, before next()'s submit
+        self.prebuilt = null;
+        first_token_prebuild_counts.adopted += 1;
+    }
+
     pub fn deinit(self: *Generator, allocator: std.mem.Allocator) void {
+        self.dropPrebuilt();
         if (self.last_logprob) |*lp| {
             allocator.free(lp.top_logprobs);
         }
@@ -2455,6 +2728,7 @@ pub const Generator = struct {
     /// `next_token_id` is sampled but NOT in the cache and pending state is
     /// empty — exactly the batched-tick entry invariant.
     pub fn drainPipelineForBatch(self: *Generator, allocator: std.mem.Allocator) !?u32 {
+        self.dropPrebuilt();
         try self.resolvePendingToken();
         if (try self.checkStop()) {
             if (self.has_pending_logits) {
@@ -2492,6 +2766,7 @@ pub const Generator = struct {
     pub fn sampleLazy(self: *Generator, logits: mlx.mlx_array) mlx.mlx_array {
         defer self.sampling.draw +%= 1;
         defer self.ctx.head_tail_want = self.headTailGreedy();
+        defer self.ctx.head_tail_answer = self.sampling.answer_only;
         // A greedy draw from a head forward that already reduced its kept rows to the token id.
         if (self.headTailGreedy()) {
             if (Transformer.headTailTakeToken(logits, self.sampling.suppress_mask)) |tok| return tok;
@@ -2556,6 +2831,7 @@ pub const Generator = struct {
     /// `pending_logits` WITHOUT forwarding lands exactly on the invariant.
     /// One sync. Also handles the shim-seeded state (`pending_logits` only).
     fn drainPipelineForSpec(self: *Generator, allocator: std.mem.Allocator) !DrainResult {
+        self.dropPrebuilt();
         if (!self.has_pending_logits) {
             if (!self.has_pending_token) return .already_clean;
             // pending_token without pending_logits never occurs in the
@@ -2598,6 +2874,7 @@ pub const Generator = struct {
     /// The caller routes every later tick through the regular path.
     pub fn commitForcedTokens(self: *Generator, allocator: std.mem.Allocator, forced: []const u32) !ForcedCommit {
         std.debug.assert(forced.len > 0);
+        self.dropPrebuilt(); // the unseeded state, so t1 and the forced tokens go through one forward as before
         var emitted = std.ArrayList(u32).empty;
         errdefer emitted.deinit(allocator);
         var input = std.ArrayList(u32).empty;
@@ -2947,12 +3224,12 @@ pub const Generator = struct {
         } else {
             var i: u32 = 0;
             while (i < m) : (i += 1) {
-                var argmax_arr = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(argmax_arr);
-                try mlx.check(mlx.mlx_argmax_axis(&argmax_arr, per_pos_logits[i], 2, false, s));
-                try mlx.check(mlx.mlx_array_eval(argmax_arr));
-                var argmax_val: i32 = 0;
-                try mlx.check(mlx.mlx_array_item_int32(&argmax_val, argmax_arr));
+                // Over the request's mask, like every other committed argmax: a draft from the prompt can be an id
+                // the serial draw could never pick.
+                var picked = try verifyArgmax(per_pos_logits[i], self.sampling.suppress_mask, s);
+                defer picked.deinit();
+                try mlx.check(mlx.mlx_array_eval(picked.lazy()));
+                const argmax_val = (try picked.ids(1))[0];
                 if (@as(u32, @intCast(argmax_val)) != draft[i]) break;
                 accepted += 1;
             }
@@ -3165,10 +3442,20 @@ pub const Generator = struct {
         const m: u32 = @max(@as(u32, 1), self.drafter_block_size - 1);
         const t1: u32 = self.next_token_id; // already-decided token at position cache.step
 
-        // RoPE offset: position the drafter's queries rotate by. Per upstream
-        // `set_shared_kv`, this is `target.cache.step` and stays constant
-        // across all `m` drafter steps in this round.
-        const rope_offset: c_int = @intCast(self.ctx.cache.step);
+        // RoPE offset: position the drafter's queries rotate by, constant
+        // across all `m` drafter steps in this round: the last
+        // cached token's position (mlx-vlm `_mtp_draft_position`), counted as
+        // the target's RoPE counts it (moe_seq_offset on the MoE path, like
+        // nextDflash's anchor); MLX_SERVE_DRAFTER_CACHE_VIEW_OFF=1 keeps `cache.step`.
+        const drafter_round_trace_on = drafter_mod.drafterRoundTraceOn();
+        const drafter_round_trace_watch = io_util.Stopwatch.init(self.timer.io);
+        // A probe: each layer's K buffer address before this round's verify, to count after the sync
+        // the layers whose K/V write landed in a new buffer (a copy or a grow) instead of the buffer in place.
+        var drafter_kv_move_ptrs: [128]usize = @splat(0);
+        const drafter_kv_move_grows0: usize = if (drafter_round_trace_on) KVCache.kv_cap_buf_grows else 0;
+        if (drafter_round_trace_on) drafterKvMoveKeyPtrs(self.ctx.cache, &drafter_kv_move_ptrs);
+        const drafter_cache_view_anchor: usize = if (self.xfm.moe_layers != null) self.ctx.moe_seq_offset.* else self.ctx.cache.step;
+        const rope_offset: c_int = if (drafter_mod.drafterCacheViewOff()) @intCast(self.ctx.cache.step) else drafter_mod.drafterCacheViewQueryPos(drafter_cache_view_anchor);
 
         // ── Phase 1: draft `m` tokens lazily, no per-step CPU sync ──
         //
@@ -3231,9 +3518,25 @@ pub const Generator = struct {
             }
         }
 
+        // Submit the draft chain now, so the GPU runs the drafts while the host builds the verify below
+        // (before, the host built the whole round first, and the GPU idled through that build). The arithmetic is
+        // unchanged (only the command-buffer grouping moves); the verify's later submit chains onto the scheduled drafts.
+        if (!drafter_mod.draftsEarlySubmitOff()) {
+            const dvec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(dvec);
+            for (draft_arrs) |arr| try mlx.check(mlx.mlx_vector_array_append_value(dvec, arr));
+            try mlx.check(asyncEvalRound(dvec, 1 + m));
+        }
+
         // ── Phase 2: snapshot KV ──
-        var kv_snap = try self.ctx.cache.snapshot();
-        defer kv_snap.deinit();
+        // A diagnostic arm (`MLX_SERVE_DRAFTER_NO_SNAPSHOT=1`): no snapshot when the rollback can serve every
+        // outcome of this round (the shortest kept length is the anchor plus t1), so no second reference to the K/V
+        // buffers exists during the verify's write.
+        const drafter_no_snapshot_skip = !drafter_mod.drafterRollbackOff() and drafter_mod.drafterNoSnapshotOn() and
+            self.ctx.cache.truncateServesAfterWrite(drafter_cache_view_anchor + 1, 1 + m);
+        var kv_snap_opt: ?transformer_mod.KVCacheSnapshot = if (drafter_no_snapshot_skip) null else try self.ctx.cache.snapshot();
+        defer if (kv_snap_opt) |*k| k.deinit();
+        const step_snap = self.ctx.cache.step;
         const moe_seq_offset_snap = self.ctx.moe_seq_offset.*;
 
         // ── Phase 3: build verify input by concatenating [t1, drafts...] ──
@@ -3266,16 +3569,30 @@ pub const Generator = struct {
             }
             const vec = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(vec);
-            _ = mlx.mlx_vector_array_append_value(vec, t1_2d);
-            for (drafts_2d) |arr| _ = mlx.mlx_vector_array_append_value(vec, arr);
+            // A failed append must stop the round, or the concatenation succeeds with fewer than 1 + m rows.
+            if (builtin.is_test) drafter_fault_sweep_verify_from = mlx.op_count.load(.monotonic);
+            try mlx.check(mlx.mlx_vector_array_append_value(vec, t1_2d));
+            for (drafts_2d) |arr| try mlx.check(mlx.mlx_vector_array_append_value(vec, arr));
             try mlx.check(mlx.mlx_concatenate_axis(&verify_input, vec, 1, s));
+            if (builtin.is_test) drafter_fault_sweep_verify_to = mlx.op_count.load(.monotonic);
         }
 
         var new_hidden = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(new_hidden);
+        // Every row's post-final-norm hidden too, so a partial accept takes the next round's
+        // hidden from row `accepted` instead of re-running the target (`drafter_mod.drafterRollbackOff`).
+        const drafter_rollback_on = !drafter_mod.drafterRollbackOff();
+        var verify_all = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(verify_all);
+        const drafter_rollback_saved_all = self.ctx.capture_hidden_all;
+        if (drafter_rollback_on) self.ctx.capture_hidden_all = &verify_all;
+        // The schedule's count before this round's verify; the round's end sets it from here (below)
+        const topk_verify_advance_df0 = xfm.decode_forwards;
         // Captures the post-final-norm hidden at the LAST input position
         // (= position m, predicting the bonus token if all drafts accept).
-        var verify_logits = try xfm.forwardWithCapture(&self.ctx, verify_input, &new_hidden);
+        const verify_out = xfm.forwardWithCapture(&self.ctx, verify_input, &new_hidden);
+        self.ctx.capture_hidden_all = drafter_rollback_saved_all;
+        var verify_logits = try verify_out;
         errdefer _ = mlx.mlx_array_free(verify_logits);
         // verify_logits shape: [1, 1+m, V]
         self.drafter_attempted += 1;
@@ -3347,7 +3664,7 @@ pub const Generator = struct {
                 _ = mlx.mlx_vector_array_append_value(eval_vec, verify_argmax.lazy());
             }
             _ = mlx.mlx_vector_array_append_value(eval_vec, new_hidden);
-            try mlx.check(mlx.mlx_async_eval(eval_vec));
+            try mlx.check(asyncEvalRound(eval_vec, 1 + m));
         }
         // Extract drafts. First eval sync waits for the GPU; subsequent
         // evals are no-ops since they were queued together.
@@ -3366,6 +3683,25 @@ pub const Generator = struct {
             // drafter chain, so the data buffer was read while the GPU was
             // still writing it).
             try mlx.check(mlx.mlx_array_eval(verify_argmax.lazy()));
+        }
+        // The verify forward's own capture: on the stochastic path the drafts' sync does not wait for the verify (Codex).
+        if (drafter_round_trace_on) try mlx.check(mlx.mlx_array_eval(new_hidden));
+        const drafter_round_trace_sync_ns: u64 = if (drafter_round_trace_on) drafter_round_trace_watch.read() else 0;
+        const drafter_round_trace_after_restore = self.drafter_round_trace_prev_restored;
+        self.drafter_round_trace_prev_restored = false;
+        const drafter_kv_move_after_roll = self.drafter_kv_move_prev_rolled;
+        self.drafter_kv_move_prev_rolled = false;
+        if (drafter_round_trace_on) {
+            var now: [128]usize = @splat(0);
+            drafterKvMoveKeyPtrs(self.ctx.cache, &now);
+            var moved: usize = 0;
+            var layers: usize = 0;
+            for (drafter_kv_move_ptrs, now) |a, b| {
+                if (a == 0 or b == 0) continue;
+                layers += 1;
+                if (a != b) moved += 1;
+            }
+            log.info("[drafter-kv-move] pos={d} prev={s} layers={d} moved={d} grows={d}\n", .{ drafter_cache_view_anchor, if (drafter_kv_move_after_roll) "rolled" else if (drafter_round_trace_after_restore) "restored" else "kept", layers, moved, KVCache.kv_cap_buf_grows - drafter_kv_move_grows0 });
         }
 
         var accepted: u32 = 0;
@@ -3402,6 +3738,24 @@ pub const Generator = struct {
             self.completion_tokens,
             self.max_tokens,
         );
+        // Tests only: pin the round's outcome, so each accept path is reachable with random tiny weights.
+        if (builtin.is_test) {
+            if (drafter_fault_sweep_force_accepted) |forced| accepted = @min(forced, m);
+        }
+        if (drafter_mod.drafterRoundLog()) {
+            log.info("[drafter-round] pos={d} drafts={d} accepted={d}\n", .{ drafter_cache_view_anchor, m, accepted });
+        }
+        // The round's kept tokens (the anchor and the accepted drafts) count toward the top-k schedule's
+        // window as one-row decode would count them, so the verify leaves the first k after the window like the best.
+        // Set when the round returns, from the count before its verify (Codex): a fallback re-forward then routes at the
+        // verify's own k, and its own one-row increment is overwritten instead of counted twice. An accepted EOS can
+        // count the drafts after it; the request ends there and the next prompt resets the count.
+        const topk_verify_advance_kept = accepted;
+        // a round that returns an error commits no tokens: registered first, so it runs after the defer below (Codex)
+        errdefer xfm.decode_forwards = topk_verify_advance_df0;
+        defer if (!Transformer.topkVerifyAdvanceOff()) {
+            xfm.decode_forwards = Transformer.topkVerifyAdvanceCount(topk_verify_advance_df0, topk_verify_advance_kept);
+        };
 
         // Sample the next pending token from the verify output at position
         // `accepted`:
@@ -3442,12 +3796,15 @@ pub const Generator = struct {
             // h_prev for the NEXT round (drafting from t = next_pending; the
             // hidden corresponds to draft[m-1], which is what next_pending
             // follows). This matches the convention `nextDrafter` uses.
+            // The history's room is reserved before the output slice exists, so an allocation failure leaves
+            // no slice to leak and no partial round in `generated_ids`; the appends below cannot fail.
+            try self.generated_ids.ensureUnusedCapacity(allocator, 1 + m);
             const tokens = try allocator.alloc(u32, 1 + m);
             tokens[0] = t1;
             for (drafts, 0..) |d, idx| tokens[1 + idx] = d;
 
-            try self.generated_ids.append(allocator, t1);
-            for (drafts) |d| try self.generated_ids.append(allocator, d);
+            self.generated_ids.appendAssumeCapacity(t1);
+            for (drafts) |d| self.generated_ids.appendAssumeCapacity(d);
 
             if (self.has_last_hidden) _ = mlx.mlx_array_free(self.last_hidden);
             self.last_hidden = new_hidden;
@@ -3457,6 +3814,7 @@ pub const Generator = struct {
             self.drafter_accepted_tokens += m;
             self.next_token_id = next_pending;
             self.advanceStep(1 + m);
+            if (drafter_round_trace_on) log.info("[drafter-round-time] pos={d} accepted={d} after_restore={d} sync_us={d} reforward_us=0 total_us={d} kv_step={d} moe_off={d}\n", .{ drafter_cache_view_anchor, m, @intFromBool(drafter_round_trace_after_restore), drafter_round_trace_sync_ns / 1000, drafter_round_trace_watch.read() / 1000, self.ctx.cache.step, self.ctx.moe_seq_offset.* });
 
             // drafts buffer transferred into tokens copy; free original.
             allocator.free(drafts);
@@ -3476,7 +3834,65 @@ pub const Generator = struct {
         _ = mlx.mlx_array_free(new_hidden);
         new_hidden = .{ .ctx = null };
 
-        try self.ctx.cache.restore(&kv_snap);
+        // The verify already wrote the kept rows' K/V and computed their hidden, so roll the cache
+        // offsets back past the rejected rows and take row `accepted` of the verify's capture. The state matches the
+        // restore and re-forward below: K/V up to the kept rows, positions at the anchor plus 1 + accepted, and on the MoE
+        // arm `cache.step` advanced by the kept rows only (below). A sliding
+        // ring that already dropped a row the rollback needs refuses (`error.SlidingRowsDropped`); that round falls back.
+        if (drafter_rollback_on and verify_all.ctx != null and !(builtin.is_test and drafter_fault_sweep_force_reforward)) drafter_rollback: {
+            const keep_len = drafter_cache_view_anchor + 1 + @as(usize, accepted);
+            // What the verify did to `cache.step`: the MoE forward's layer-0 K/V write advances it by the block's rows
+            // (Codex), so the kept rows advance it by 1 + accepted, as the re-forward would; a forward that left it alone
+            // leaves it at the pre-verify value.
+            const verify_advanced = self.ctx.cache.step != step_snap;
+            self.ctx.cache.truncate(keep_len, s) catch |err| {
+                if (err != error.SlidingRowsDropped) return err;
+                if (kv_snap_opt == null) return error.DrafterNoSnapshotMisjudged;
+                self.drafter_rollback_fallbacks += 1;
+                if (self.drafter_rollback_fallbacks == 1) log.info("[drafter-rollback] a sliding ring had dropped a needed row: this round restores and re-runs\n", .{});
+                break :drafter_rollback;
+            };
+            if (self.xfm.moe_layers != null) {
+                self.ctx.cache.step = if (verify_advanced) step_snap + 1 + @as(usize, accepted) else step_snap;
+                self.ctx.moe_seq_offset.* = keep_len;
+            }
+            const vsh = mlx.getShape(verify_all);
+            var kept_hidden = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(kept_hidden);
+            const hstart = [_]c_int{ 0, @intCast(accepted), 0 };
+            const hstop = [_]c_int{ vsh[0], @as(c_int, @intCast(accepted)) + 1, vsh[2] };
+            const hstrides = [_]c_int{ 1, 1, 1 };
+            try mlx.check(mlx.mlx_slice(&kept_hidden, verify_all, &hstart, 3, &hstop, 3, &hstrides, 3, s));
+
+            // Reserve first, allocate second, then nothing fallible remains (see the full-accept path).
+            try self.generated_ids.ensureUnusedCapacity(allocator, 1 + @as(usize, accepted));
+            const kept_tokens = try allocator.alloc(u32, 1 + accepted);
+            kept_tokens[0] = t1;
+            for (drafts[0..accepted], 0..) |d, idx| kept_tokens[1 + idx] = d;
+            self.generated_ids.appendAssumeCapacity(t1);
+            for (drafts[0..accepted]) |d| self.generated_ids.appendAssumeCapacity(d);
+
+            if (self.has_last_hidden) _ = mlx.mlx_array_free(self.last_hidden);
+            self.last_hidden = kept_hidden;
+            self.has_last_hidden = true;
+            kept_hidden = .{ .ctx = null };
+
+            self.drafter_accepted_tokens += accepted;
+            self.next_token_id = next_pending;
+            self.advanceStep(1 + accepted);
+            self.drafter_kv_move_prev_rolled = true;
+            if (drafter_round_trace_on) log.info("[drafter-round-time] pos={d} accepted={d} after_restore={d} sync_us={d} reforward_us=0 total_us={d} kv_step={d} moe_off={d}\n", .{ drafter_cache_view_anchor, accepted, @intFromBool(drafter_round_trace_after_restore), drafter_round_trace_sync_ns / 1000, drafter_round_trace_watch.read() / 1000, self.ctx.cache.step, self.ctx.moe_seq_offset.* });
+
+            allocator.free(drafts);
+            self.checkDrafterRuntimeGate();
+            return DrafterStepResult{
+                .tokens = kept_tokens,
+                .accepted_tokens = accepted,
+            };
+        }
+
+        const kv_snap = if (kv_snap_opt) |*k| k else return error.DrafterNoSnapshotMisjudged;
+        try self.ctx.cache.restore(kv_snap);
         self.ctx.moe_seq_offset.* = moe_seq_offset_snap;
 
         const re_seq_len: c_int = @intCast(1 + accepted);
@@ -3492,13 +3908,18 @@ pub const Generator = struct {
         errdefer _ = mlx.mlx_array_free(re_new_hidden);
         const re_logits = try xfm.forwardWithCapture(&self.ctx, re_input, &re_new_hidden);
         _ = mlx.mlx_array_free(re_logits);
+        const drafter_round_trace_re_start: u64 = if (drafter_round_trace_on) drafter_round_trace_watch.read() else 0;
+        if (drafter_round_trace_on) try mlx.check(mlx.mlx_array_eval(re_new_hidden));
+        const drafter_round_trace_re_ns: u64 = if (drafter_round_trace_on) drafter_round_trace_watch.read() - drafter_round_trace_re_start else 0;
 
+        // Reserve first, allocate second, then nothing fallible remains.
+        try self.generated_ids.ensureUnusedCapacity(allocator, 1 + @as(usize, accepted));
         const tokens = try allocator.alloc(u32, 1 + accepted);
         tokens[0] = t1;
         for (drafts[0..accepted], 0..) |d, idx| tokens[1 + idx] = d;
 
-        try self.generated_ids.append(allocator, t1);
-        for (drafts[0..accepted]) |d| try self.generated_ids.append(allocator, d);
+        self.generated_ids.appendAssumeCapacity(t1);
+        for (drafts[0..accepted]) |d| self.generated_ids.appendAssumeCapacity(d);
 
         if (self.has_last_hidden) _ = mlx.mlx_array_free(self.last_hidden);
         self.last_hidden = re_new_hidden;
@@ -3508,6 +3929,8 @@ pub const Generator = struct {
         self.drafter_accepted_tokens += accepted;
         self.next_token_id = next_pending;
         self.advanceStep(1 + accepted);
+        self.drafter_round_trace_prev_restored = true;
+        if (drafter_round_trace_on) log.info("[drafter-round-time] pos={d} accepted={d} after_restore={d} sync_us={d} reforward_us={d} total_us={d} kv_step={d} moe_off={d}\n", .{ drafter_cache_view_anchor, accepted, @intFromBool(drafter_round_trace_after_restore), drafter_round_trace_sync_ns / 1000, drafter_round_trace_re_ns / 1000, drafter_round_trace_watch.read() / 1000, self.ctx.cache.step, self.ctx.moe_seq_offset.* });
 
         allocator.free(drafts);
         self.checkDrafterRuntimeGate();
@@ -3710,7 +4133,7 @@ pub const Generator = struct {
 
         // ── Phase 1: one assistant forward drafts all m tokens ──
         // Row mapping is the export's convention (`anchor_row_drafts`):
-        // DFlash reads mask rows 1..bs-1 (anchor row dropped), DSpark reads
+        // DFlash reads the mask rows after the first (anchor row dropped), DSpark reads
         // ALL rows starting at the anchor — so DSpark needs only m noise rows
         // for the same m drafts and the same verify width.
         const noise_rows: u32 = if (model.config.anchor_row_drafts)
@@ -4756,6 +5179,8 @@ pub const Generator = struct {
     /// of the generation.
     fn checkDrafterRuntimeGate(self: *Generator) void {
         if (self.spec_disabled_runtime) return;
+        // Acceptance measurement: MLX_SERVE_DRAFTER_NO_GATE=1 keeps drafting on.
+        if (drafter_mod.drafterNoGate()) return;
         const drafts_per_round: u32 = if (self.drafter_block_size >= 1) self.drafter_block_size - 1 else 0;
         if (!runtimeGateShouldDisable(self.drafter_attempted, self.drafter_accepted_tokens, drafts_per_round)) return;
         const drafts_proposed: u64 = self.drafter_attempted * @as(u64, drafts_per_round);
@@ -5410,6 +5835,8 @@ pub const Generator = struct {
         // path picks up cleanly. PLD's exit state already matches `next()`'s
         // invariant, so this only fires for drafter→next runtime-gate
         // fallbacks (and any future spec methods that share drafter's shape).
+        // The shim's forward, already built in init, is adopted when every input it read is unchanged.
+        self.adoptPrebuilt();
         if (!self.has_pending_logits and !self.has_pending_token and
             self.step < self.max_tokens and self.logprobs_n == 0)
         {
@@ -5842,7 +6269,7 @@ pub const Generator = struct {
             }
         }
         if (allowed == 0) {
-            log.warn("[grammar] no token satisfies the schema at this position — disabling further mask enforcement\n", .{});
+            log.warn("[grammar] no token satisfies the schema at this position - disabling further mask enforcement\n", .{});
             constraint.grammar.dead = true;
             @memset(constraint.mask_buf, true);
         }
@@ -5910,7 +6337,7 @@ pub const Generator = struct {
                 for (bytes) |b| {
                     const ok = try constraint.grammar.acceptByte(b);
                     if (!ok) {
-                        log.warn("[grammar] sampled token {d} produced byte 0x{x} that was rejected — disabling further mask enforcement\n", .{ token, b });
+                        log.warn("[grammar] sampled token {d} produced byte 0x{x} that was rejected - disabling further mask enforcement\n", .{ token, b });
                         constraint.grammar.dead = true;
                         break;
                     }
@@ -5983,6 +6410,19 @@ pub const Generator = struct {
     }
 };
 
+/// A probe: the address of each initialized layer's K buffer (0 where none is materialized), for
+/// telling a K/V write that updated its buffer in place from one that produced a new buffer. Read only under the drafter_round_trace probe.
+fn drafterKvMoveKeyPtrs(cache: *const KVCache, out: *[128]usize) void {
+    for (cache.entries, 0..) |e, i| {
+        if (i >= out.len) break;
+        if (!e.initialized or e.keys.ctx == null) continue;
+        // `data()` of an array with no buffer yet dereferences nothing safe: read only a materialized one
+        var ready = false;
+        if (mlx._mlx_array_is_available(&ready, e.keys) != 0 or !ready) continue;
+        out[i] = if (mlx.mlx_array_data_uint8(e.keys)) |p| @intFromPtr(p) else 0;
+    }
+}
+
 /// Diagnostic (`MLX_SERVE_STEP_TRACE=1`): host time of a pipelined serial step, per phase,
 /// summed across the request and reported with the spec stats.
 const StepTrace = struct {
@@ -6047,6 +6487,167 @@ fn asyncEvalDecodeStep(vec: mlx.mlx_vector_array) void {
     _ = mlx.mlx_lesto_commit_on_ops_limit_only(true);
     _ = mlx.mlx_async_eval(vec);
     _ = mlx.mlx_lesto_commit_on_ops_limit_only(false);
+}
+
+/// The ops-limit commit (`MLX_SERVE_DRAFTER_OPS_LIMIT_COMMIT=1`, off by default): the drafter round's two submits (the draft chain's early submit and
+/// the verify's batched eval) commit on MLX's ops limit alone, as `asyncEvalDecodeStep` does for the one-token step. The verify forward binds the same weights as a one-token step, so it trips the byte limit about as often, while
+/// its transients are those of a forward of `rows` tokens. The scope applies only up to `OPS_LIMIT_COMMIT_MAX_ROWS` verify rows, so a
+/// wide `--draft-block-size` never submits a prefill-sized forward with the byte limit off (Codex); wider rounds keep the
+/// byte limit. The scope holds only around this call, for the same reason as `asyncEvalDecodeStep`'s (MLX reads `needs_commit()` on the
+/// encoding thread), and is reset on every path. Only commit boundaries move, so replies must match the switch off bit for
+/// bit.
+const OPS_LIMIT_COMMIT_MAX_ROWS: u32 = 8;
+/// Tests only: forces the switch, bypassing the environment.
+var ops_limit_commit_test_force: ?bool = null;
+
+fn opsLimitCommitOn() bool {
+    if (ops_limit_commit_test_force) |v| return v;
+    const S = struct {
+        var on: ?bool = null;
+    };
+    return S.on orelse blk: {
+        // exactly "1" turns it on: `=0` or any other value keeps the byte limit (Codex)
+        const v = if (std.c.getenv("MLX_SERVE_DRAFTER_OPS_LIMIT_COMMIT")) |p| std.mem.eql(u8, std.mem.span(p), "1") else false;
+        S.on = v;
+        if (v) log.info("[ops-limit-commit] drafter rounds commit on the ops limit alone (MLX_SERVE_DRAFTER_OPS_LIMIT_COMMIT=1)\n", .{});
+        break :blk v;
+    };
+}
+
+fn asyncEvalRound(vec: mlx.mlx_vector_array, rows: u32) c_int {
+    if (!opsLimitCommitOn() or rows > OPS_LIMIT_COMMIT_MAX_ROWS) return mlx.mlx_async_eval(vec);
+    _ = mlx.mlx_lesto_commit_on_ops_limit_only(true);
+    defer _ = mlx.mlx_lesto_commit_on_ops_limit_only(false);
+    return mlx.mlx_async_eval(vec);
+}
+
+/// Tests only: `mlx.op_count` where initWithOptions's tail starts (after the prompt's last forward, in either
+/// branch), so a fault sweep can start at the tail's first checked op.
+var init_tail_mark: u64 = 0;
+/// Tests only: `mlx.op_count` before and after the regular tail's `lazyForward` (both 0 on the server path).
+/// The sweep covers the ops inside it too (the forward's own error exits free their locals); the marks
+/// let the test check that the forward's ops were swept.
+var init_forward_from: u64 = 0;
+var init_forward_to: u64 = 0;
+/// Tests only: `mlx.op_count` before and after the prompt's last forward (the one that captures the drafter's
+/// hidden), so a fault sweep can place faults after the capture was written (`transformer_mod.test_capture_mark`).
+var init_final_from: u64 = 0;
+var init_final_to: u64 = 0;
+/// Tests only: `mlx.op_count` before the drafter round's verify-input appends and after its concatenation.
+var drafter_fault_sweep_verify_from: u64 = 0;
+var drafter_fault_sweep_verify_to: u64 = 0;
+/// Tests only: the drafter round's accepted count is forced to this (at most the round's drafts), and a
+/// partial accept skips the offset rollback so the restore and re-forward path runs.
+var drafter_fault_sweep_force_accepted: ?u32 = null;
+var drafter_fault_sweep_force_reforward: bool = false;
+
+/// The first-token prebuild (`MLX_SERVE_FIRST_TOKEN_PREBUILD_OFF=1` keeps the step 0 shim): t1's one-token forward built in the server path's init,
+/// before the first token's sync, so its host build overlaps the GPU's last prefill work, but
+/// against a shadow of the cache (`KVCache.shadowClone`) and a copy of the MoE position. The live cache, the position, the
+/// Transformer's top-k counters and the global head-tail slot are left exactly as the unseeded path leaves them, so every
+/// consumer other than next() (a batch join, forced tokens, a restore dump, a commit, the tests) reads the unseeded state.
+/// next() adopts it only when every input of the shim's own forward is unchanged; otherwise it is freed and the shim runs.
+const Prebuilt = struct {
+    cache: KVCache,
+    /// The live cache as the build found it (`shadowClone`: references, no copy), so adoption requires the same arrays and
+    /// positions, not only the same length. Freed before next()'s submit, like the live handles it shares.
+    orig: KVCache,
+    logits: mlx.mlx_array,
+    /// What the build left in the global head-tail slot, and whether it changed the slot at all (the shim's forward
+    /// clears and arms it when eligible; adopting replays that).
+    head_tail: transformer_mod.HeadTailSlot = .{},
+    head_tail_touched: bool = false,
+    token: u32 = 0,
+    step_before: usize,
+    moe_before: usize,
+    moe_after: usize,
+    df_before: u32,
+    ta_before: u32,
+    df_after: u32,
+    ta_after: u32,
+    epoch: u64,
+
+    /// Whether `ctx` lets a forward be built ahead without side effects outside the shadow: no capture destination (the
+    /// forward would write it during init) and no pipelined build (it submits layers while building).
+    fn eligible(ctx: *const ForwardCtx) bool {
+        return ctx.capture_hidden == null and ctx.capture_hidden_all == null and ctx.capture_stream_all == null and
+            ctx.capture_layers == null and ctx.pipeline_build == 0 and ctx.stream_in == null;
+    }
+
+    fn build(xfm: *Transformer, ctx: *const ForwardCtx, sample_lazy: mlx.mlx_array) !Prebuilt {
+        var orig = try ctx.cache.shadowClone();
+        errdefer orig.deinit();
+        var shadow = try ctx.cache.shadowClone();
+        errdefer shadow.deinit();
+        var moe: usize = ctx.moe_seq_offset.*;
+        var sctx = ctx.*;
+        sctx.cache = &shadow;
+        sctx.moe_seq_offset = &moe;
+        const tok_shape = [_]c_int{ 1, 1 };
+        var reshaped = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(reshaped);
+        try mlx.check(mlx.mlx_reshape(&reshaped, sample_lazy, &tok_shape, 2, xfm.s));
+        var prev = try Transformer.headTailSlotRef();
+        const df0 = xfm.decode_forwards;
+        const ta0 = xfm.topk_active;
+        // forwardWith itself, as the shim calls it: lazyForward would charge this build to the step trace
+        const logits = xfm.forwardWith(&sctx, reshaped) catch |err| {
+            xfm.decode_forwards = df0;
+            xfm.topk_active = ta0;
+            Transformer.headTailSlotPut(prev);
+            return err;
+        };
+        const df1 = xfm.decode_forwards;
+        const ta1 = xfm.topk_active;
+        xfm.decode_forwards = df0;
+        xfm.topk_active = ta0;
+        var out: Prebuilt = .{
+            .cache = shadow,
+            .orig = orig,
+            .logits = logits,
+            .step_before = ctx.cache.step,
+            .moe_before = ctx.moe_seq_offset.*,
+            .moe_after = moe,
+            .df_before = df0,
+            .ta_before = ta0,
+            .df_after = df1,
+            .ta_after = ta1,
+            .epoch = xfm.topk_epoch,
+        };
+        if (Transformer.headTailSlotIs(prev)) {
+            Transformer.headTailSlotFree(&prev);
+        } else {
+            out.head_tail = Transformer.headTailSlotTake();
+            out.head_tail_touched = true;
+            Transformer.headTailSlotPut(prev);
+        }
+        return out;
+    }
+
+    fn deinit(self: *Prebuilt) void {
+        _ = mlx.mlx_array_free(self.logits);
+        self.cache.deinit();
+        self.orig.deinit();
+        Transformer.headTailSlotFree(&self.head_tail);
+    }
+};
+
+/// Tests set this to run both paths in one process; null reads `MLX_SERVE_FIRST_TOKEN_PREBUILD_OFF`.
+var first_token_prebuild_test_on: ?bool = null;
+/// How many forwards built ahead were adopted by next() and how many dropped (read by the tests).
+var first_token_prebuild_counts: struct { adopted: u64 = 0, dropped: u64 = 0 } = .{};
+
+/// One `[first-token-prebuild]` line at first use.
+fn firstTokenPrebuildOn() bool {
+    if (first_token_prebuild_test_on) |v| return v;
+    const S = struct {
+        var v: ?bool = null;
+    };
+    if (S.v) |v| return v;
+    const on = std.c.getenv("MLX_SERVE_FIRST_TOKEN_PREBUILD_OFF") == null;
+    S.v = on;
+    if (on) log.info("[first-token-prebuild] t1's one-token forward is built before the first token's sync against a shadow cache, adopted at step 0 (MLX_SERVE_FIRST_TOKEN_PREBUILD_OFF=1 keeps the step 0 shim)\n", .{});
+    return on;
 }
 
 /// Build forward pass from a lazy sampled token array.
@@ -6357,7 +6958,8 @@ pub fn sampleTokenLazy(logits_in: mlx.mlx_array, sampling: SamplingParams, s: ml
     };
     const logits = if (sampling.suppress_mask) |m| blk: {
         suppressed = mlx.mlx_array_new();
-        applySuppressMask(&suppressed, logits_in, m, s) catch break :blk logits_in;
+        const greedy_next = mlx.getShape(logits_in)[1] == 1 and sampling.temperature < 0.01; // the fast path below
+        applySuppressMaskFor(&suppressed, logits_in, m, greedy_next, s) catch break :blk logits_in;
         break :blk suppressed;
     } else logits_in;
 
@@ -6580,7 +7182,7 @@ fn sampleRowsLazy(row_logits: []const mlx.mlx_array, params: []const SamplingPar
     };
     if (p0.suppress_mask) |m| {
         suppressed = mlx.mlx_array_new();
-        applySuppressMask(&suppressed, current, m, s) catch {
+        applySuppressMaskFor(&suppressed, current, m, sampleRowsAllGreedy(params), s) catch {
             _ = mlx.mlx_array_free(suppressed);
             suppressed = .{ .ctx = null };
         };
@@ -8873,7 +9475,7 @@ test "Generator.yieldGateShouldDisable trips on cold-path-dominated workloads" {
     try testing.expect(!Generator.yieldGateShouldDisable(Generator.YIELD_GATE_WARMUP, Generator.YIELD_GATE_WARMUP));
 }
 
-test "yield-gate warmup is 8 — the cold-path tax tripled when the AR step got 3x cheaper" {
+test "yield-gate warmup is 8 - the cold-path tax tripled when the AR step got 3x cheaper" {
     // This constant is pure economics and the economics MOVED. Every warmup
     // step pays PLD's unpipelined cold forward plus a synchronous host read of
     // the sampled token, against `next()`'s async-pipelined step — an
@@ -9228,7 +9830,7 @@ test "isDegenerateTailLoop does not fire on healthy or briefly-repeating output"
     try testing.expect(!isDegenerateTailLoop(&[_]u32{ 1, 1 }, P, R));
 }
 
-test "isNearRepeatTailLoop leaves PROCEDURAL code alone — it recycles a vocabulary while still progressing" {
+test "isNearRepeatTailLoop leaves PROCEDURAL code alone - it recycles a vocabulary while still progressing" {
     // Live 2026-08-05: a pi session was asked for an elaborate voxel scene and
     // the tier cut it at 16241 generated tokens, so the user got NO file at
     // all. The output was healthy — dense `fillBox(x,y,z, x,y,z, C.name);`
@@ -9486,7 +10088,7 @@ test "boundedPrefillChunk: never raises a caller-lowered base chunk" {
     try testing.expectEqual(@as(usize, 256), boundedPrefillChunk(256, 256, 16, 262_144, true, false, false));
 }
 
-test "boundedPrefillChunk: fused-causal (default) non-sliding hd-256 — MoE caps at 4096, dense keeps the full chunk" {
+test "boundedPrefillChunk: fused-causal (default) non-sliding hd-256 - MoE caps at 4096, dense keeps the full chunk" {
     // With the causal arm FUSED (default since the budgeted-dispatch flip) no
     // score tensor exists, so the scores-budget formula is moot for the
     // A hybrid class - and its old shrink to 1024 at 64K starved the
@@ -9932,8 +10534,8 @@ test "buildPaddedBatch pads to max length with zeros and records lengths" {
 
 test "maskedMeanPoolNormalize excludes padded positions and unit-normalizes" {
     const s = mlx.gpuStream();
-    // hidden [2, 3, 2]; row 0 has 2 real positions (pad slot holds garbage
-    // that must not leak into the pool), row 1 has 3.
+    // hidden [2, 3, 2]; the first row has 2 real positions (pad slot holds garbage
+    // that must not leak into the pool), the second has 3.
     const data = [_]f32{
         1, 0, 3, 4, 100, 100,
         0, 2, 0, 4, 0,   6,
@@ -10056,6 +10658,19 @@ test "Tokenizer.definedVocabSize: highest defined id + 1, 0 when nothing is defi
     try tok.id_to_token.put(1, "b");
     try tok.id_to_token.put(11, "<|special|>");
     try testing.expectEqual(@as(usize, 12), tok.definedVocabSize());
+}
+
+test "answerMaskIds: the reserved set plus the opener; the host mask flags exactly those rows" {
+    const a = std.testing.allocator;
+    const ids = try answerMaskIds(a, &[_]u32{ 7, 9 }, 100);
+    defer a.free(ids);
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 7, 9, 100 }, ids);
+    var buf: [128]bool = undefined;
+    fillSuppressMask(&buf, ids, 0);
+    for (buf, 0..) |b, i| try std.testing.expectEqual(i == 7 or i == 9 or i == 100, b);
+    const only = try answerMaskIds(a, &[_]u32{}, 100);
+    defer a.free(only);
+    try std.testing.expectEqualSlices(u32, &[_]u32{100}, only);
 }
 
 test "suppress_mask: a suppressed id is unreachable from both samplers, everything else stays" {
@@ -11307,7 +11922,78 @@ test "only the pipelined decode step runs on the ops limit alone" {
     const at = std.mem.indexOf(u8, src, call).?;
     try std.testing.expect(at > next_fn and at < slow);
     const set_call = "mlx_lesto_commit_on_ops_limit_only" ++ "(";
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, src, set_call));
+    // two in asyncEvalDecodeStep, two in asyncEvalRound
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, src, set_call));
+}
+
+test "ops-limit-commit: the drafter round's two submits, and nothing else, go through the round's ops-limit scope" {
+    const src = @embedFile("generate.zig");
+    const call = "asyncEvalRound" ++ "(";
+    // the two call sites plus the definition
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, src, call));
+    const lo = std.mem.indexOf(u8, src, "pub fn nextDrafter(self: *Generator") orelse return error.MissingNextDrafter;
+    const hi = std.mem.indexOf(u8, src, "pub fn nextDflash(self: *Generator") orelse return error.MissingNextDflash;
+    var from: usize = 0;
+    var inside: usize = 0;
+    while (std.mem.indexOfPos(u8, src, from, "mlx.check(" ++ call)) |at| : (from = at + 1) {
+        try std.testing.expect(at > lo and at < hi);
+        inside += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), inside);
+}
+
+test "ops-limit-commit: the round's scope leaves the byte limit restored after its submit" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    // the counts below assume MLX's stock limits; a process-level override changes them (Codex)
+    if (std.c.getenv("MLX_MAX_MB_PER_BUFFER") != null or std.c.getenv("MLX_MAX_OPS_PER_BUFFER") != null) return error.SkipZigTest;
+    const t = std.testing;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    ops_limit_commit_test_force = true;
+    defer ops_limit_commit_test_force = null;
+    // a 64 M element array: above MLX's byte limit for every GPU class, so by default each add commits on its own
+    const shape = [_]c_int{64 * 1024 * 1024};
+    var big = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(big);
+    try mlx.check(mlx.mlx_ones(&big, &shape, 1, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(big));
+    const steps = 6;
+    var sums: [3]f32 = .{ 0, 0, 0 };
+    var commits: [3]u64 = .{ 0, 0, 0 };
+    for (0..3) |pass| {
+        var x = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x);
+        try mlx.check(mlx.mlx_array_set(&x, big));
+        for (0..steps) |_| {
+            var y = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_add(&y, x, x, s));
+            _ = mlx.mlx_array_free(x);
+            x = y;
+        }
+        var total = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(total);
+        try mlx.check(mlx.mlx_sum(&total, x, false, s));
+        const vec = mlx.mlx_vector_array_new_value(total);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        const before = mlx.mlx_lesto_command_buffers_committed();
+        // pass 0 through the round's scope at 3 rows; pass 1 a plain eval right after it, which must see the default limits
+        // again; pass 2 through the scope at OPS_LIMIT_COMMIT_MAX_ROWS + 1 rows, which must keep the byte limit. Through an alias, so
+        // the source scan above counts only the served call sites
+        const round_eval = asyncEvalRound;
+        switch (pass) {
+            0 => try mlx.check(round_eval(vec, 3)),
+            1 => try mlx.check(mlx.mlx_async_eval(vec)),
+            else => try mlx.check(round_eval(vec, OPS_LIMIT_COMMIT_MAX_ROWS + 1)),
+        }
+        try mlx.check(mlx.mlx_array_eval(total));
+        commits[pass] = mlx.mlx_lesto_command_buffers_committed() - before;
+        try mlx.check(mlx.mlx_array_item_float32(&sums[pass], total));
+    }
+    try t.expect(commits[0] <= 2);
+    try t.expect(commits[1] >= steps);
+    try t.expect(commits[2] >= steps);
+    try t.expectEqual(sums[0], sums[1]);
+    try t.expectEqual(sums[0], sums[2]);
 }
 
 test "no decode path advances `step` outside advanceStep" {
@@ -11406,4 +12092,707 @@ fn suppressedArgmaxCase(allocator: std.mem.Allocator, s: mlx.mlx_stream, v: usiz
     const ids = try samplerTestReadFlat(allocator, masked.lazy(), rows, s);
     defer allocator.free(ids);
     for (ids, 0..) |id, r| try testing.expectEqual(@as(f32, @floatFromInt(100 + r)), id);
+}
+
+test "suppress-mask-native-dtype: a greedy suppression mask keeps a bf16 logits row bf16 and masks the same ids; other callers stay float32" {
+    const s = mlx.gpuStream();
+    const V = 16;
+    var lf: [V]f32 = undefined;
+    for (0..V) |i| lf[i] = @as(f32, @floatFromInt(i)) * 0.25 - 1.0;
+    const sh = [_]c_int{ 1, 1, V };
+    const raw = mlx.mlx_array_new_data(&lf, &sh, 3, .float32);
+    defer _ = mlx.mlx_array_free(raw);
+    var lg = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(lg);
+    try mlx.check(mlx.mlx_astype(&lg, raw, .bfloat16, s));
+    var mb: [V]bool = undefined;
+    for (0..V) |i| mb[i] = i == V - 1 or i == 3;
+    const msh = [_]c_int{V};
+    const mask = mlx.mlx_array_new_data(&mb, &msh, 1, .bool_);
+    defer _ = mlx.mlx_array_free(mask);
+    if (!suppressMaskNativeDtypeOn()) return error.SkipZigTest;
+    var out = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(out);
+    // a caller whose next op is not an argmax keeps the float32 row (its softmax would round in bf16)
+    var wide = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wide);
+    try applySuppressMask(&wide, lg, mask, s);
+    try std.testing.expectEqual(mlx.mlx_dtype.float32, mlx.mlx_array_dtype(wide));
+    try applySuppressMaskFor(&out, lg, mask, true, s);
+    try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(out));
+    // the argmax skips the masked top id (15) and lands on 14, as the float32 path did
+    var am = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(am);
+    try mlx.check(mlx.mlx_argmax_axis(&am, out, 2, false, s));
+    try mlx.check(mlx.mlx_array_eval(am));
+    var amu = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(amu);
+    try mlx.check(mlx.mlx_astype(&amu, am, .int32, s));
+    try mlx.check(mlx.mlx_array_eval(amu));
+    try std.testing.expectEqual(@as(i32, 14), mlx.mlx_array_data_int32(amu).?[0]);
+}
+
+
+test "first-token-prebuild the server path builds t1's forward on a shadow before the sample's sync; next() adopts it before the shim; other consumers drop it" {
+    // Source checks (no model). The needles are concatenated so this test's own text does not match them.
+    const src = @embedFile("generate.zig");
+    const branch = std.mem.indexOf(u8, src, "if (options." ++ "skip_lazy_preforward) {") orelse return error.MissingBranch;
+    const end = std.mem.indexOfPos(u8, src, branch, "// Regular path: " ++ "sample first token lazily") orelse return error.MissingEnd;
+    const body = src[branch..end];
+    const submit = std.mem.indexOf(u8, body, "mlx_async_" ++ "eval(vec)") orelse return error.MissingSubmit;
+    const build = std.mem.indexOf(u8, body, "Prebuilt." ++ "build(xfm, &ctx, sample_lazy)") orelse return error.MissingBuild;
+    const sync = std.mem.indexOf(u8, body, "mlx_array_eval(" ++ "sample_lazy)") orelse return error.MissingSync;
+    try std.testing.expect(submit < build and build < sync);
+    // The shim's own gate, and off under modes whose build evaluates or that dump the cache first.
+    try std.testing.expect(std.mem.indexOf(u8, body, "sampling.constraint == null and options.logprobs_n == 0 and max_tokens > " ++ "0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "!xfm.build" ++ "Evaluates() and restore_dump.dumpRestoreDir() == null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, ".prebuilt = " ++ "prebuilt,") != null);
+    // The live cache is never the build's: the forward runs on the shadow context.
+    const pb = std.mem.indexOf(u8, src, "fn build(xfm: *Transformer, ctx: *const " ++ "ForwardCtx") orelse return error.MissingPrebuilt;
+    const pb_end = std.mem.indexOfPos(u8, src, pb, "fn deinit(self: *" ++ "Prebuilt)") orelse return error.MissingPrebuilt;
+    const pbody = src[pb..pb_end];
+    try std.testing.expect(std.mem.indexOf(u8, pbody, "xfm.forwardWith(&" ++ "sctx, reshaped)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pbody, "lazyForward(") == null); // no step-trace lap for a build ahead
+    try std.testing.expect(std.mem.indexOf(u8, pbody, "forwardWith(" ++ "ctx,") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Prebuilt." ++ "eligible(&ctx)") != null);
+    // next(): the adopt comes right before the shim's gate.
+    const next_fn = std.mem.indexOf(u8, src, "pub fn next(self: " ++ "*Generator") orelse return error.MissingNext;
+    const adopt = std.mem.indexOfPos(u8, src, next_fn, "self.adopt" ++ "Prebuilt();") orelse return error.MissingAdopt;
+    const shim = std.mem.indexOfPos(u8, src, next_fn, "if (!self.has_pending_logits and !self.has_pending_token and" ++ "\n            self.step < self.max_tokens and self.logprobs_n == 0)") orelse return error.MissingShim;
+    try std.testing.expect(adopt < shim);
+    // Every other consumer drops it first.
+    inline for (.{ "pub fn drainPipelineFor" ++ "Batch(", "fn drainPipelineFor" ++ "Spec(", "pub fn commitForced" ++ "Tokens(", "pub fn deinit(self: *" ++ "Generator" }) |needle| {
+        const at = std.mem.indexOf(u8, src, needle) orelse return error.MissingConsumer;
+        const window = src[at..@min(src.len, at + 400)];
+        try std.testing.expect(std.mem.indexOf(u8, window, "self.drop" ++ "Prebuilt();") != null);
+    }
+    const sched = @embedFile("scheduler.zig");
+    const drain_at = std.mem.indexOf(u8, sched, "gen.drainPipelineFor" ++ "Batch(slot.allocator)") orelse return error.MissingBatchJoin;
+    const drop_at = std.mem.lastIndexOf(u8, sched[0..drain_at], "gen.drop" ++ "Prebuilt();") orelse return error.MissingBatchDrop;
+    try std.testing.expect(drain_at - drop_at < 400);
+}
+
+
+test "first-token-prebuild on a model: an adopted forward gives the shim's tokens; a moved token drops it; forced tokens at tick 0 match the shim's" {
+    const allocator = std.testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp_trunk = std.testing.tmpDir(.{});
+    defer tmp_trunk.cleanup();
+    var trunk_buf: [512]u8 = undefined;
+    const trunk_path = trunk_buf[0..try tmp_trunk.dir.realPath(io, &trunk_buf)];
+    try dflash_mod.TinyFix.writeTrunk(io, tmp_trunk.dir, trunk_path, s);
+    var config = try model_mod.parseConfig(io, allocator, trunk_path);
+    var weights = try model_mod.loadWeights(io, allocator, trunk_path);
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var tok_dummy: Tokenizer = undefined;
+    const prompt = [_]u32{ 3, 7, 1, 12, 30, 5, 9, 22, 4, 17, 2, 28 };
+    defer first_token_prebuild_test_on = null;
+
+    // case 0: plain decode; case 1: next_token_id overwritten after init (the DFlash copy test's move);
+    // case 2: two forced tokens committed at tick 0 (a think-bound or tool force due at once), then decode.
+    for (0..3) |case| {
+        var out: [2][16]?u32 = undefined;
+        for ([_]bool{ false, true }, 0..) |on, r| {
+            first_token_prebuild_test_on = on;
+            var xfm = try Transformer.init(io, allocator, config, &weights);
+            defer xfm.deinit();
+            // the other gates (a decode profile, the ladder, the head_shortlist check, a restore dump) turn the build off by design
+            if (xfm.buildEvaluates() or restore_dump.dumpRestoreDir() != null) return error.SkipZigTest;
+            var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, 16, SamplingParams{ .temperature = 0.0 }, &.{}, .{ .skip_lazy_preforward = true });
+            defer gen.deinit(allocator);
+            try testing.expectEqual(on, gen.prebuilt != null);
+            const before = first_token_prebuild_counts;
+            var n: usize = 0;
+            if (case == 1) gen.next_token_id = 11;
+            if (case == 2) {
+                const fc = try gen.commitForcedTokens(allocator, &[_]u32{ 6, 13 });
+                defer allocator.free(fc.emitted);
+                try testing.expect(!fc.stopped);
+                for (fc.emitted) |t| {
+                    out[r][n] = t;
+                    n += 1;
+                }
+            }
+            while (n < 16) : (n += 1) out[r][n] = try gen.next(allocator);
+            // no stop ids and max_tokens 16: every slot holds a token (forced ones count toward the 16)
+            if (case != 2) {
+                for (out[r]) |t| try testing.expect(t != null);
+            }
+            try testing.expect(gen.prebuilt == null);
+            const adopted = first_token_prebuild_counts.adopted - before.adopted;
+            const dropped = first_token_prebuild_counts.dropped - before.dropped;
+            if (!on) {
+                try testing.expectEqual(@as(u64, 0), adopted + dropped);
+            } else if (case == 0) {
+                try testing.expectEqual(@as(u64, 1), adopted);
+                try testing.expectEqual(@as(u64, 0), dropped);
+            } else {
+                try testing.expectEqual(@as(u64, 0), adopted);
+                try testing.expectEqual(@as(u64, 1), dropped);
+            }
+        }
+        for (out[0], out[1]) |a, b| try testing.expectEqual(a, b);
+        try testing.expect(out[0][0] != null and out[0][4] != null); // never two stopped runs compared as equal
+    }
+}
+
+fn faultSweepSettledActiveBytes(s: mlx.mlx_stream) !usize {
+    if (mlx.mlx_synchronize(s) != 0) return error.NoSettledReading;
+    if (mlx.mlx_clear_cache() != 0) return error.NoSettledReading;
+    var active: usize = 0;
+    if (mlx.mlx_get_active_memory(&active) != 0) return error.NoActiveMemoryReading;
+    return active;
+}
+
+test "fault-sweep every error exit of initWithOptions's tail frees the prefill logits, the first token and the next logits" {
+    // A fault sweep over every checked op of the tail (from `init_tail_mark` to init's return), both branches, with logprobs
+    // on so firstTokenLogprobs runs ops of its own. Every run starts from a reset KV (`resetCache`), so the op sequence is the
+    // measuring run's and every armed fault must fire; the KV is reset again before the after-reading, so it is out of the
+    // comparison. MLX's settled active bytes are the leak oracle (the transformer's ownership test's method). Scope: the
+    // oracle sees a leaked handle only when it keeps device memory alive (an output, or a graph holding a freed array); a
+    // leaked view of memory something else still owns (a transpose of a weight) adds no bytes and is out of its reach.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const s = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(s);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp_trunk = std.testing.tmpDir(.{});
+    defer tmp_trunk.cleanup();
+    var trunk_buf: [512]u8 = undefined;
+    const trunk_path = trunk_buf[0..try tmp_trunk.dir.realPath(io, &trunk_buf)];
+    try dflash_mod.TinyFix.writeTrunk(io, tmp_trunk.dir, trunk_path, s);
+    var config = try model_mod.parseConfig(io, allocator, trunk_path);
+    var weights = try model_mod.loadWeights(io, allocator, trunk_path);
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var tok_dummy: Tokenizer = undefined;
+    const prompt = [_]u32{ 3, 7, 1, 12, 30, 5, 9, 22, 4, 17, 2, 28 };
+    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+    const sampling = SamplingParams{ .temperature = 0.0 };
+
+    // Control: the oracle sees the smallest leak the tail could make, an unevaluated lazy first token whose graph holds a
+    // logits row after the row's own handle was freed (the shape of a leaked `sampleTokenLazy` result).
+    {
+        const base = try faultSweepSettledActiveBytes(s);
+        const row = [_]c_int{ 1, 1, @intCast(dflash_mod.TinyFix.VOCAB) };
+        var probe_row = mlx.mlx_array_new();
+        var row_owned = true;
+        defer if (row_owned) {
+            _ = mlx.mlx_array_free(probe_row);
+        };
+        var probe_tok = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(probe_tok);
+        try mlx.check(mlx.mlx_zeros(&probe_row, &row, 3, .float32, s));
+        try mlx.check(mlx.mlx_array_eval(probe_row));
+        try mlx.check(mlx.mlx_argmax_axis(&probe_tok, probe_row, -1, false, s));
+        _ = mlx.mlx_array_free(probe_row);
+        row_owned = false;
+        try testing.expect((try faultSweepSettledActiveBytes(s)) > base);
+    }
+
+    // Cases: 0 the server path and 1 the regular path, logprobs on (the first-token prebuild is off); 2 the server path with
+    // logprobs off and the build ahead forced on (stk3, Codex on the merge), where a fault inside the build is swallowed by
+    // design: init returns a generator and step 0's shim builds the forward.
+    defer first_token_prebuild_test_on = null;
+    for (0..3) |case| {
+        const server_path = case != 1;
+        const ahead = case == 2;
+        first_token_prebuild_test_on = if (ahead) true else null;
+        // The build ahead's other gates (a build that evaluates, a restore dump) leave nothing of it to sweep.
+        if (ahead and (xfm.buildEvaluates() or restore_dump.dumpRestoreDir() != null)) continue;
+        const name = switch (case) {
+            0 => "server",
+            1 => "regular",
+            else => "server with the build ahead",
+        };
+        const opts: Generator.InitOptions = .{ .skip_lazy_preforward = server_path, .logprobs_n = if (ahead) 0 else 2 };
+        // A first unfaulted run warms the process-wide kernel caches (configs built once per shape), so the counting run
+        // below issues exactly the checks every faulted run issues.
+        try xfm.resetCache();
+        {
+            var g = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, 4, sampling, &.{}, opts);
+            g.deinit(allocator);
+        }
+        // One unfaulted run from a reset KV: counts the checked ops up to init's return.
+        try xfm.resetCache();
+        const c0 = mlx.op_count.load(.monotonic);
+        var n_ops: u64 = 0;
+        {
+            var g = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, 4, sampling, &.{}, opts);
+            n_ops = mlx.op_count.load(.monotonic) - c0;
+            g.deinit(allocator);
+        }
+        const tail_from = init_tail_mark - c0;
+        // The ops inside the regular tail's lazyForward are swept with the rest; the server path has none.
+        const fwd_from: u64 = if (server_path) 0 else init_forward_from - c0;
+        const fwd_to: u64 = if (server_path) 0 else init_forward_to - c0;
+        if (!server_path) try testing.expect(fwd_from >= tail_from and fwd_to > fwd_from and fwd_to < n_ops);
+        try testing.expect(n_ops > tail_from + 3);
+        var failed: usize = 0;
+        var swept: usize = 0;
+        var k: u64 = tail_from + 1;
+        while (k <= n_ops) : (k += 1) {
+            swept += 1;
+            // An unfaulted run first: a fault can stop init before a kernel cache is rebuilt for the decode shape, so the
+            // next run would issue fewer checks; this run puts every cache back in the counting run's state.
+            // The first restoring run starts from whatever cache state the previous fault left, so its own count can differ; it
+            // ends in the full run's state, and the second one, from that state, must issue exactly the counting run's checks.
+            for (0..2) |pass| {
+                try xfm.resetCache();
+                const w0 = mlx.op_count.load(.monotonic);
+                var g = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, 4, sampling, &.{}, opts);
+                const w_ops = mlx.op_count.load(.monotonic) - w0;
+                g.deinit(allocator);
+                if (pass == 1) try testing.expectEqual(n_ops, w_ops);
+            }
+            try xfm.resetCache();
+            const base = try faultSweepSettledActiveBytes(s);
+            mlx.fault.arm(k);
+            const r = Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, 4, sampling, &.{}, opts);
+            const did = mlx.fault.didFire();
+            mlx.fault.disarm();
+            // With the build ahead on, every check before the last two is the build's and is swallowed by design; the last
+            // two (the sample's eval and its read) return the error. Without it, every fault returns the error.
+            const want_err = !ahead or k > n_ops - 2;
+            if (r) |ok| {
+                var g = ok;
+                g.deinit(allocator);
+                if (want_err) std.debug.print("[fault-sweep] {s} path k={d}: init returned a generator\n", .{ name, k });
+                try testing.expect(!want_err);
+            } else |err| {
+                try testing.expectEqual(error.MlxError, err);
+                if (!want_err) std.debug.print("[fault-sweep] {s} path k={d}: a build fault escaped init\n", .{ name, k });
+                try testing.expect(want_err);
+                failed += 1;
+            }
+            // Same start state, same ops: every op of the tail is reached, so every fault fires.
+            if (!did) std.debug.print("[fault-sweep] {s} path k={d}: the fault did not fire\n", .{ name, k });
+            try testing.expect(did);
+            try xfm.resetCache();
+            const after = try faultSweepSettledActiveBytes(s);
+            if (after != base) std.debug.print("[fault-sweep] {s} path k={d}: base {d} after {d}\n", .{ name, k, base, after });
+            try testing.expectEqual(base, after);
+        }
+        std.debug.print("[fault-sweep] {s} path: {d} tail ops faulted ({d} of them inside lazyForward), {d} returned the error\n", .{ name, swept, fwd_to - fwd_from, failed });
+        try testing.expectEqual(n_ops - tail_from, swept);
+        if (ahead) {
+            // Checked by position above: two errors (the sample's eval and read), and the build's faults all swallowed.
+            try testing.expect(failed == 2 and swept > 2);
+        } else {
+            // No check of the tail swallows its error: every swept fault returns it, the ones after lazyForward included.
+            try testing.expectEqual(swept, failed);
+        }
+        // The regular path's checks after lazyForward (the first token's eval and read, then firstTokenLogprobs's ops) are all
+        // swept, so a fault reaches the state where the tail owns the logits, the token and next_logits at once.
+        if (!server_path) try testing.expect(n_ops - fwd_to >= 3);
+    }
+}
+
+// ── Injected failures on the drafter's error paths ──
+//
+// One filter runs them all: `-Dtest-filter=drafter-fault-sweep`. Method as the fault sweep above: `mlx.fault.arm(k)` makes the k-th checked op
+// report an error after it ran (its output handle is valid and must be freed by the failing function), `std.testing.FailingAllocator`
+// makes the k-th host allocation fail, and MLX's settled active bytes (KV reset before the reading, so a leaked graph that pins
+// the cache's buffers shows) are the leak oracle for arrays. Scope of that oracle: it sees a leaked handle only when it keeps device
+// memory alive; the drafter's intermediates after the first cross-attention hold the target's K/V buffers, so they show.
+//
+// The fixture is a tiny random-weight assistant drafter (two sliding layers, hidden 64, vocab 128, tied head) written in memory
+// beside `TinyFix`'s trunk, loaded with `loadDrafter` and bound to that trunk. Its drafts mean nothing: the rounds' outcomes are
+// pinned by `drafter_fault_sweep_force_accepted` and `drafter_fault_sweep_force_reforward` (test-only variables, read under `builtin.is_test`).
+
+const drafter_fault_sweep_drafter_config =
+    \\{
+    \\  "model_type": "gemma4_assistant",
+    \\  "backbone_hidden_size": 64,
+    \\  "tie_word_embeddings": true,
+    \\  "text_config": {
+    \\    "hidden_size": 64,
+    \\    "intermediate_size": 128,
+    \\    "num_hidden_layers": 2,
+    \\    "num_attention_heads": 4,
+    \\    "head_dim": 16,
+    \\    "sliding_window": 8,
+    \\    "vocab_size": 128,
+    \\    "rms_norm_eps": 1e-5,
+    \\    "layer_types": ["sliding_attention", "sliding_attention"]
+    \\  }
+    \\}
+;
+
+fn drafterFaultSweepWriteDrafter(io: std.Io, dir: std.Io.Dir, dir_path: []const u8, s: mlx.mlx_stream) !void {
+    const Fix = dflash_mod.TinyFix;
+    try dir.writeFile(io, .{ .sub_path = "config.json", .data = drafter_fault_sweep_drafter_config });
+    const st_path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/model.safetensors", .{dir_path}, 0);
+    defer testing.allocator.free(st_path);
+    const map = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(map);
+    const meta = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(meta);
+
+    try Fix.putW(map, "model.embed_tokens.weight", Fix.VOCAB, Fix.HIDDEN, 201, s);
+    try Fix.putNorm(map, "model.norm.weight", Fix.HIDDEN, s);
+    try Fix.putW(map, "pre_projection.weight", Fix.HIDDEN, 2 * Fix.HIDDEN, 202, s);
+    try Fix.putW(map, "post_projection.weight", Fix.HIDDEN, Fix.HIDDEN, 203, s);
+    const q_out = Fix.N_HEADS * Fix.HEAD_DIM;
+    var key_buf: [128]u8 = undefined;
+    var li: usize = 0;
+    while (li < 2) : (li += 1) {
+        try Fix.putNorm(map, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.input_layernorm.weight", .{li}), Fix.HIDDEN, s);
+        try Fix.putNorm(map, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.post_attention_layernorm.weight", .{li}), Fix.HIDDEN, s);
+        try Fix.putNorm(map, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.pre_feedforward_layernorm.weight", .{li}), Fix.HIDDEN, s);
+        try Fix.putNorm(map, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.post_feedforward_layernorm.weight", .{li}), Fix.HIDDEN, s);
+        try Fix.putW(map, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.self_attn.q_proj.weight", .{li}), q_out, Fix.HIDDEN, 210 + li, s);
+        try Fix.putW(map, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.self_attn.o_proj.weight", .{li}), Fix.HIDDEN, q_out, 220 + li, s);
+        try Fix.putNorm(map, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.self_attn.q_norm.weight", .{li}), Fix.HEAD_DIM, s);
+        try Fix.putW(map, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.mlp.gate_proj.weight", .{li}), Fix.INTER, Fix.HIDDEN, 230 + li, s);
+        try Fix.putW(map, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.mlp.up_proj.weight", .{li}), Fix.INTER, Fix.HIDDEN, 240 + li, s);
+        try Fix.putW(map, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.mlp.down_proj.weight", .{li}), Fix.HIDDEN, Fix.INTER, 250 + li, s);
+        try Fix.putNorm(map, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.layer_scalar", .{li}), 1, s);
+    }
+    try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
+}
+
+/// Pointers to the objects one test body works on (built in place by `drafterFaultSweepWith`, so nothing moves after `bind`).
+const DrafterFaultSweepCtx = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    s: mlx.mlx_stream,
+    xfm: *Transformer,
+    drafter: *DrafterModel,
+    tok: *const Tokenizer,
+    /// 12 tokens: past the trunk's sliding window of 8.
+    prompt: []const u32,
+
+    fn drafterOptions(self: *const DrafterFaultSweepCtx) Generator.InitOptions {
+        return .{ .drafter_enabled = true, .drafter = self.drafter, .drafter_block_size = 4 };
+    }
+
+    fn initGen(self: *const DrafterFaultSweepCtx, prompt: []const u32, options: Generator.InitOptions) !Generator {
+        return Generator.initWithOptions(self.io, self.allocator, self.xfm, self.tok, prompt, 16, .{ .temperature = 0.0 }, &.{}, options);
+    }
+
+    fn settled(self: *const DrafterFaultSweepCtx) !usize {
+        return faultSweepSettledActiveBytes(self.s);
+    }
+};
+
+fn drafterFaultSweepFreeLogprobs(allocator: std.mem.Allocator, list: *std.ArrayList(LogprobResult)) void {
+    for (list.items) |r| allocator.free(r.top_logprobs);
+    list.deinit(allocator);
+}
+
+fn drafterFaultSweepWith(body: anytype) !void {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const s = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(s);
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var tmp_trunk = std.testing.tmpDir(.{});
+    defer tmp_trunk.cleanup();
+    var trunk_buf: [512]u8 = undefined;
+    const trunk_path = trunk_buf[0..try tmp_trunk.dir.realPath(io, &trunk_buf)];
+    try dflash_mod.TinyFix.writeTrunk(io, tmp_trunk.dir, trunk_path, s);
+    var config = try model_mod.parseConfig(io, allocator, trunk_path);
+    var weights = try model_mod.loadWeights(io, allocator, trunk_path);
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+
+    var tmp_drafter = std.testing.tmpDir(.{});
+    defer tmp_drafter.cleanup();
+    var drafter_buf: [512]u8 = undefined;
+    const drafter_path = drafter_buf[0..try tmp_drafter.dir.realPath(io, &drafter_buf)];
+    try drafterFaultSweepWriteDrafter(io, tmp_drafter.dir, drafter_path, s);
+    var drafter = try drafter_mod.loadDrafter(io, allocator, s, drafter_path);
+    defer drafter.deinit();
+    try drafter.bind(&xfm);
+
+    var tok_dummy: Tokenizer = undefined;
+    const prompt = [_]u32{ 3, 7, 1, 12, 30, 5, 9, 22, 4, 17, 2, 28 };
+    var ctx = DrafterFaultSweepCtx{
+        .io = io,
+        .allocator = allocator,
+        .s = s,
+        .xfm = &xfm,
+        .drafter = &drafter,
+        .tok = &tok_dummy,
+        .prompt = &prompt,
+    };
+    // Whatever a body pinned, a failing body leaves nothing behind for the next test.
+    defer {
+        drafter_fault_sweep_force_accepted = null;
+        drafter_fault_sweep_force_reforward = false;
+    }
+    try body(&ctx);
+}
+
+// The drafter's init captures the prompt's last hidden before the head projection, the prompt logprobs and the tail slice.
+fn drafterFaultSweepBodyCapture(c: *DrafterFaultSweepCtx) !void {
+    const allocator = c.allocator;
+    // An unfaulted run warms the process-wide kernel caches, so every later run issues the same checked ops.
+    {
+        try c.xfm.resetCache();
+        var out = std.ArrayList(LogprobResult).empty;
+        defer drafterFaultSweepFreeLogprobs(allocator, &out);
+        var opts = c.drafterOptions();
+        opts.prompt_logprobs = &out;
+        opts.logprobs_n = 2;
+        var g = try c.initGen(c.prompt, opts);
+        g.deinit(allocator);
+    }
+
+    // (1) The prompt logprobs refuse after the capture exists: a list that already holds a row cannot reach prompt_len - 1.
+    {
+        try c.xfm.resetCache();
+        const base = try c.settled();
+        {
+            var out = std.ArrayList(LogprobResult).empty;
+            defer drafterFaultSweepFreeLogprobs(allocator, &out);
+            try out.append(allocator, .{ .token_logprob = 0, .top_logprobs = try allocator.alloc(TokenLogprob, 0) });
+            var opts = c.drafterOptions();
+            opts.prompt_logprobs = &out;
+            opts.logprobs_n = 2;
+            if (c.initGen(c.prompt, opts)) |ok| {
+                var g = ok;
+                g.deinit(allocator);
+                return error.TestExpectedInitToFail;
+            } else |err| try testing.expectEqual(error.PromptLogprobsUnavailable, err);
+        }
+        try c.xfm.resetCache();
+        const after = try c.settled();
+        if (after != base) std.debug.print("[drafter-fault-sweep] logprobs exit: base {d} after {d}\n", .{ base, after });
+        try testing.expectEqual(base, after);
+    }
+
+    // (2) A fault on every checked op after the forward wrote the capture (the head projection and what follows it).
+    try c.xfm.resetCache();
+    const c0 = mlx.op_count.load(.monotonic);
+    var end_rel: u64 = 0;
+    {
+        var g = try c.initGen(c.prompt, c.drafterOptions());
+        // To init's return: the head projection, then the first token's sample, evaluation and read.
+        end_rel = mlx.op_count.load(.monotonic) - c0;
+        g.deinit(allocator);
+    }
+    const cap_rel = transformer_mod.test_capture_mark - c0;
+    // The capture is written before the head projection, so the forward's own tail is in the window, and the sample after it.
+    try testing.expect(init_final_to - c0 > cap_rel);
+    try testing.expect(end_rel > init_final_to - c0);
+    var failed: usize = 0;
+    var k: u64 = cap_rel + 1;
+    while (k <= end_rel) : (k += 1) {
+        try c.xfm.resetCache();
+        const base = try c.settled();
+        mlx.fault.arm(k);
+        const r = c.initGen(c.prompt, c.drafterOptions());
+        const did = mlx.fault.didFire();
+        mlx.fault.disarm();
+        if (r) |ok| {
+            var g = ok;
+            g.deinit(allocator);
+        } else |err| {
+            try testing.expectEqual(error.MlxError, err);
+            failed += 1;
+        }
+        if (!did) std.debug.print("[drafter-fault-sweep] capture sweep k={d}: the fault did not fire\n", .{k});
+        try testing.expect(did);
+        try c.xfm.resetCache();
+        const after = try c.settled();
+        if (after != base) std.debug.print("[drafter-fault-sweep] capture sweep k={d}: base {d} after {d}\n", .{ k, base, after });
+        try testing.expectEqual(base, after);
+    }
+    std.debug.print("[drafter-fault-sweep] capture: {d} checked ops after the capture swept, {d} returned the error\n", .{ end_rel - cap_rel, failed });
+    // No checked op between the capture and init's return swallows its error.
+    try testing.expectEqual(@as(usize, @intCast(end_rel - cap_rel)), failed);
+}
+
+test "drafter-fault-sweep: an init that fails after the drafter's capture frees the captured hidden" {
+    try drafterFaultSweepWith(drafterFaultSweepBodyCapture);
+}
+
+// The verify input's appends are checked. A fault on each of them (and on the concatenation) must stop the round.
+fn drafterFaultSweepBodyAppends(c: *DrafterFaultSweepCtx) !void {
+    const allocator = c.allocator;
+    const m: u64 = 3; // block size 4: three drafts
+    // An unfaulted round: warm-up, then the counting run.
+    {
+        try c.xfm.resetCache();
+        var g = try c.initGen(c.prompt, c.drafterOptions());
+        defer g.deinit(allocator);
+        const res = (try g.nextDrafter(allocator)).?;
+        allocator.free(res.tokens);
+    }
+    try c.xfm.resetCache();
+    var g0 = try c.initGen(c.prompt, c.drafterOptions());
+    const c0 = mlx.op_count.load(.monotonic);
+    const res0 = (try g0.nextDrafter(allocator)).?;
+    allocator.free(res0.tokens);
+    g0.deinit(allocator);
+    const from_rel = drafter_fault_sweep_verify_from - c0;
+    const to_rel = drafter_fault_sweep_verify_to - c0;
+    // One checked append for t1, one per draft, then the concatenation. With the appends unchecked, only the concatenation counts.
+    try testing.expectEqual(2 + m, to_rel - from_rel);
+
+    var k: u64 = from_rel + 1;
+    while (k <= to_rel) : (k += 1) {
+        try c.xfm.resetCache();
+        const base = try c.settled();
+        {
+            var g = try c.initGen(c.prompt, c.drafterOptions());
+            defer g.deinit(allocator);
+            mlx.fault.arm(k);
+            const r = g.nextDrafter(allocator);
+            const did = mlx.fault.didFire();
+            mlx.fault.disarm();
+            if (r) |maybe| {
+                if (maybe) |res| allocator.free(res.tokens);
+                std.debug.print("[drafter-fault-sweep] appends k={d}: the round returned instead of failing\n", .{k});
+                return error.TestExpectedRoundToFail;
+            } else |err| try testing.expectEqual(error.MlxError, err);
+            try testing.expect(did);
+            // No partial round: nothing was committed to the history.
+            try testing.expectEqual(@as(usize, 0), g.generated_ids.items.len);
+        }
+        try c.xfm.resetCache();
+        const after = try c.settled();
+        if (after != base) std.debug.print("[drafter-fault-sweep] appends k={d}: base {d} after {d}\n", .{ k, base, after });
+        try testing.expectEqual(base, after);
+    }
+}
+
+test "drafter-fault-sweep: a failed append of the verify input stops the round and leaks nothing" {
+    try drafterFaultSweepWith(drafterFaultSweepBodyAppends);
+}
+
+// The accept paths reserve the history's room before they allocate the output slice. A failing allocation at either
+// of the round's last two allocations (the reservation, then the slice) must return OutOfMemory with no partial round and no leaked slice
+// (the testing allocator reports a leaked slice when the test ends).
+fn drafterFaultSweepBodyAccept(c: *DrafterFaultSweepCtx) !void {
+    const allocator = c.allocator;
+    const m: usize = 3;
+    // The re-forward needs the round's cache snapshot (MLX_SERVE_DRAFTER_NO_SNAPSHOT=1 takes none when the rollback can serve the round) and the
+    // rollback needs MLX_SERVE_DRAFTER_ROLLBACK_OFF unset: under either switch these scenarios do not mean what they say.
+    if (drafter_mod.drafterRollbackOff() or drafter_mod.drafterNoSnapshotOn()) return error.SkipZigTest;
+    // Three tokens: the verify's rows stay inside the trunk's sliding window of 8, so the offset rollback is not refused by a ring that
+    // already dropped a needed row.
+    const prompt = c.prompt[0..3];
+    const Scenario = struct { name: []const u8, accepted: u32, reforward: bool };
+    const scenarios = [_]Scenario{
+        .{ .name = "full accept", .accepted = 3, .reforward = false },
+        .{ .name = "partial accept, offset rollback", .accepted = 1, .reforward = false },
+        .{ .name = "partial accept, restore and re-forward", .accepted = 1, .reforward = true },
+    };
+    for (scenarios, 0..) |sc, si| {
+        drafter_fault_sweep_force_accepted = sc.accepted;
+        drafter_fault_sweep_force_reforward = sc.reforward;
+
+        // The counting run: the allocations of one unfaulted round, and the path it took.
+        var n_alloc: usize = 0;
+        {
+            try c.xfm.resetCache();
+            var g = try c.initGen(prompt, c.drafterOptions());
+            defer g.deinit(allocator);
+            var counting = std.testing.FailingAllocator.init(allocator, .{});
+            const res = (try g.nextDrafter(counting.allocator())).?;
+            defer allocator.free(res.tokens);
+            n_alloc = counting.alloc_index;
+            try testing.expectEqual(@as(usize, if (si == 0) 1 + m else 2), res.tokens.len);
+            try testing.expectEqual(res.tokens.len, g.generated_ids.items.len);
+            if (si == 1) try testing.expect(g.drafter_kv_move_prev_rolled);
+            if (si == 2) try testing.expect(g.drafter_round_trace_prev_restored);
+        }
+        // The reservation (the history starts empty) and the slice are the round's last two allocations in every path.
+        try testing.expect(n_alloc >= 2);
+
+        for ([_]usize{ n_alloc - 2, n_alloc - 1 }) |fail_at| {
+            try c.xfm.resetCache();
+            const base = try c.settled();
+            {
+                var g = try c.initGen(prompt, c.drafterOptions());
+                defer g.deinit(allocator);
+                var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_at });
+                const r = g.nextDrafter(failing.allocator());
+                if (r) |maybe| {
+                    if (maybe) |res| allocator.free(res.tokens);
+                    std.debug.print("[drafter-fault-sweep] accept [{s}] fail_at={d}: the round returned instead of failing\n", .{ sc.name, fail_at });
+                    return error.TestExpectedRoundToFail;
+                } else |err| try testing.expectEqual(error.OutOfMemory, err);
+                // No partial round in the history.
+                try testing.expectEqual(@as(usize, 0), g.generated_ids.items.len);
+            }
+            try c.xfm.resetCache();
+            const after = try c.settled();
+            if (after != base) std.debug.print("[drafter-fault-sweep] accept [{s}] fail_at={d}: base {d} after {d}\n", .{ sc.name, fail_at, base, after });
+            try testing.expectEqual(base, after);
+        }
+        std.debug.print("[drafter-fault-sweep] accept [{s}]: {d} allocations in the round, the last two failed in turn\n", .{ sc.name, n_alloc });
+    }
+}
+
+test "drafter-fault-sweep: a failing allocation in the accept paths leaks no slice and leaves no partial round" {
+    try drafterFaultSweepWith(drafterFaultSweepBodyAccept);
+}
+
+// `drafter.stepArr` frees its intermediates when a later op fails. A fault on every checked op of one draft step.
+fn drafterFaultSweepStepOnce(c: *DrafterFaultSweepCtx, g: *Generator) !drafter_mod.DrafterStepOut {
+    const id_i32: i32 = @intCast(g.next_token_id);
+    const id_shape = [_]c_int{1};
+    const id_arr = mlx.mlx_array_new_data(&id_i32, &id_shape, 1, .int32);
+    defer _ = mlx.mlx_array_free(id_arr);
+    const rope_offset: c_int = drafter_mod.drafterCacheViewQueryPos(g.ctx.cache.step);
+    return drafter_mod.stepArr(c.drafter, c.xfm, g.ctx.cache, id_arr, g.last_hidden, rope_offset);
+}
+
+fn drafterFaultSweepBodyStepArr(c: *DrafterFaultSweepCtx) !void {
+    const allocator = c.allocator;
+    // Warm-up, then the counting run.
+    var n_ops: u64 = 0;
+    for (0..2) |pass| {
+        try c.xfm.resetCache();
+        var g = try c.initGen(c.prompt, c.drafterOptions());
+        defer g.deinit(allocator);
+        const c0 = mlx.op_count.load(.monotonic);
+        const out = try drafterFaultSweepStepOnce(c, &g);
+        _ = mlx.mlx_array_free(out.logits);
+        _ = mlx.mlx_array_free(out.h_prev_next);
+        if (pass == 1) n_ops = mlx.op_count.load(.monotonic) - c0;
+    }
+    // Two layers of attention and MLP, the norms, the projections and the tied head: far more than a few dozen checked ops.
+    try testing.expect(n_ops > 40);
+
+    var k: u64 = 1;
+    while (k <= n_ops) : (k += 1) {
+        try c.xfm.resetCache();
+        const base = try c.settled();
+        {
+            var g = try c.initGen(c.prompt, c.drafterOptions());
+            defer g.deinit(allocator);
+            mlx.fault.arm(k);
+            const r = drafterFaultSweepStepOnce(c, &g);
+            const did = mlx.fault.didFire();
+            mlx.fault.disarm();
+            if (r) |out| {
+                _ = mlx.mlx_array_free(out.logits);
+                _ = mlx.mlx_array_free(out.h_prev_next);
+                std.debug.print("[drafter-fault-sweep] stepArr k={d}: the step returned instead of failing\n", .{k});
+                return error.TestExpectedStepToFail;
+            } else |err| try testing.expectEqual(error.MlxError, err);
+            if (!did) std.debug.print("[drafter-fault-sweep] stepArr k={d}: the fault did not fire\n", .{k});
+            try testing.expect(did);
+        }
+        try c.xfm.resetCache();
+        const after = try c.settled();
+        if (after != base) std.debug.print("[drafter-fault-sweep] stepArr k={d}: base {d} after {d}\n", .{ k, base, after });
+        try testing.expectEqual(base, after);
+    }
+    std.debug.print("[drafter-fault-sweep] stepArr: {d} checked ops faulted in turn\n", .{n_ops});
+}
+
+test "drafter-fault-sweep: a failing op inside drafter.stepArr frees every intermediate" {
+    try drafterFaultSweepWith(drafterFaultSweepBodyStepArr);
 }

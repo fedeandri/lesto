@@ -891,6 +891,21 @@ fn promptOpensThink(
     return chat_mod.promptTailOpensThink(tail);
 }
 
+/// True when the rendered generation prompt ends with the empty, closed
+/// thought a thinking-off Gemma 4 template appends (`chat.CLOSED_EMPTY_THOUGHT`).
+fn promptClosesEmptyThought(
+    allocator: std.mem.Allocator,
+    lm: *LoadedModel,
+    tok: *const Tokenizer,
+    prompt_ids: []const u32,
+) bool {
+    if (prompt_ids.len == 0) return false;
+    const n = @min(prompt_ids.len, 8);
+    const tail = decodeTokens(allocator, lm, tok, prompt_ids[prompt_ids.len - n ..], false) catch return false;
+    defer allocator.free(tail);
+    return chat_mod.promptTailClosesEmptyThought(tail);
+}
+
 /// One token id for `text`, or null when the tokenizer spells it in pieces.
 fn atomicTokenId(allocator: std.mem.Allocator, tok: *const Tokenizer, text: []const u8) ?u32 {
     const ids = tok.encode(allocator, text) catch return null;
@@ -1534,7 +1549,7 @@ pub fn serve(
             .stop = &sampler_stop,
         };
         sampler_thread = try std.Thread.spawn(.{}, gaugeSamplerLoop, .{ctx});
-        log.info("Prometheus metrics: ENABLED — GET http://{s}:{d}/metrics (live panel at GET /)\n", .{ host, port });
+        log.info("Prometheus metrics: ENABLED - GET http://{s}:{d}/metrics (live panel at GET /)\n", .{ host, port });
     }
     // LIFO: join deferred first → runs second. stop deferred second → runs first.
     defer if (sampler_thread) |t| t.join();
@@ -1550,7 +1565,7 @@ pub fn serve(
             .window_ms = @as(i64, secs) * 1000,
             .stop = &idle_evict_stop,
         }});
-        log.info("[registry] idle eviction ON — unloading models idle for {d}s\n", .{secs});
+        log.info("[registry] idle eviction ON - unloading models idle for {d}s\n", .{secs});
     }
     defer if (idle_evict_thread) |t| t.join();
     defer idle_evict_stop.store(true, .monotonic);
@@ -1738,7 +1753,7 @@ pub fn serve(
         }
         const remaining = active_conn_threads.load(.acquire);
         if (remaining > 0)
-            log.warn("shutdown: {d} connection thread(s) still active after {d}ms — proceeding\n", .{ remaining, waited_ms });
+            log.warn("shutdown: {d} connection thread(s) still active after {d}ms - proceeding\n", .{ remaining, waited_ms });
     }
 
     log.info("\nShutting down gracefully...\n", .{});
@@ -2042,7 +2057,7 @@ fn handleConnection(
             // Quiet: the index panel polls this ~1 Hz — don't log the body.
             try sendResponseQuiet(stream, "200 OK", "application/json", out.written());
         } else {
-            try sendResponse(stream, "503 Service Unavailable", "application/json", "{\"error\":\"metrics not enabled — start with --metrics\"}");
+            try sendResponse(stream, "503 Service Unavailable", "application/json", "{\"error\":\"metrics not enabled - start with --metrics\"}");
         }
         return;
     }
@@ -3128,7 +3143,7 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
     const live_ceiling: u64 = currentGpuMemoryCeiling(config, active_mem);
     if (live_ceiling < staticGpuMemoryCeiling()) {
         const free_gb = @as(f64, @floatFromInt(live_ceiling -| active_mem)) / (1024.0 * 1024.0 * 1024.0);
-        log.info("[hot-cache] budget {d} MB (static ceiling); free at load {d:.1} GB — live admission will evict as needed\n", .{ plan.budget >> 20, free_gb });
+        log.info("[hot-cache] budget {d} MB (static ceiling); free at load {d:.1} GB - live admission will evict as needed\n", .{ plan.budget >> 20, free_gb });
     }
     if (ask != requested) {
         log.info("[hot-cache] budget {d} MB = one session at the working context (no --prefix-cache-mem)\n", .{ask >> 20});
@@ -3618,7 +3633,7 @@ fn memoryRefusalMessage(
     avail_mb: u64,
     bill: AdmissionBill,
 ) ![]u8 {
-    return std.fmt.allocPrint(allocator, "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB is available and the hot prefix cache holds ~{d}MB more, all of which can be reclaimed (~{d}MB — the shortfall is elsewhere), which is not enough. Reduce prompt size, lower --ctx-size, or use a smaller model.", .{ prompt_len, needed_mb, avail_mb, bill.evictable / (1024 * 1024), bill.evictionCredit() / (1024 * 1024) });
+    return std.fmt.allocPrint(allocator, "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB is available and the hot prefix cache holds ~{d}MB more, all of which can be reclaimed (~{d}MB - the shortfall is elsewhere), which is not enough. Reduce prompt size, lower --ctx-size, or use a smaller model.", .{ prompt_len, needed_mb, avail_mb, bill.evictable / (1024 * 1024), bill.evictionCredit() / (1024 * 1024) });
 }
 
 /// The message `error.PrefillDoesNotFit` sends: refused before its first forward by the same
@@ -4272,7 +4287,7 @@ pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize
     const width_note: []const u8 = if (perRequestPrefillChunkEnabled(config)) "the narrowest width tried" else "the pinned width";
     // The comparison first (`fitsAfterEviction` spelled out), then the residency as context, with
     // the part eviction cannot take named.
-    log.warn("  prompt {d} tokens needs ~{d}MB at prefill chunk {d} ({s}), ~{d}MB available + ~{d}MB the hot cache can give back (~{d}MB resident, ~{d}MB of it pinned by this request's own prefix) — refused before prefill\n", .{
+    log.warn("  prompt {d} tokens needs ~{d}MB at prefill chunk {d} ({s}), ~{d}MB available + ~{d}MB the hot cache can give back (~{d}MB resident, ~{d}MB of it pinned by this request's own prefix) - refused before prefill\n", .{
         prompt_len,
         bill.needed / mb,
         bill.chunk,
@@ -4299,7 +4314,7 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
     // Evict to admit (#353): when the bill only fails because the cache is holding memory, admit;
     // the inference thread evicts LRU entries until it fits and refuses by name only if it still does not.
     if (needed > available and bill.fitsAfterEviction()) {
-        log.info("  prompt {d} tokens needs ~{d}MB, ~{d}MB available + ~{d}MB reclaimable hot cache (of ~{d}MB resident) — admitting, the prefill will evict\n", .{
+        log.info("  prompt {d} tokens needs ~{d}MB, ~{d}MB available + ~{d}MB reclaimable hot cache (of ~{d}MB resident) - admitting, the prefill will evict\n", .{
             prompt_len, needed / (1024 * 1024), available / (1024 * 1024), bill.evictionCredit() / (1024 * 1024), bill.evictable / (1024 * 1024),
         });
         return true;
@@ -4308,7 +4323,7 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
     // this prompt would restore from is holding bytes that will neither be allocated nor
     // reclaimed. How many is knowable only on the inference thread, which bills with `WarmPrefix`.
     if (needed > available and pinnedResidentBytes(bill) > 0) {
-        log.info("  prompt {d} tokens needs ~{d}MB cold, ~{d}MB available, and ~{d}MB of hot cache is a prefix this prompt would SHARE — deferring to the prefill, which bills the warm request\n", .{
+        log.info("  prompt {d} tokens needs ~{d}MB cold, ~{d}MB available, and ~{d}MB of hot cache is a prefix this prompt would SHARE - deferring to the prefill, which bills the warm request\n", .{
             prompt_len, needed / (1024 * 1024), available / (1024 * 1024), pinnedResidentBytes(bill) / (1024 * 1024),
         });
         return true;
@@ -4329,7 +4344,7 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
             }
             fn unloadOne(r: *@This()) bool {
                 const id = r.sch.idleModelToUnload(r.keep) orelse return false;
-                log.info("  prompt {d} tokens does not fit — unloading idle model {s} first\n", .{ r.prompt_ids.len, id });
+                log.info("  prompt {d} tokens does not fit - unloading idle model {s} first\n", .{ r.prompt_ids.len, id });
                 r.sch.unloadModelIfIdle(id, 0) catch return false;
                 r.bill.* = prefillAdmissionBill(r.config, r.prompt_ids.len, r.max_tokens, r.kv_override, r.unchunked, r.prompt_ids, .{});
                 r.bill.needed += r.media_bytes;
@@ -4342,7 +4357,7 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
     if (bill.needed > bill.available) {
         const needed_mb = bill.needed / (1024 * 1024);
         const avail_mb = bill.available / (1024 * 1024);
-        log.warn("  prompt {d} tokens needs ~{d}MB (KV+working+margin) at prefill chunk {d}, ~{d}MB available + ~{d}MB reclaimable of ~{d}MB resident hot cache — rejecting\n", .{ prompt_len, needed_mb, bill.chunk, avail_mb, bill.evictionCredit() / (1024 * 1024), bill.evictable / (1024 * 1024) });
+        log.warn("  prompt {d} tokens needs ~{d}MB (KV+working+margin) at prefill chunk {d}, ~{d}MB available + ~{d}MB reclaimable of ~{d}MB resident hot cache - rejecting\n", .{ prompt_len, needed_mb, bill.chunk, avail_mb, bill.evictionCredit() / (1024 * 1024), bill.evictable / (1024 * 1024) });
         // A refusal quotes the numbers it compared, hot cache included; everything the cache holds
         // is evictable here by construction (the withheld case took the deferral arm).
         const msg = try memoryRefusalMessage(allocator, prompt_len, needed_mb, avail_mb, bill);
@@ -4387,7 +4402,7 @@ fn clampMaxTokens(max_tokens: u32, prompt_len: usize, effective_ctx: u32) u32 {
     if (prompt >= effective_ctx) return 1; // at least 1 token
     const remaining = effective_ctx - prompt;
     if (maxTokensBudgetSqueezed(max_tokens, remaining)) {
-        log.warn("  generation budget squeezed: {d}/{d} tokens remaining (prompt={d}, ctx={d}) — tool call arguments may be truncated\n", .{ remaining, max_tokens, prompt, effective_ctx });
+        log.warn("  generation budget squeezed: {d}/{d} tokens remaining (prompt={d}, ctx={d}) - tool call arguments may be truncated\n", .{ remaining, max_tokens, prompt, effective_ctx });
     } else if (max_tokens == AUTO_MAX_TOKENS_SENTINEL and autoBudgetWindowTight(remaining, effective_ctx)) {
         // The client named no budget, so this is context, not a deviation: debug.
         log.debug("  generation budget squeezed: {d} of the window remain (auto budget; prompt={d}, ctx={d})\n", .{ remaining, prompt, effective_ctx });
@@ -6444,7 +6459,7 @@ fn handleChatCompletions(
             // A DFlash drafter is exempt: its runtime yield gate disables on
             // REALIZED acceptance after `DFLASH_GATE_WARMUP` rounds (8 wasted
             // verifies at worst), strictly better evidence than a prompt-time heuristic
-            // that cannot see output echo — and llmprobe/bench bodies cannot
+            // that cannot see output echo - and LLM probe and bench bodies cannot
             // carry enable_drafter:true. The gemma cross-attention drafter
             // (0.55x measured on novel) keeps the gate.
             if (enable_drafter and !drafter_explicit_in_json and lm.dflash == null) {
@@ -6468,6 +6483,12 @@ fn handleChatCompletions(
         .presence_penalty = presence_penalty,
         .frequency_penalty = sampled.frequency_penalty,
         .seed = seed,
+        // Thinking off and the template closed an empty thought: the reply is the answer, so the
+        // thought-channel opener is masked (a channel opened anyway left `content` empty). Tool requests
+        // and JSON response_format requests keep their own sampling policy; `{"type": "text"}` asks for a
+        // plain answer, which is this case.
+        .answer_only = !enable_thinking and !has_tools and grammar_schema_val == null and
+            promptClosesEmptyThought(allocator, lm, tok, prompt_ids),
     };
 
     // Build grammar-constrained sampling state if a JSON schema was supplied.
@@ -6755,7 +6776,7 @@ fn nonStreamingViaScheduler(
             // which is fine; the win is freeing the GPU.
             if (conn) |c| {
                 if (c.peerClosed()) {
-                    log.info("  [cancel] client disconnected while waiting (non-stream) — cancelling slot\n", .{});
+                    log.info("  [cancel] client disconnected while waiting (non-stream) - cancelling slot\n", .{});
                     slot.cancel();
                     client_gone = true;
                     break :wait;
@@ -6770,7 +6791,7 @@ fn nonStreamingViaScheduler(
         }
         if (conn) |c| {
             if (c.peerClosed()) {
-                log.info("  [cancel] client disconnected while decoding (non-stream) — cancelling slot\n", .{});
+                log.info("  [cancel] client disconnected while decoding (non-stream) - cancelling slot\n", .{});
                 slot.cancel();
                 client_gone = true;
                 break :wait;
@@ -7748,13 +7769,13 @@ fn handleStreamingGeneration(
                 // (Claude Code retries pile up serially otherwise), and the
                 // keepalive stops clients timing out on stream silence.
                 if (stream.peerClosed()) {
-                    log.info("  [cancel] client disconnected while waiting for tokens — cancelling slot\n", .{});
+                    log.info("  [cancel] client disconnected while waiting for tokens - cancelling slot\n", .{});
                     slot_handle.?.cancel();
                     client_gone = true;
                     break;
                 }
                 sendStreamKeepalive(stream) catch {
-                    log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
+                    log.info("  [cancel] keepalive write failed (client disconnected) - cancelling slot\n", .{});
                     slot_handle.?.cancel();
                     client_gone = true;
                     break;
@@ -8105,7 +8126,7 @@ fn handleStreamingGeneration(
         // flowing — without this the client's idle-body timeout kills the
         // stream mid-generation.
         beatStreamKeepalive(stream) catch {
-            log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
+            log.info("  [cancel] keepalive write failed (client disconnected) - cancelling slot\n", .{});
             slot_handle.?.cancel();
             client_gone = true;
             break;
@@ -11432,7 +11453,7 @@ test "handleMessagesEmbedding: a Gemma 4 LM answers the three messages 400s, in 
     });
 }
 
-test "content-array text parts JOIN in order — plan-mode's [prompt, reminder] shape (issue #195)" {
+test "content-array text parts JOIN in order - plan-mode's [prompt, reminder] shape (issue #195)" {
     // opencode plan mode appends its system-reminder as a SECOND text part on
     // the user message. Last-wins parsing kept only the reminder, so the model
     // saw no user prompt at all.
@@ -12586,7 +12607,7 @@ test "prefillMemoryNeeded: quantized KV is billed at its real width, not fp16" {
         prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 16, 512, 100_000, 0, 0, .{}));
 }
 
-test "prefillMemoryNeeded: working set is chunk-bounded — the 255K MoE prompt is admittable" {
+test "prefillMemoryNeeded: working set is chunk-bounded - the 255K MoE prompt is admittable" {
     const t = std.testing;
     transformer_mod.fused256_override = false;
     defer transformer_mod.fused256_override = null;
@@ -13426,7 +13447,7 @@ test "formatCompletionsLogprobs: legacy shape, byte-aligned offsets, escaped tok
     try std.testing.expect(top0.get("a\x01\"b") != null);
 }
 
-test "logprobs token strings are valid UTF-8 — a split multi-byte token can't break the body" {
+test "logprobs token strings are valid UTF-8 - a split multi-byte token can't break the body" {
     // A single token is a BPE fragment, so it can carry HALF a multi-byte
     // character; `jsonEscape` passes every byte >= 0x20 through verbatim, so
     // those raw bytes landed in the JSON string and the WHOLE response body
@@ -13793,7 +13814,7 @@ test "memoryRefusalMessage: the 400 quotes the hot-cache credits the guard compa
     const cold = try memoryRefusalMessage(t.allocator, 12_000, 4096, 2048, .{ .needed = 30 * MB, .available = 20 * MB });
     defer t.allocator.free(cold);
     try t.expectEqualStrings(
-        "Prompt (12000 tokens) requires ~4096MB GPU memory but only ~2048MB is available and the hot prefix cache holds ~0MB more, all of which can be reclaimed (~0MB — the shortfall is elsewhere), which is not enough. Reduce prompt size, lower --ctx-size, or use a smaller model.",
+        "Prompt (12000 tokens) requires ~4096MB GPU memory but only ~2048MB is available and the hot prefix cache holds ~0MB more, all of which can be reclaimed (~0MB - the shortfall is elsewhere), which is not enough. Reduce prompt size, lower --ctx-size, or use a smaller model.",
         cold,
     );
 }
@@ -13943,7 +13964,7 @@ test "Conn names the client from each request's User-Agent and keeps no header t
     try std.testing.expectEqual(instr.Client.other, conn.client);
 }
 
-test "outcome row 7/9: countRejected moves the rejected counter, and does nothing with metrics off" {
+test "outcome cases 7 and 9: countRejected moves the rejected counter, and does nothing with metrics off" {
     const t = std.testing;
     const saved = g_metrics;
     defer g_metrics = saved;

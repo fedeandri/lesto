@@ -1897,7 +1897,7 @@ test "planEvictions: an idle victim's prefix cache counts as freed live memory (
     try testing.expectEqualStrings("a", buf[0].id);
 }
 
-test "planEvictions: multi-victim — evicts as many as needed to fit" {
+test "planEvictions: multi-victim - evicts as many as needed to fit" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var reg = try ModelRegistry.init(testing.allocator, io, null, 10, 100, null);
     defer reg.deinit();

@@ -22,7 +22,7 @@ medium or another platform is gone.
   guest.
 - **Speculative decoding by multi-token prediction** (`--mtp*`), the SSM and hybrid cache plumbing, and the pooling
   modes other than mean (`cls` and `last_token` are refused at load).
-- **Interfaces around the engine.** Only `serve`, `--help` and `--version` remain; `pull`, `list`, `run`, `launch`,
+- **Interfaces around the engine.** Only `serve`, `tune`, `--help` and `--version` remain; `pull`, `list`, `run`, `launch`,
   `worker` and `dist-probe` are gone with LAN sharing, distributed inference, the provider layer, the Ollama routes,
   `/v1/messages`, `/v1/responses`, `/v1/completions`, `/v1/decisions`, `/v1/systemone`, `/v1/load-model`,
   `/v1/unload-model` and the built-in web page. An unknown path answers 404.
@@ -80,12 +80,23 @@ The speed techniques, each described by what it does. Each has a switch that res
   fits single-user serving; batched decode and speculative verify share it. Cached prompt states keep the k they were
   computed with: a later turn that reuses an earlier reply from the prefix cache does not recompute it at k1. Unset, the
   config's experts per token throughout.
+- **A 2-bit head shortlist, on request.** `MLX_SERVE_HEAD_SHORTLIST=1` builds, at load, a 2-bit copy of the Latin-script head rows and
+  uses it at each decode step to pick the 64 likeliest tokens, which the 4-bit head then rescores; the greedy token comes from
+  that rescore. It reads about 0.085 GB less per step and holds about 0.15 GB more memory. Replies can change where the true
+  argmax falls outside the 64, so it is off unless set. `MLX_SERVE_HEAD_SHORTLIST_CHECK=1` serves the head's own scores and logs how
+  often the shortlist would have agreed.
 - **macOS 14 compiler fix.** The runtime-compiled Metal kernels unpack with `as_type` instead of a pointer pun that
   the macOS 14 compiler backend crashes on.
+- **Thinking-off answers.** With thinking off and a prompt that ends in Gemma 4's closed empty thought, the thought-channel
+  opener is masked at sampling, so a reply cannot be filed whole as reasoning with empty content; tool and JSON
+  `response_format` requests keep their own sampling, and `MLX_SERVE_ANSWER_MASK_OFF=1` restores the old behaviour.
+- **Prefill chunks nobody reads.** A prefill chunk whose logits are not read skips the last layer's eval (the chunk
+  boundary still evaluates the quantized cache's scales and biases), and a greedy draw masks in the logits' own dtype,
+  so a bf16 row is not widened before the argmax; `MLX_SERVE_PREFILL_LAST_EVAL_SKIP_OFF=1` and `MLX_SERVE_SUPPRESS_MASK_NATIVE_DTYPE_OFF=1` restore each.
 - **Fixes.** The fp4 MoE decode gate refuses a GELU model (the kernels apply SiLU only); the third `messages` 400 of
   `/v1/embeddings` reads "'messages' is not supported by this model; send the text in 'input'"; a fallback chat
   format writes the tool block after the system turn when both exist; unloading a model frees its compact head; a bad
-  keep list is refused at load and leaves the full head.
+  keep list is refused at load and leaves the full head; the greedy prompt-lookup verify honours the sampling mask.
 - **Build.** The jinja template library is compiled from its sources by `build.zig`, no prebuilt archive is
   committed, and a macOS 14 build (`scripts/build-macos14.sh`) runs the same engine.
 - **Names.** The binary is `lesto`. The responses say `lesto` in `owned_by` and `system_fingerprint`; an empty model id,
@@ -119,3 +130,10 @@ The speed techniques, each described by what it does. Each has a switch that res
 - **The model alias `"mlx-serve"`**, accepted beside `"lesto"` for clients that already send it.
 - **The base in `--version`.** `lesto <VERSION> (base mlx-serve 26.10.3)` credits the project Lesto starts from, and
   comments that describe upstream behaviour stay.
+- **Fused shortlist pick.** The 2-bit head shortlist's top-64 pick is one select over 256-score chunks plus a one-thread-a-chunk merge, the head tail's argmax runs over the 64 rescored scores alone, and the tail uses the request's mask from the first forward; `MLX_SERVE_HEAD_SHORTLIST_SELECT_OFF=1` and `MLX_SERVE_HEAD_SHORTLIST_ARGMAX_OFF=1` restore the argpartition and the kept-row argmax.
+- **Threshold-select pick.** On bf16 scores the shortlist's top-64 pick finds each 4,096-score chunk's exact 64th score with two 256-bin histograms of a 16-bit order key and keeps its 64 in index order, then repeats this on the candidates in one threadgroup and ranks only the final 64; `MLX_SERVE_HEAD_SHORTLIST_THRESHOLD_OFF=1` restores the sorted chunks.
+- **First-token build ahead.** The server path builds the first reply token's one-token forward before the sync on its sample, in place of the step 0 shim; `MLX_SERVE_FIRST_TOKEN_PREBUILD_OFF=1` keeps the shim.
+- **Drafter verify on the top-k schedule.** A speculative round's kept tokens advance the expert-count schedule, so the drafter's verify routes at the count a one-token step would use; with the assistant drafter's window, rollback and bf16 draft-step fixes it is what makes `--drafter` faster than the one-token path.
+- **Drafts submitted before the verify is built.** A drafter round queues its draft forwards with their own `mlx_async_eval` before it builds the verify, so the GPU works through the drafts during the verify's graph build instead of idling; the arithmetic and the replies are unchanged (`MLX_SERVE_DRAFTS_EARLY_SUBMIT_OFF=1` keeps the old single submit).
+- **A shorter drafter head.** `MLX_SERVE_DRAFTER_HEAD_KEEP_LIST=<file.npy>` cuts the assistant drafter's 4-bit tied head to a keep list, a checked subset of the target's Latin list, so each draft reads a fraction of the head; the verify stays the target's. The gain holds only on text like the replies the list was ranked from: on other text the drafter can no longer propose many of the tokens it needs, fewer drafts are accepted, and decode can end slower than with no drafter at all (an 8,192-token list ranked from one deployment's replies made decode about 8% slower on general English at 1k tokens, on an M3 MacBook Air). Leave it unset unless the list was built from your own traffic.
+- **Per-device MoE verify layouts and a lighter request tail.** `MLX_SERVE_MOE_ROWS_LAYOUT=1` launches the drafter verify's gate/up and down expert kernels at layouts searched for the GPU generation (a measured entry for G16, and a down-kernel entry for G15; every other device keeps the previous layouts unless `lesto tune` wrote a local table for it), with the same arithmetic. `MLX_SERVE_DEFERRED_TURN_CLEAR=1` and `MLX_SERVE_DEFERRED_CACHE_COMMIT=1` take the end-of-turn cache clear and the prefix-cache commit out of the reply's wait. Together, about 2% faster decode on an M4 Pro with byte-identical replies.

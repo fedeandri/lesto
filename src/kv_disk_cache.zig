@@ -368,7 +368,7 @@ pub const DiskTier = struct {
             .counter = 0,
         };
         self.scan() catch |err| {
-            log.warn("[disk-cache] scan failed: {s} — starting empty\n", .{@errorName(err)});
+            log.warn("[disk-cache] scan failed: {s} - starting empty\n", .{@errorName(err)});
         };
         self.gcToBudget();
         self.base_dir = allocator.dupe(u8, base_dir) catch null;
@@ -389,7 +389,7 @@ pub const DiskTier = struct {
         w.* = disk_writer.Writer.init(self.allocator, self.io);
         w.start() catch {
             self.allocator.destroy(w);
-            log.warn("[disk-cache] background writer unavailable — writing synchronously\n", .{});
+            log.warn("[disk-cache] background writer unavailable - writing synchronously\n", .{});
             return;
         };
         self.writer = w;
@@ -510,7 +510,7 @@ pub const DiskTier = struct {
         _ = self;
         e.poisoned = true;
         @memset(e.chunk_bytes, 0);
-        log.warn("  [disk-cache] e{d} unusable ({s}) — entry invalidated\n", .{ e.id, err_name });
+        log.warn("  [disk-cache] e{d} unusable ({s}) - entry invalidated\n", .{ e.id, err_name });
     }
 
     fn poisonAll(self: *DiskTier, err_name: []const u8) usize {
@@ -614,7 +614,7 @@ pub const DiskTier = struct {
         } else if (!self.store_declined) {
             self.store_declined = true;
             // The number compared is free less the reserve, not free.
-            log.warn("[disk-cache] {s}: {d} MB free less the {d} MB reserve (min 64 GiB, 10% of the volume) is below the {d} MB store floor — no NEW entries persist (already-persisted entries stay restorable)\n", .{
+            log.warn("[disk-cache] {s}: {d} MB free less the {d} MB reserve (min 64 GiB, 10% of the volume) is below the {d} MB store floor - no NEW entries persist (already-persisted entries stay restorable)\n", .{
                 self.root,
                 vs.free >> 20,
                 @min(DISK_RESERVE_CAP, vs.total / 10) >> 20,
@@ -1060,7 +1060,7 @@ pub const DiskTier = struct {
             var root_dir = std.Io.Dir.openDirAbsolute(self.io, self.root, .{}) catch null;
             defer if (root_dir) |*rd| rd.close(self.io);
             if (root_dir) |rd| self.unlinkChunkRange(rd, id, keep, inherited);
-            log.warn("  [disk-cache] chunk share: e{d} would rewrite an inherited chunk (keep {d} < inherited {d}) — writing from {d} instead\n", .{ id, keep, inherited, keep });
+            log.warn("  [disk-cache] chunk share: e{d} would rewrite an inherited chunk (keep {d} < inherited {d}) - writing from {d} instead\n", .{ id, keep, inherited, keep });
             inherited = keep;
             if (chunk_sizes.items.len > keep) chunk_sizes.shrinkRetainingCapacity(keep);
         }
@@ -1094,7 +1094,7 @@ pub const DiskTier = struct {
         // tier's supersede rule). Best-effort DRAFT-side state: a failed
         // write costs the entry its spec, never the entry.
         const spec_res: SpecSidecarResult = self.writeSpecSidecar(dir_rel, dflash_snap, s) catch |err| blk: {
-            log.warn("  [disk-cache] spec persist failed: {s} — entry keeps no spec\n", .{@errorName(err)});
+            log.warn("  [disk-cache] spec persist failed: {s} - entry keeps no spec\n", .{@errorName(err)});
             break :blk .{};
         };
 
@@ -1251,7 +1251,7 @@ pub const DiskTier = struct {
         const old_non_chunk = nonChunkBytes(e);
         if (specWorkPending(e, dflash_snap)) {
             const spec_res: SpecSidecarResult = self.writeSpecSidecar(dir_rel, dflash_snap, s) catch |err| blk: {
-                log.warn("  [disk-cache] spec persist failed: {s} — entry keeps its old spec\n", .{@errorName(err)});
+                log.warn("  [disk-cache] spec persist failed: {s} - entry keeps its old spec\n", .{@errorName(err)});
                 break :blk .{ .bytes = e.spec_bytes, .dflash = e.spec_dflash };
             };
             e.spec_bytes = spec_res.bytes;
@@ -1773,7 +1773,7 @@ pub const DiskTier = struct {
             const new_sub = try std.fmt.allocPrint(self.allocator, "e{d}/c{d:0>6}.safetensors", .{ id, i });
             defer self.allocator.free(new_sub);
             std.Io.Dir.hardLink(root_dir, old_sub, root_dir, new_sub, self.io, .{}) catch |err| {
-                log.warn("  [disk-cache] chunk share: link e{d}/c{d} -> e{d} failed: {s} — writing the chunks instead\n", .{ d.id, i, id, @errorName(err) });
+                log.warn("  [disk-cache] chunk share: link e{d}/c{d} -> e{d} failed: {s} - writing the chunks instead\n", .{ d.id, i, id, @errorName(err) });
                 return error.ChunkShareLinkFailed;
             };
             linked += 1;
@@ -2068,7 +2068,7 @@ pub const DiskTier = struct {
         }
         if (valid_chunks < n_chunks) {
             const salvaged = valid_chunks * chunk_tokens;
-            log.info("  [disk-cache] e{d}: chunk {d} invalid — salvaging {d}/{d} tokens\n", .{ id, valid_chunks, salvaged, kv_len });
+            log.info("  [disk-cache] e{d}: chunk {d} invalid - salvaging {d}/{d} tokens\n", .{ id, valid_chunks, salvaged, kv_len });
             kv_len = salvaged;
             if (kv_len < MIN_PERSIST_TOKENS) return null;
         }
@@ -2128,7 +2128,7 @@ pub const DiskTier = struct {
             defer self.allocator.free(sp);
             const have = fileSize(self.io, sp) orelse break :parse_spec;
             if (have != rec_bytes) {
-                log.info("  [disk-cache] e{d}: spec sidecar size mismatch — dropping the spec\n", .{id});
+                log.info("  [disk-cache] e{d}: spec sidecar size mismatch - dropping the spec\n", .{id});
                 break :parse_spec;
             }
             spec_dflash = parseSpecMeta(so, "dflash");
@@ -2165,7 +2165,7 @@ pub const DiskTier = struct {
             media_ok = true;
         }
         if ((obj.contains("media") or version == 9) and !media_ok) {
-            log.info("  [disk-cache] e{d}: media record unreadable — dropping the entry (never restore text-only past an item)\n", .{id});
+            log.info("  [disk-cache] e{d}: media record unreadable - dropping the entry (never restore text-only past an item)\n", .{id});
             self.allocator.free(tokens);
             self.allocator.free(chunk_bytes);
             return null;
@@ -4234,7 +4234,7 @@ test "DiskTier v9: supersede and extend are media-gated; chunk share clamps at d
     var twin_a: [768]u32 = cont_a;
     twin_a[740] = 555_001;
     _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &twin_a, false, &.{span_a}, null, s);
-    // The same tokens under B's pixels: rows 512.. up describe a different
+    // The same tokens under B's pixels: the rows from 512 up describe a different
     // image, so the share clamps to the 4 whole chunks below the span start.
     _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &twin_a, false, &.{span_b}, null, s);
     var inherited_a: ?u32 = null;

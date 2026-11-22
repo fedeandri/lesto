@@ -431,6 +431,11 @@ pub const Slot = struct {
     cancelled: std.atomic.Value(bool),
     /// Inference thread only: the request's outcome has been counted in `Metrics`.
     metrics_recorded: bool = false,
+    /// Inference thread only: `finishSlot` left this slot's hot-cache commit to the cleanup
+    /// drain (`deferredCommitRun`), which runs it before `deinit`.
+    deferred_commit_commit_owed: bool = false,
+    /// This owed commit's number (`Scheduler.deferred_commit_next_seq` at its finish).
+    deferred_commit_seq: u64 = 0,
     /// Inference-thread passes (a prefill, a decode tick) holding this slot, taken
     /// under `queue_mu`. `complete` waits it out: the handler owns sampling state
     /// the pass reads (`think_bound`, `constraint`) and frees it once `complete` returns.
@@ -1018,6 +1023,14 @@ pub const Scheduler = struct {
     /// Set on unload: the OS hands freed pages back lazily, so the budget revise repeats
     /// before each prefill batch while this is armed and settles as the ceiling recovers.
     budget_revise_sw: ?io_util.Stopwatch = null,
+    /// Inference thread only: the end-of-turn clear a `finishSlot` owes, run by
+    /// `deferredClearService` once no pass holds a slot.
+    deferred_clear_clear: OwedClear = .{},
+    /// Inference thread only: finished slots whose commit the cleanup drain still owes and an
+    /// admission still waits for; each owed slot's number (`Slot.deferred_commit_seq`) and the last one a given-up wait waived.
+    deferred_commit_owed: usize = 0,
+    deferred_commit_next_seq: u64 = 0,
+    deferred_commit_waived_upto: u64 = 0,
     promise_ledger: PromiseLedger = .{},
     /// Inference thread only. Greater than 0 while a prefill started at a chunk boundary runs: it may
     /// tick decoders at its own boundaries but never admits.
@@ -1147,7 +1160,14 @@ pub const Scheduler = struct {
             break :blk std.mem.eql(u8, slice, "1");
         };
         if (force_batched) {
-            log.info("[scheduler] force_batched=on (MLX_SERVE_FORCE_BATCHED=1) — single-slot ticks will route through batched kernel\n", .{});
+            log.info("[scheduler] force_batched=on (MLX_SERVE_FORCE_BATCHED=1) - single-slot ticks will route through batched kernel\n", .{});
+        }
+        // Each switch resolved once, here, before the inference thread reads it.
+        {
+            const kd = deferredClearEnabled();
+            const kv = prefix_cache_mod.budgetTrimNoCopyEnabled();
+            const km = deferredCommitEnabled();
+            if (kd or kv or km) log.info("[turn-tail-switches] switches kd={d} kv={d} km={d}\n", .{ @intFromBool(kd), @intFromBool(kv), @intFromBool(km) });
         }
         self.* = .{
             .allocator = allocator,
@@ -3136,7 +3156,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         if (params.config.isMoe()) {
             log.warn(
                 "Drafter loaded but target is MoE ({s}); per-request " ++
-                    "enable_drafter defaults to OFF — drafter+MoE regresses " ++
+                    "enable_drafter defaults to OFF - drafter+MoE regresses " ++
                     "at single-stream batch=1 (verify forward expert-routing " ++
                     "penalty). Pass enable_drafter:true per request to opt-in.\n",
                 .{params.config.model_type},
@@ -3307,6 +3327,64 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             const ms_nolm = @as(f64, @floatFromInt(sw_nolm.read())) / 1.0e6 / @as(f64, @floatFromInt(@max(done_nolm, 1)));
             ctx.skip_lm_head = false;
             log.info("[fwd-ubench] without lm_head: {d:.3} ms/forward  => lm_head = {d:.3} ms\n", .{ ms_nolm, ms - ms_nolm });
+            // MLX_SERVE_DRAFT_UBENCH=<block>, with a drafter loaded): time the drafter's chained
+            // draft steps at this context as `nextDrafter` runs them (each step's lazy argmax feeds the next, one eval a
+            // block), from a zero target hidden. Reports ms a draft and which arms the drafter holds.
+            if (drafter_ptr) |dp| draft_ub: {
+                const draw = std.c.getenv("MLX_SERVE_DRAFT_UBENCH") orelse break :draft_ub;
+                const blk_n: usize = @max(1, std.fmt.parseInt(usize, std.mem.sliceTo(draw, 0), 10) catch 5);
+                var hid = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(hid);
+                const hsh = [_]c_int{ 1, 1, @intCast(dp.config.backbone_hidden_size) };
+                try mlx.check(mlx.mlx_zeros(&hid, &hsh, 3, .bfloat16, mlx.gpuStream()));
+                const rope_off: c_int = @intCast(if (ctx.cache.step > 0) ctx.cache.step - 1 else 0);
+                const t0: i32 = 1;
+                const t0sh = [_]c_int{1};
+                const t0_arr = mlx.mlx_array_new_data(&t0, &t0sh, 1, .int32);
+                defer _ = mlx.mlx_array_free(t0_arr);
+                var drafted: usize = 0;
+                var sw_d = io_u.Stopwatch.init(tio);
+                for (0..3 + n) |round| {
+                    if (round == 3) sw_d = io_u.Stopwatch.init(tio);
+                    var prev: mlx.mlx_array = t0_arr;
+                    var prev_owned = false;
+                    var h_owner: ?mlx.mlx_array = null;
+                    var ok = true;
+                    for (0..blk_n) |_| {
+                        const out = drafter_mod.stepArr(dp, xfm_ptr, ctx.cache, prev, h_owner orelse hid, rope_off) catch {
+                            ok = false;
+                            break;
+                        };
+                        var am = mlx.mlx_array_new();
+                        _ = mlx.mlx_argmax_axis(&am, out.logits, 2, false, mlx.gpuStream());
+                        _ = mlx.mlx_array_free(out.logits);
+                        if (prev_owned) _ = mlx.mlx_array_free(prev);
+                        prev = am;
+                        prev_owned = true;
+                        if (h_owner) |h| _ = mlx.mlx_array_free(h);
+                        h_owner = out.h_prev_next;
+                    }
+                    if (prev_owned) {
+                        // A failed eval is a failed round: it stops the bench rather than counting as drafted (Codex).
+                        if (mlx.mlx_array_eval(prev) != 0) ok = false;
+                        _ = mlx.mlx_array_free(prev);
+                    }
+                    if (h_owner) |h| _ = mlx.mlx_array_free(h);
+                    if (!ok) break;
+                    if (round >= 3) drafted += blk_n;
+                }
+                const timed_ns = sw_d.read();
+                log.info("[draft-ubench] block={d} {d} drafts: {d:.3} ms a draft (4bit layers={} head={}, bf16 scalars={}, context {d})\n", .{
+                    blk_n,
+                    drafted,
+                    @as(f64, @floatFromInt(timed_ns)) / 1.0e6 / @as(f64, @floatFromInt(@max(drafted, 1))),
+                    dp.pre_q4 != null,
+                    dp.head_q4 != null,
+                    drafter_mod.drafterBf16ScalarsOn(),
+                    ctx.cache.step,
+                });
+                if (std.c.getenv("MLX_SERVE_DRAFT_UBENCH_PARTS") != null) drafter_mod.draftPartsUbenchParts(dp) catch |err| log.warn("[draft-parts] failed: {s}\n", .{@errorName(err)});
+            }
             xfm_ptr.diagProjBench(20);
             log.info("[fwd-ubench] done\n", .{});
             xfm_ptr.resetCache() catch {};
@@ -3399,7 +3477,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 entry.path,
                 params.config.cacheLayoutNamespace(),
             ) catch |err| {
-                log.warn("[disk-cache] fingerprint failed: {s} — persistence off for this model\n", .{@errorName(err)});
+                log.warn("[disk-cache] fingerprint failed: {s} - persistence off for this model\n", .{@errorName(err)});
                 break :attach;
             };
             defer sch.allocator.free(fp);
@@ -3413,7 +3491,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 params.prefix_cache_disk_bytes,
                 kv_disk_cache.DEFAULT_CHUNK_TOKENS,
             ) catch |err| {
-                log.warn("[disk-cache] init failed: {s} — persistence off for this model\n", .{@errorName(err)});
+                log.warn("[disk-cache] init failed: {s} - persistence off for this model\n", .{@errorName(err)});
                 break :attach;
             };
         }
@@ -3721,6 +3799,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             }
         }
         _ = drainSideQueues(sch);
+        deferredClearService(sch);
         if (load_req) |req| runLoadRequest(sch, req);
         if (unload_req) |req| runUnloadRequest(sch, req);
         if (load_req != null or unload_req != null) reviseHotCacheBudgets(sch, load_req == null);
@@ -3775,6 +3854,9 @@ fn drainSideQueues(sch: *Scheduler) bool {
             if (s.model.prefix_cache) |*hc| {
                 if (s.model.transformer) |xf| hc.flushPendingDisk(xf.s);
             }
+        } else if (s.deferred_commit_commit_owed) {
+            // The finish committed nothing; its commit runs here, before `deinit`.
+            deferredCommitRun(sch, s);
         }
         recordSlotCleanup(sch.metrics, s);
         // Second slot-end path (a decode-phase cancel never reaches finishSlot); the
@@ -3857,6 +3939,8 @@ fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
     // 1. Wait for work. Drain pending slots into a local list under lock,
     //    run prefills outside the lock.
     var ran = mode == .yield and drainSideQueues(sch);
+    // No slot is held yet in this pass (a `.yield` pass inside a media job reaches here too).
+    deferredClearService(sch);
     var to_prefill: [16]*Slot = undefined;
     var n_prefill: usize = 0;
     {
@@ -3925,6 +4009,11 @@ fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
         sch.prefilling_from = 0;
         sch.n_prefilling = n_prefill;
     }
+
+    // A finished slot's commit waits until its `complete()` queues it for cleanup. Land
+    // every owed commit before this batch's restore lookups, so a follow-up turn finds the entry an
+    // inline commit would have left, even from a client that sends it before the socket closes.
+    if (n_prefill > 0 and deferredCommitEnabled()) deferredCommitLandOwed(sch);
 
     if (sch.budget_revise_sw) |sw| {
         if (sw.read() > BUDGET_REVISE_WINDOW_NS) sch.budget_revise_sw = null;
@@ -4323,7 +4412,7 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     @memcpy(total_tokens[slot.full_prompt.len..], gen_ptr.generated_ids.items[0 .. total_len - slot.full_prompt.len]);
 
     // Plain DFlash rounds park their captures; they join the context before it is paired with the prefix.
-    gen_ptr.dflashSettle(slot.allocator, total_len) catch |err| log.warn("[hot-cache] dflash context settle failed: {s} — not committed\n", .{@errorName(err)});
+    gen_ptr.dflashSettle(slot.allocator, total_len) catch |err| log.warn("[hot-cache] dflash context settle failed: {s} - not committed\n", .{@errorName(err)});
     // A runtime fallback leaves the dormant assistant context at its last
     // speculative boundary while serial decode continues growing the trunk.
     // Only pair the assistant payload with this prefix when both end at the
@@ -4368,7 +4457,7 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
     // `cancelled_forwarded` is the authoritative length: `cache.step` only advances when
     // Generator init completes, so it reads 0 on every aborted prefill.
     const len = cancelledPrefillCommitLen(slot.cancelled_forwarded, slot.full_prompt.len) orelse {
-        log.debug("[hot-cache] cancelled prefill forwarded < {d} tokens — below the commit floor; not committed\n", .{prefix_cache_mod.MIN_CANCELLED_COMMIT_TOKENS});
+        log.debug("[hot-cache] cancelled prefill forwarded < {d} tokens - below the commit floor; not committed\n", .{prefix_cache_mod.MIN_CANCELLED_COMMIT_TOKENS});
         return;
     };
     const st = hc.commitWithMediaState(&slot.cache, slot.full_prompt[0..len], slot.has_tools, slot.media, slot.cache_key, null) catch |err| {
@@ -4585,13 +4674,28 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     }
     const latched: ?[]const u8 = mlx.peekErrorName();
     if (latched) |name| {
-        log.err("[scheduler] finish suppressed: the last forward failed ({s}) but produced a \"{s}\" — failing this request rather than answering 200 with what Metal never wrote\n", .{ name, reason });
+        log.err("[scheduler] finish suppressed: the last forward failed ({s}) but produced a \"{s}\" - failing this request rather than answering 200 with what Metal never wrote\n", .{ name, reason });
     }
     if (slot.completion_tokens <= 2) logShortGen(slot, reason);
-    commitSlotIfApplicable(sch, slot);
-    // Restore by move: a slot that ended without committing still holds its checkout, and
-    // the record now describes bytes that die with `slot.cache`. Above every early return.
-    if (slot.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(slot), reason);
+    // The commit (and with it a budget trim's copy) and everything after it that
+    // reads what it committed (the checkout release, the disk flush and spill) move to the cleanup
+    // drain, in the same order, after `complete()` has queued the slot: its KV is alive until
+    // `deinit`, and the client's EOF no longer waits on the copy. A latched failure keeps the
+    // inline path (its commit declines there).
+    const commit_deferred = deferredCommitEnabled() and latched == null;
+    if (commit_deferred) {
+        if (!slot.deferred_commit_commit_owed) {
+            sch.deferred_commit_next_seq += 1;
+            slot.deferred_commit_seq = sch.deferred_commit_next_seq;
+            sch.deferred_commit_owed += 1;
+        }
+        slot.deferred_commit_commit_owed = true;
+    } else {
+        commitSlotIfApplicable(sch, slot);
+        // Restore by move: a slot that ended without committing still holds its checkout, and
+        // the record now describes bytes that die with `slot.cache`. Above every early return.
+        if (slot.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(slot), reason);
+    }
     // SSD flush runs AFTER markFinished so the client never waits on the
     // chunk-append — but everything it needs must be captured BEFORE the
     // broadcast: the conn thread may complete()+free the slot immediately.
@@ -4609,21 +4713,130 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // e2e = first_token_ns + decode_ns.
     recordSlotEnd(sch.metrics, slot, finishOutcome(reason, latched));
     publishSlotTerminator(slot, reason, latched);
-    if (hc_opt) |hc| {
-        if (stream_opt) |s| {
-            hc.flushPendingDisk(s);
-            // After the flush, so this turn's entry is the MRU one and any entry spilled
-            // already has a complete copy to spill into.
-            hc.spillIdleEntries(s);
-            publishHotCacheResidency(sch);
+    if (!commit_deferred) {
+        if (hc_opt) |hc| {
+            if (stream_opt) |s| {
+                hc.flushPendingDisk(s);
+                // After the flush, so this turn's entry is the MRU one and any entry spilled
+                // already has a complete copy to spill into.
+                hc.spillIdleEntries(s);
+                publishHotCacheResidency(sch);
+            }
         }
     }
     // Return this turn's transients to the OS. The per-`CACHE_CLEAR_INTERVAL`
     // clear inside `Generator.advanceStep` can't cover the tail of a turn, and
-    // MLX parks freed buffers in a size-keyed pool rather than releasing them —
+    // MLX parks freed buffers in a size-keyed pool rather than releasing them -
     // so without this a short turn hands everything it stranded to the next one
     // and the process footprint ratchets across a session (issue #110).
+    // Owed instead, and run by `deferredClearService` once this pass has
+    // dropped its slots, so `complete()`'s wait for the pass (and the client's EOF) no
+    // longer includes it. Still one clear per turn.
+    if (deferredClearEnabled()) sch.deferred_clear_clear.owe() else _ = mlx.mlx_clear_cache();
+}
+
+/// An owed end-of-turn clear. Several finishes before the next service run one clear.
+const OwedClear = struct {
+    owed: bool = false,
+    fn owe(self: *OwedClear) void {
+        self.owed = true;
+    }
+    /// True once per owed clear: the caller runs it.
+    fn take(self: *OwedClear) bool {
+        const was = self.owed;
+        self.owed = false;
+        return was;
+    }
+};
+
+/// Run the end-of-turn clear a `finishSlot` owes. Called on the inference thread only
+/// where no pass holds a slot's `in_pass` (the top of each loop iteration and of each `chatPass`), so a
+/// conn thread's `complete()` never waits on it.
+fn deferredClearService(sch: *Scheduler) void {
+    if (!sch.deferred_clear_clear.take()) return;
     _ = mlx.mlx_clear_cache();
+    if (!deferred_clear_logged) {
+        deferred_clear_logged = true;
+        log.info("[deferred-clear] the first owed end-of-turn clear ran outside every pass\n", .{});
+    }
+}
+
+/// The deferred clear and the deferred commit: each path logs once a process, its first time (the smoke's proof that it ran).
+var deferred_clear_logged = false;
+var deferred_commit_logged = false;
+
+/// The commit `finishSlot` left to the cleanup drain, in `finishSlot`'s own order:
+/// commit, checkout release, disk flush, spill, residency. The slot is out of every list and its conn
+/// thread is done with it (`complete()` queued it), so the KV it commits is alive and read by no one
+/// else; a budget trim's copy runs after the client's EOF.
+fn deferredCommitRun(sch: *Scheduler, s: *Slot) void {
+    s.deferred_commit_commit_owed = false;
+    // Counted only while an admission still waits for it (a slot past a given-up wait is not).
+    if (s.deferred_commit_seq > sch.deferred_commit_waived_upto) sch.deferred_commit_owed -|= 1;
+    if (!deferred_commit_logged) {
+        deferred_commit_logged = true;
+        log.info("[deferred-commit] the first deferred commit ran in the cleanup drain\n", .{});
+    }
+    commitSlotIfApplicable(sch, s);
+    const hc = if (s.model.prefix_cache) |*p| p else return;
+    hc.releaseCheckout(@intFromPtr(s), s.finish_reason);
+    if (s.model.transformer) |x| {
+        hc.flushPendingDisk(x.s);
+        hc.spillIdleEntries(x.s);
+        publishHotCacheResidency(sch);
+    }
+}
+
+/// The longest an admission waits for an owed commit's slot to reach the cleanup queue.
+/// Its conn thread is past the terminator and only returning; past this the batch admits without it
+/// (a restore miss, logged), so a stuck socket cannot hold admission.
+const DEFERRED_COMMIT_LAND_WAIT_MS: u32 = 200;
+
+/// Drain the cleanup queue until no finished slot owes its commit, waiting in 1 ms steps
+/// (as `complete()` waits on `in_pass`) for a slot whose conn thread has not queued it yet. Inference
+/// thread, outside every pass that could hold an owed slot (a finished slot is in no list).
+fn deferredCommitLandOwed(sch: *Scheduler) void {
+    var waited_ms: u32 = 0;
+    while (true) {
+        _ = drainSideQueues(sch);
+        if (sch.deferred_commit_owed == 0) return;
+        if (waited_ms >= DEFERRED_COMMIT_LAND_WAIT_MS) {
+            // A fixed line, so a job's whole-line check can refuse it.
+            log.warn("[deferred-commit] an admission gave up waiting for an owed commit\n", .{});
+            // Every slot owed now is waived, never waited for again: one that never reaches the drain
+            // (`complete()`'s OOM fallback frees it inline) must not stall every later admission. A slot
+            // that finishes after this is counted and waited for as before.
+            sch.deferred_commit_waived_upto = sch.deferred_commit_next_seq;
+            sch.deferred_commit_owed = 0;
+            return;
+        }
+        std.Io.sleep(sch.io, .fromMilliseconds(1), .real) catch {};
+        waited_ms += 1;
+    }
+}
+
+var deferred_clear_env: ?bool = null;
+var deferred_commit_env: ?bool = null;
+
+fn envIsOne(name: [*:0]const u8) bool {
+    const raw = std.c.getenv(name) orelse return false;
+    return std.mem.eql(u8, std.mem.sliceTo(raw, 0), "1");
+}
+
+/// `MLX_SERVE_DEFERRED_TURN_CLEAR=1` moves the end-of-turn clear off `complete()`'s wait. Off: inline, as before.
+pub fn deferredClearEnabled() bool {
+    if (deferred_clear_env) |v| return v;
+    const v = envIsOne("MLX_SERVE_DEFERRED_TURN_CLEAR");
+    deferred_clear_env = v;
+    return v;
+}
+
+/// `MLX_SERVE_DEFERRED_CACHE_COMMIT=1` moves a finished slot's hot-cache commit to the cleanup drain. Off: inline, as before.
+pub fn deferredCommitEnabled() bool {
+    if (deferred_commit_env) |v| return v;
+    const v = envIsOne("MLX_SERVE_DEFERRED_CACHE_COMMIT");
+    deferred_commit_env = v;
+    return v;
 }
 
 /// Scale the measured M5/block-16 break-even to the effective number of
@@ -5066,7 +5279,7 @@ fn writeThroughArmed(slot: *Slot, new_span: usize) bool {
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return false;
     if (!writeThroughEnabled()) {
         if (hc.ssd_first and !write_through_off_logged.swap(true, .monotonic)) {
-            log.info("  [disk-cache] prefill write-through disabled by MLX_SERVE_SSD_WRITE_THROUGH=0 — the end-of-request commit persists every turn\n", .{});
+            log.info("  [disk-cache] prefill write-through disabled by MLX_SERVE_SSD_WRITE_THROUGH=0 - the end-of-request commit persists every turn\n", .{});
         }
         return false;
     }
@@ -5076,7 +5289,7 @@ fn writeThroughArmed(slot: *Slot, new_span: usize) bool {
     if (!writer_up) return false;
     if (!writeThroughSpanReached(new_span, d.chunk_tokens)) {
         if (!write_through_span_declined_logged.swap(true, .monotonic)) {
-            log.info("  [disk-cache] prefill write-through declined: {d} new tokens is under one chunk ({d}) — the end-of-request commit persists this turn\n", .{ new_span, d.chunk_tokens });
+            log.info("  [disk-cache] prefill write-through declined: {d} new tokens is under one chunk ({d}) - the end-of-request commit persists this turn\n", .{ new_span, d.chunk_tokens });
         }
         return false;
     }
@@ -5304,7 +5517,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 @intFromPtr(slot),
                 slot.skip_prefix_cache,
             ) catch |err| blk: {
-                log.warn("[hot-cache] lookup failed: {s} — proceeding with cold prefill\n", .{@errorName(err)});
+                log.warn("[hot-cache] lookup failed: {s} - proceeding with cold prefill\n", .{@errorName(err)});
                 break :blk prefix_cache_mod.LookupResult{ .matched = 0, .full_match = false };
             };
             if (lookup.matched > 0 and lookup.matched <= slot.full_prompt.len) {
@@ -5431,7 +5644,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         if (decision.widened) {
             log.info("[prefill] re-ask: width {d} -> {d} after the eviction pass returned {d} MB\n", .{ admitted_prefill_chunk, decision.width, evicted_live_bytes >> 20 });
         } else if (decision.moved) {
-            log.warn("[prefill] re-ask: width {d} is NARROWER than the admitted {d} after the eviction pass returned {d} MB — memory moved between the two reads; the re-ask is the live reading, so it runs\n", .{ decision.width, admitted_prefill_chunk, evicted_live_bytes >> 20 });
+            log.warn("[prefill] re-ask: width {d} is NARROWER than the admitted {d} after the eviction pass returned {d} MB - memory moved between the two reads; the re-ask is the live reading, so it runs\n", .{ decision.width, admitted_prefill_chunk, evicted_live_bytes >> 20 });
         }
         break :blk decision.width;
     } else 0;
@@ -5963,7 +6176,7 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
         else => inner_err = e,
     };
     mlx.checkErrorDecode() catch |mlx_err| {
-        log.err("[scheduler] decode aborted: MLX failure mid-generation ({s}) — failing this request, the server keeps serving\n", .{@errorName(mlx_err)});
+        log.err("[scheduler] decode aborted: MLX failure mid-generation ({s}) - failing this request, the server keeps serving\n", .{@errorName(mlx_err)});
         slot.markError(@errorName(mlx_err));
         return;
     };
@@ -6317,7 +6530,7 @@ fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         inner_err = e;
     };
     mlx.checkErrorDecode() catch |mlx_err| {
-        log.err("[scheduler] batched decode aborted: MLX failure ({s}) — failing all {d} slots in the group\n", .{ @errorName(mlx_err), active.len });
+        log.err("[scheduler] batched decode aborted: MLX failure ({s}) - failing all {d} slots in the group\n", .{ @errorName(mlx_err), active.len });
         for (active) |s| s.markError(@errorName(mlx_err));
         return;
     };
@@ -6356,6 +6569,7 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
             slot.markError("no_generator");
             continue;
         };
+        gen.dropPrebuilt(); // a slot joining a batch takes the unseeded path, as the shim leaves it
         if (gen.has_pending_logits or gen.has_pending_token) {
             const emitted = gen.drainPipelineForBatch(slot.allocator) catch |err| {
                 slot.markError(@errorName(err));
@@ -6802,7 +7016,7 @@ fn expectOutcomes(m: *const metrics_mod.Metrics, success: u64, cancelled: u64, f
     try testing.expectEqual(rejected, m.requests_rejected_total.load());
 }
 
-test "outcome row 1: a disconnect while the request waits in pending counts cancelled once" {
+test "outcome case 1: a disconnect while the request waits in pending counts cancelled once" {
     var m = metrics_mod.Metrics.init();
     var s = OutcomeStub{};
     s.complete();
@@ -6810,7 +7024,7 @@ test "outcome row 1: a disconnect while the request waits in pending counts canc
     try expectOutcomes(&m, 0, 1, 0, 0);
 }
 
-test "outcome row 2: a disconnect during prefill is counted once, not again by the drain" {
+test "outcome case 2: a disconnect during prefill is counted once, not again by the drain" {
     var m = metrics_mod.Metrics.init();
     var s = OutcomeStub{};
     s.complete();
@@ -6819,7 +7033,7 @@ test "outcome row 2: a disconnect during prefill is counted once, not again by t
     try expectOutcomes(&m, 0, 1, 0, 0);
 }
 
-test "outcome row 3: a disconnect during decode never reaches finishSlot and the drain counts it" {
+test "outcome case 3: a disconnect during decode never reaches finishSlot and the drain counts it" {
     var m = metrics_mod.Metrics.init();
     var s = OutcomeStub{};
     s.completion_tokens = 7;
@@ -6831,7 +7045,7 @@ test "outcome row 3: a disconnect during decode never reaches finishSlot and the
     try testing.expectEqual(@as(u64, 0), m.generation_tokens_total.load());
 }
 
-test "outcome row 4: a normal completion is success once even though complete() sets cancelled" {
+test "outcome case 4: a normal completion is success once even though complete() sets cancelled" {
     var m = metrics_mod.Metrics.init();
     for ([_][]const u8{ "stop", "length" }) |reason| {
         var s = OutcomeStub{};
@@ -6843,7 +7057,7 @@ test "outcome row 4: a normal completion is success once even though complete() 
     try testing.expectEqual(@as(u64, 20), m.generation_tokens_total.load());
 }
 
-test "outcome row 5: a mid-decode generation error counts failed and leaves the histograms alone" {
+test "outcome case 5: a mid-decode generation error counts failed and leaves the histograms alone" {
     var m = metrics_mod.Metrics.init();
     var s = OutcomeStub{};
     s.fail("MlxFailure");
@@ -6855,13 +7069,13 @@ test "outcome row 5: a mid-decode generation error counts failed and leaves the 
     try testing.expectEqual(@as(u64, 0), m.generation_tokens_total.load());
 }
 
-test "outcome row 5b: a finish over a latched MLX failure counts failed, not success" {
+test "outcome case 5b: a finish over a latched MLX failure counts failed, not success" {
     try testing.expectEqual(metrics_mod.Outcome.failed, finishOutcome("stop", "OutOfMemory"));
     try testing.expectEqual(metrics_mod.Outcome.success, finishOutcome("stop", null));
     try testing.expectEqual(metrics_mod.Outcome.cancelled, finishOutcome("cancelled", null));
 }
 
-test "outcome row 6: an error followed by a client disconnect is one failure, never two outcomes" {
+test "outcome case 6: an error followed by a client disconnect is one failure, never two outcomes" {
     var m = metrics_mod.Metrics.init();
     var s = OutcomeStub{};
     s.fail("MlxFailure");
@@ -6871,7 +7085,7 @@ test "outcome row 6: an error followed by a client disconnect is one failure, ne
     try expectOutcomes(&m, 0, 0, 1, 0);
 }
 
-test "outcome row 7: a slot refused before its first forward is a rejection, not a failure" {
+test "outcome case 7: a slot refused before its first forward is a rejection, not a failure" {
     var m = metrics_mod.Metrics.init();
     var s = OutcomeStub{};
     s.fail("PrefillDoesNotFit");
@@ -6880,7 +7094,7 @@ test "outcome row 7: a slot refused before its first forward is a rejection, not
     try expectOutcomes(&m, 0, 0, 0, 1);
 }
 
-test "outcome row 9: metrics off does no work and leaves the slot untouched" {
+test "outcome case 9: metrics off does no work and leaves the slot untouched" {
     var s = OutcomeStub{};
     s.complete();
     recordSlotCleanup(null, &s);
@@ -7466,4 +7680,114 @@ test "a refusal right after a two-model eviction waits for the memory to come ba
     mark.record(1_000, 100 * GiB);
     mark.record(1_100, 17 * GiB);
     try std.testing.expect(waitForUnload(211 * GiB, 108 * GiB, mark, 1_200));
+}
+
+/// For the source-reading tests: the body of the function `name` opens, up to its closing brace at column 0.
+fn sourceFnBody(source: []const u8, comptime name: []const u8) ![]const u8 {
+    const start = std.mem.indexOf(u8, source, "\nfn " ++ name ++ "(") orelse return error.MissingFunction;
+    const end = std.mem.indexOfPos(u8, source, start + 1, "\n}\n") orelse return error.MissingFunctionEnd;
+    return source[start..end];
+}
+
+test "deferred-clear owed clear: several finishes before a service run one clear, and nothing is owed after it" {
+    var c: OwedClear = .{};
+    try testing.expect(!c.take());
+    c.owe();
+    try testing.expect(c.take());
+    try testing.expect(!c.take());
+    // Two slots finishing in one pass owe one clear between them: the pool is emptied once.
+    c.owe();
+    c.owe();
+    try testing.expect(c.take());
+    try testing.expect(!c.take());
+}
+
+test "deferred-clear every finish either clears or owes the clear, and the clear left finishSlot only behind the switch" {
+    const source = @embedFile("scheduler.zig");
+    const body = try sourceFnBody(source, "finishSlot");
+    // No early exit: every finish reaches its last statement, so every turn owes (or runs) its clear.
+    try testing.expect(std.mem.indexOf(u8, body, "return;") == null);
+    try testing.expect(std.mem.indexOf(u8, body, "return ") == null);
+    try testing.expect(std.mem.endsWith(u8, body, "if (deferredClearEnabled()) sch.deferred_clear_clear.owe() else _ = mlx.mlx_clear_cache();"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "mlx.mlx_clear_cache()"));
+    // `complete()` (the conn thread's wait) never clears.
+    const cs = std.mem.indexOf(u8, source, "    pub fn complete(self: *Scheduler, slot: *Slot) void {") orelse return error.MissingComplete;
+    const ce = std.mem.indexOfPos(u8, source, cs, "\n    }\n") orelse return error.MissingCompleteEnd;
+    try testing.expect(std.mem.indexOf(u8, source[cs..ce], "clear") == null);
+}
+
+test "deferred-clear the owed clear runs only where no pass holds a slot, so complete() no longer waits on it" {
+    const source = @embedFile("scheduler.zig");
+    // The loop's top: after the cleanup drain, before the next pass.
+    const loop = try sourceFnBody(source, "inferenceLoop");
+    const svc = std.mem.indexOf(u8, loop, "_ = drainSideQueues(sch);\n        deferredClearService(sch);") orelse return error.MissingLoopService;
+    const pass_call = std.mem.indexOf(u8, loop, "chatPass(sch, .main)") orelse return error.MissingPassCall;
+    try testing.expect(svc < pass_call);
+    try testing.expect(std.mem.indexOf(u8, loop, "in_pass") == null);
+    // A pass's start: before it takes any slot's `in_pass` (prefill admission or the decode list).
+    const pass = try sourceFnBody(source, "chatPass");
+    const pass_svc = std.mem.indexOf(u8, pass, "deferredClearService(sch);") orelse return error.MissingPassService;
+    const first_hold = std.mem.indexOf(u8, pass, "in_pass.fetchAdd") orelse return error.MissingHold;
+    try testing.expect(pass_svc < first_hold);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, pass, "deferredClearService("));
+    // The service itself: one clear per owed turn.
+    const service = try sourceFnBody(source, "deferredClearService");
+    const taken = std.mem.indexOf(u8, service, "if (!sch.deferred_clear_clear.take()) return;") orelse return error.MissingTake;
+    const cleared = std.mem.indexOf(u8, service, "_ = mlx.mlx_clear_cache();") orelse return error.MissingClear;
+    try testing.expect(taken < cleared);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, service, "mlx_clear_cache("));
+}
+
+test "deferred-commit finishSlot defers the commit with its checkout release and disk flush, and keeps the terminator in place" {
+    const source = @embedFile("scheduler.zig");
+    const body = try sourceFnBody(source, "finishSlot");
+    const decide = std.mem.indexOf(u8, body, "const commit_deferred = deferredCommitEnabled() and latched == null;") orelse return error.MissingDecision;
+    const inline_arm = std.mem.indexOfPos(u8, body, decide, "} else {\n        commitSlotIfApplicable(sch, slot);") orelse return error.MissingInlineCommit;
+    const release = std.mem.indexOfPos(u8, body, inline_arm, "hc.releaseCheckout(@intFromPtr(slot), reason);") orelse return error.MissingRelease;
+    const terminator = std.mem.indexOf(u8, body, "publishSlotTerminator(slot, reason, latched);") orelse return error.MissingTerminator;
+    const flush_gate = std.mem.indexOfPos(u8, body, terminator, "if (!commit_deferred) {") orelse return error.MissingFlushGate;
+    const flush = std.mem.indexOfPos(u8, body, flush_gate, "hc.flushPendingDisk(s);") orelse return error.MissingFlush;
+    try testing.expect(decide < inline_arm and inline_arm < release and release < terminator and flush_gate < flush);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "commitSlotIfApplicable("));
+}
+
+test "deferred-commit the cleanup drain runs an owed commit before deinit, in finishSlot's order" {
+    const source = @embedFile("scheduler.zig");
+    const drain = try sourceFnBody(source, "drainSideQueues");
+    const owed = std.mem.indexOf(u8, drain, "} else if (s.deferred_commit_commit_owed) {") orelse return error.MissingOwedArm;
+    const call = std.mem.indexOfPos(u8, drain, owed, "deferredCommitRun(sch, s);") orelse return error.MissingOwedCall;
+    const free = std.mem.indexOfPos(u8, drain, call, "s.deinit();") orelse return error.MissingDeinit;
+    try testing.expect(call < free);
+    const dc = try sourceFnBody(source, "deferredCommitRun");
+    const c = std.mem.indexOf(u8, dc, "commitSlotIfApplicable(sch, s);") orelse return error.MissingCommit;
+    const r = std.mem.indexOf(u8, dc, "hc.releaseCheckout(") orelse return error.MissingRelease;
+    const f = std.mem.indexOf(u8, dc, "hc.flushPendingDisk(") orelse return error.MissingFlush;
+    const sp = std.mem.indexOf(u8, dc, "hc.spillIdleEntries(") orelse return error.MissingSpill;
+    try testing.expect(c < r and r < f and f < sp);
+    try testing.expect(std.mem.indexOf(u8, dc, "sch.deferred_commit_owed -|= 1;").? < c);
+}
+
+test "deferred-commit owed commits land before a batch's restore lookups" {
+    const source = @embedFile("scheduler.zig");
+    const pass = try sourceFnBody(source, "chatPass");
+    const land = std.mem.indexOf(u8, pass, "if (n_prefill > 0 and deferredCommitEnabled()) deferredCommitLandOwed(sch);") orelse return error.MissingLand;
+    const admitted = std.mem.indexOf(u8, pass, "prefillAdmitted(sch, slot)") orelse return error.MissingPrefill;
+    const revise = std.mem.indexOf(u8, pass, "reviseHotCacheBudgets(sch, true)") orelse return error.MissingRevise;
+    try testing.expect(land < revise and land < admitted);
+    const lw = try sourceFnBody(source, "deferredCommitLandOwed");
+    try testing.expect(std.mem.indexOf(u8, lw, "_ = drainSideQueues(sch);").? < std.mem.indexOf(u8, lw, "if (sch.deferred_commit_owed == 0) return;").?);
+    try testing.expect(std.mem.indexOf(u8, lw, "sch.deferred_commit_owed = 0;") != null);
+    // a given-up wait waives exactly the slots owed then: a later finish is counted and waited for, and a waived slot's
+    // drain does not cancel it
+    try testing.expect(std.mem.indexOf(u8, lw, "sch.deferred_commit_waived_upto = sch.deferred_commit_next_seq;") != null);
+    const dc = try sourceFnBody(source, "deferredCommitRun");
+    try testing.expect(std.mem.indexOf(u8, dc,"if (s.deferred_commit_seq > sch.deferred_commit_waived_upto) sch.deferred_commit_owed -|= 1;") != null);
+    const fs = try sourceFnBody(source, "finishSlot");
+    try testing.expect(std.mem.indexOf(u8, fs, "slot.deferred_commit_seq = sch.deferred_commit_next_seq;") != null);
+}
+
+test "deferred-clear and deferred-commit switches read 1 as on and anything else as off" {
+    try testing.expect(!envIsOne("MLX_SERVE_NO_SUCH_SWITCH_TEST"));
+    if (std.c.getenv("MLX_SERVE_DEFERRED_TURN_CLEAR") == null) try testing.expect(!deferredClearEnabled());
+    if (std.c.getenv("MLX_SERVE_DEFERRED_CACHE_COMMIT") == null) try testing.expect(!deferredCommitEnabled());
 }

@@ -255,6 +255,12 @@ MLX_API CommandEncoder& get_command_encoder(Stream s);
 MLX_API void set_commit_on_ops_limit_only(bool on);
 // Lesto's addition. Command buffers committed so far by this process.
 MLX_API uint64_t command_buffers_committed();
+// Lesto's addition (lab row 153w). While on for the calling thread (MLX builds an op's graph node on the thread that calls
+// it), scaled_dot_product_attention at head dim 512 keeps the vector kernel for 2 to 8 queries under its other limits
+// (query length times GQA factor at most 32, GQA factor 8, no array mask, MLX_SDPA_D512_MIN_KL keys); off, it takes one
+// query only, as before.
+MLX_API void set_sdpa_d512_multi_query(bool on);
+MLX_API bool sdpa_d512_multi_query();
 
 std::unordered_map<int, CommandEncoder>& get_command_encoders();
 std::unordered_map<int, CommandEncoder>& get_global_command_encoders();

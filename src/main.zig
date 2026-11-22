@@ -16,6 +16,7 @@ const scheduler_mod = @import("scheduler.zig");
 const status = @import("status.zig");
 const model_settings_mod = @import("model_settings.zig");
 const cli_mod = @import("cli.zig");
+const tune_cli = @import("tune_cli.zig");
 
 // codesign names an executable after its embedded Info.plist; without one it makes up a new name for
 // every build.
@@ -50,6 +51,16 @@ fn printUsage(io: std.Io) void {
         \\Commands:
         \\  serve               Start the server over ~/.mlx-serve/models
         \\                      (every model there loads on demand by name)
+        \\  tune                Find, while this Mac is idle, the fastest MoE kernel
+        \\                      layouts that give bit-identical output on it, and
+        \\                      write them to ~/.mlx-serve/tune/kernel-plans.json
+        \\                      (read at the next serve start)
+        \\    tune --background   Do it as a LaunchAgent instead of in this terminal
+        \\    tune --show         Print the table, the layouts in use and the progress
+        \\    tune --verify       Re-check the table's layouts on this macOS build
+        \\    tune --reset        Delete the table and the progress
+        \\    tune --stop         Remove the LaunchAgent and stop a running tune
+        \\    tune --idle-minutes <n>  Minutes without input first (default: 5)
         \\
         \\Options:
         \\  --model <dir>       Path to MLX model directory
@@ -293,9 +304,9 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // Subcommands: `lesto serve`. `serve` falls
+    // Subcommands: `lesto serve` and `lesto tune`. `serve` falls
     // through into the normal flag parse (skipping the consumed positional)
-    // and the serve path.
+    // and the serve path; `tune` runs src/tune_cli.zig and exits with its code.
     var arg_start: usize = 1;
     var use_default_models_root = false;
     if (args.len >= 2 and args[1].len > 0 and args[1][0] != '-') {
@@ -303,8 +314,10 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, cmd, "serve")) {
             arg_start = 2;
             use_default_models_root = true;
+        } else if (std.mem.eql(u8, cmd, "tune")) {
+            std.process.exit(tune_cli.run(allocator, io, args[2..]));
         } else {
-            log.err("unknown command '{s}' (expected serve)\n", .{cmd});
+            log.err("unknown command '{s}' (expected serve or tune)\n", .{cmd});
             std.process.exit(1);
         }
     }

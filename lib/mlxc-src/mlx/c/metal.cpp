@@ -129,6 +129,16 @@ extern "C" int mlx_lesto_commit_on_ops_limit_only(bool on) {
 #endif
   return 0;
 }
+// Lesto's addition (lab row 153w): head-dim-512 SDPA keeps the vector kernel for 2 to 8 queries while on, for what the
+// calling thread builds.
+extern "C" int mlx_lesto_sdpa_d512_multi_query(bool on) {
+#ifdef MLX_LESTO_WRITTEN_IN_PLACE_METAL
+  mlx::core::metal::set_sdpa_d512_multi_query(on);
+#else
+  (void)on;
+#endif
+  return 0;
+}
 extern "C" uint64_t mlx_lesto_command_buffers_committed(void) {
 #ifdef MLX_LESTO_WRITTEN_IN_PLACE_METAL
   return mlx::core::metal::command_buffers_committed();

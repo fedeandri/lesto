@@ -8,6 +8,7 @@ const rowqmv = @import("rowqmv.zig");
 const lane_qmm = @import("lane_qmm.zig");
 const lane_attn = @import("lane_attn.zig");
 const simd_qmm = @import("simd_qmm.zig");
+const topk_select = @import("topk_select.zig");
 const row_attn = @import("row_attn.zig");
 const modelopt_pack = @import("modelopt_pack.zig");
 const qmv_nax2 = @import("qmv_nax2.zig");
@@ -15,6 +16,8 @@ const gather_qmm_nax = @import("gather_qmm_nax.zig");
 const qmm_int8 = @import("qmm_int8.zig");
 const add_norm = @import("add_norm.zig");
 const kv_quant = @import("kv_quant.zig");
+const os_mutex = @import("os_mutex.zig");
+const kernel_table = @import("kernel_table.zig");
 
 pub const KVQuantConfig = kv_quant.KVQuantConfig;
 pub const KVQuantScheme = kv_quant.Scheme;
@@ -566,6 +569,11 @@ pub const VQMM_BN_CHOICES = [_]c_int{ 2, 4, 8 };
 /// Test seam: the parity test drives every tile without touching the env.
 pub var vqmm_bn_test_override: ?c_int = null;
 var vqmm_bn_override_cache: ?c_int = null;
+
+/// Tests only: `mlx.op_count` right after the dense forward wrote `ctx.capture_hidden`, so a fault sweep
+/// can arm exactly the checked ops that follow the capture (the head projection and the softcap). Written only under
+/// `builtin.is_test`; a served build carries neither the store nor the variable.
+pub var test_capture_mark: u64 = 0;
 fn vqmmBnOverride() c_int {
     if (vqmm_bn_test_override) |v| return v;
     if (vqmm_bn_override_cache) |v| return v;
@@ -763,6 +771,32 @@ test "top-k schedule: a prompt resets the count, the first n reply forwards keep
     }
     try std.testing.expectEqualSlices(u32, &.{ 8, 8, 6, 6, 6 }, &ks);
     try std.testing.expectEqual(@as(u32, 6), Transformer.scheduleK(.{ .k1 = 8, .n = 0, .k2 = 6 }, 0));
+}
+
+test "topk-verify-advance: a drafter reply's verify leaves the first k once its kept tokens fill the window" {
+    // the best's 8:4:6 schedule; rounds of a k = 3 drafter (anchor plus 2 drafts) keeping 3, 1, 2 and 3 tokens
+    const sch = Transformer.TopKSchedule{ .k1 = 8, .n = 4, .k2 = 6 };
+    var fw: u32 = 0;
+    var ks: [4]u32 = undefined;
+    var kept: u32 = 0;
+    for ([_]u32{ 2, 0, 1, 2 }, &ks) |accepted, *k| {
+        k.* = Transformer.scheduleK(sch, fw); // the verify routes at the count before its round, as applyTopKSchedule does
+        fw = Transformer.topkVerifyAdvanceCount(fw, accepted);
+        kept += accepted + 1;
+    }
+    try std.testing.expectEqualSlices(u32, &.{ 8, 8, 6, 6 }, &ks);
+    // the count is the reply's kept tokens, as one-row decode would count one forward per token
+    try std.testing.expectEqual(kept, fw);
+    // a rejected round whose fallback re-forwards one row: the replay's own increment is overwritten at the round's end,
+    // which nextDrafter sets from the count before the verify (so the replay routed at the verify's k)
+    const df0: u32 = 3;
+    try std.testing.expectEqual(@as(u32, 8), Transformer.scheduleK(sch, df0));
+    try std.testing.expectEqual(@as(u32, 4), Transformer.topkVerifyAdvanceCount(df0, 0));
+    // This covers the counting rule only; that the served verify routes at 6 is checked on the M4 by the multi-row
+    // `[topk-schedule] a <k>-row verify routed to` line of a drafter run.
+    // without the fix (the count never moves) every round stays at 8
+    try std.testing.expectEqual(@as(u32, 8), Transformer.scheduleK(sch, 0));
+    try std.testing.expectEqual(std.math.maxInt(u32), Transformer.topkVerifyAdvanceCount(std.math.maxInt(u32) - 1, 5));
 }
 
 test "top-k schedule: refused for a model whose expert count either k exceeds" {
@@ -1219,17 +1253,20 @@ pub const DeviceGen = struct { gen: u32, phone: bool };
 
 /// Test seam: pin the GPU generation every generation-keyed plan reads (null = the device's).
 pub var device_gen_override: ?DeviceGen = null;
-var device_gen_cache: ?DeviceGen = null;
+/// The parsed generation packed in one atomic word (0 = not parsed yet; bit 32 is the phone flag, bit 33 the "parsed" mark),
+/// so two threads' first lookups never read a half-written value. Both compute the same value, so the race is benign.
+var device_gen_cache = std.atomic.Value(u64).init(0);
 
 /// The device's GPU generation, parsed once. Kernel plans keyed on generation (`qmv2.planFor`, the
 /// down+reduce lane count) read this one cache.
 pub fn deviceGeneration() DeviceGen {
     if (device_gen_override) |g| return g;
-    if (device_gen_cache) |g| return g;
+    const cached = device_gen_cache.load(.acquire);
+    if (cached != 0) return .{ .gen = @truncate(cached), .phone = (cached >> 32) & 1 != 0 };
     var buf: [128]u8 = undefined;
     const parsed = naxArchGeneration(gpuArchitecture(&buf) orelse "");
     const g: DeviceGen = .{ .gen = parsed.gen, .phone = parsed.phone };
-    device_gen_cache = g;
+    device_gen_cache.store(@as(u64, g.gen) | (@as(u64, @intFromBool(g.phone)) << 32) | (1 << 33), .release);
     return g;
 }
 
@@ -3231,6 +3268,61 @@ pub const KVCache = struct {
         self.step = snap.step;
     }
 
+    /// A second KVCache whose entries hold one more reference on each of this cache's handles (storage and
+    /// views) and copy every other field, so a forward built against it leaves this cache untouched. Unlike `snapshot`
+    /// it keeps the views and the in-place gate (`kv_in_place_off`, `shared_view`), so that forward takes the same path
+    /// the same forward on this cache would. Free it with `deinit`, or hand it back with `adoptShadow`.
+    pub fn shadowClone(self: *const KVCache) !KVCache {
+        const out = try self.allocator.alloc(KVCacheEntry, self.entries.len);
+        var built: usize = 0;
+        errdefer {
+            for (out[0..built]) |*e| freeKVEntry(e);
+            self.allocator.free(out);
+        }
+        for (self.entries, 0..) |src, i| {
+            out[i] = src;
+            inline for (.{ "keys", "values", "keys_scales", "keys_biases", "values_scales", "values_biases", "key_view", "value_view", "key_scales_view", "key_biases_view", "value_scales_view", "value_biases_view" }) |f| {
+                @field(out[i], f) = mlx.mlx_array_new();
+            }
+            built = i + 1;
+            inline for (.{ "keys", "values", "keys_scales", "keys_biases", "values_scales", "values_biases", "key_view", "value_view", "key_scales_view", "key_biases_view", "value_scales_view", "value_biases_view" }) |f| {
+                // an empty handle (a dense cache's quant fields, an uninitialized entry) stays a fresh empty one
+                if (@field(src, f).ctx != null and arrayId(@field(src, f)) != 0) try mlx.check(mlx.mlx_array_set(&@field(out[i], f), @field(src, f)));
+            }
+        }
+        return .{ .entries = out, .step = self.step, .allocator = self.allocator, .config = self.config, .reserve_tokens = self.reserve_tokens };
+    }
+
+    /// Whether this cache is in exactly the state `ref` (a `shadowClone` of it) recorded: the same step and,
+    /// per entry, the same arrays (by array id: `ref`'s references keep those ids from being reused) and positions.
+    pub fn sameStateAs(self: *const KVCache, ref: *const KVCache) bool {
+        if (self.step != ref.step or self.entries.len != ref.entries.len or self.reserve_tokens != ref.reserve_tokens) return false;
+        for (self.entries, ref.entries) |a, b| {
+            if (a.offset != b.offset or a.initialized != b.initialized or a.base != b.base or a.keep != b.keep or a.window != b.window or
+                a.shared_view != b.shared_view or a.shared_rows != b.shared_rows or a.kv_in_place_off != b.kv_in_place_off) return false;
+            inline for (.{ "keys", "values", "keys_scales", "keys_biases", "values_scales", "values_biases", "key_view", "value_view", "key_scales_view", "key_biases_view", "value_scales_view", "value_biases_view" }) |f| {
+                if (arrayId(@field(a, f)) != arrayId(@field(b, f))) return false;
+            }
+        }
+        return true;
+    }
+
+    /// Take `shadow`'s entries and positions as this cache's own (freeing this cache's handles first), as if
+    /// the forward built against `shadow` had been built against this cache. `shadow` is left empty; its `deinit` is then
+    /// a no-op on entries.
+    pub fn adoptShadow(self: *KVCache, shadow: *KVCache) void {
+        std.debug.assert(self.entries.len == shadow.entries.len);
+        for (self.entries, shadow.entries) |*dst, src| {
+            freeKVEntry(dst);
+            dst.* = src;
+        }
+        self.step = shadow.step;
+        self.reserve_tokens = shadow.reserve_tokens;
+        const taken = shadow.entries;
+        shadow.entries = taken[0..0]; // a later deinit frees nothing (a zero-length free returns at once)
+        shadow.allocator.free(taken);
+    }
+
     const chunk_step = 256;
 
     /// Cap on the slack a single growth event adds, in tokens. Keeps the
@@ -3818,15 +3910,16 @@ pub const KVCache = struct {
         }
     }
 
-    /// The dense buffers a fused S=1 decode kernel writes its K and V row into, at buffer row `row`
+    /// The dense buffers a fused decode kernel writes its `rows` K and V rows into, from buffer row `row`
     /// of capacity `cap`. Null unless the write is safe in place (see `kv_in_place_off`).
     pub const KvInPlaceTarget = struct { k: mlx.mlx_array, v: mlx.mlx_array, row: i32, cap: i32 };
 
-    pub fn kvInPlaceTarget(self: *KVCache, layer: u32, kv_heads: c_int, head_dim: c_int, dt: mlx.mlx_dtype) ?KvInPlaceTarget {
+    pub fn kvInPlaceTarget(self: *KVCache, layer: u32, kv_heads: c_int, head_dim: c_int, dt: mlx.mlx_dtype, rows: usize) ?KvInPlaceTarget {
         if (self.config.scheme != .off) return null;
+        if (rows < 1) return null;
         const e = &self.entries[layer];
         if (!e.initialized or e.shared_view or e.kv_in_place_off != e.offset) return null;
-        if (self.planGrow(e, 1) != null) return null;
+        if (self.planGrow(e, rows) != null) return null;
         const ks = mlx.getShape(e.keys);
         const vs = mlx.getShape(e.values);
         if (ks.len != 4 or vs.len != 4) return null;
@@ -3834,15 +3927,15 @@ pub const KVCache = struct {
         if (vs[0] != 1 or vs[1] != kv_heads or vs[2] != ks[2] or vs[3] != head_dim) return null;
         if (mlx.mlx_array_dtype(e.keys) != dt or mlx.mlx_array_dtype(e.values) != dt) return null;
         const row = e.offset - e.base;
-        if (row >= @as(usize, @intCast(ks[2]))) return null;
+        if (row + rows > @as(usize, @intCast(ks[2]))) return null;
         return .{ .k = e.keys, .v = e.values, .row = @intCast(row), .cap = ks[2] };
     }
 
-    /// `updateDense` for one row the fused kernel already wrote in place. The buffers are rebound
+    /// `updateDense` for the `rows` rows the fused kernel already wrote in place. The buffers are rebound
     /// through `mlx_lesto_written_in_place` on `dep` (an output of that kernel): MLX then tracks them as written
     /// after the kernel, so every later reader of the cache, through any handle, gets MLX's barrier (same
     /// encoder) or fence wait (later encoder); the views and counters follow updateDense steps 1, 5 and 6.
-    pub fn kvInPlaceCommit(self: *KVCache, layer: u32, dep: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32) !DenseKVView {
+    pub fn kvInPlaceCommit(self: *KVCache, layer: u32, dep: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32, rows: usize) !DenseKVView {
         const entry = &self.entries[layer];
         _ = mlx.mlx_array_free(entry.key_view);
         _ = mlx.mlx_array_free(entry.value_view);
@@ -3870,8 +3963,8 @@ pub const KVCache = struct {
         entry.keys = fresh.k;
         _ = mlx.mlx_array_free(entry.values);
         entry.values = fresh.v;
-        entry.offset += 1;
-        if (layer == 0) self.step += 1;
+        entry.offset += rows;
+        if (layer == 0) self.step += rows;
         entry.kv_in_place_off = entry.offset;
         const total: c_int = @intCast(entry.offset - entry.base);
         const view_start: c_int = if (max_seq > 0 and total > max_seq) total - @as(c_int, @intCast(max_seq)) else 0;
@@ -3978,13 +4071,30 @@ pub const KVCache = struct {
                 const lo: c_int = @intCast(base + 1 - entry.base);
                 const hi: c_int = lo + @as(c_int, @intCast(rows.len));
                 var moved = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_slice_update(&moved, buf.*, picked, &[_]c_int{ 0, 0, lo, 0 }, 4, &[_]c_int{ sh[0], sh[1], hi, sh[3] }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, s));
+                mlx.check(mlx.mlx_slice_update(&moved, buf.*, picked, &[_]c_int{ 0, 0, lo, 0 }, 4, &[_]c_int{ sh[0], sh[1], hi, sh[3] }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, s)) catch |e| {
+                    _ = mlx.mlx_array_free(moved); // a failed op frees its own output
+                    return e;
+                };
                 _ = mlx.mlx_array_free(buf.*);
                 buf.* = moved;
             }
             // The rows now live in this cache's own buffer, not a restored share.
             entry.shared_view = false;
         }
+    }
+
+    /// For `MLX_SERVE_DRAFTER_NO_SNAPSHOT=1`: whether `truncate(len)` would succeed after a write of `new_rows` rows on
+    /// every entry, read before that write. Mirrors the write's own grow plan (`planGrow`, whose drop moves a sliding ring's
+    /// base) and `truncate`'s refusal, so a round that skips its snapshot is one the rollback can always serve.
+    pub fn truncateServesAfterWrite(self: *const KVCache, len: usize, new_rows: usize) bool {
+        for (self.entries) |*entry| {
+            if (!entry.initialized) continue;
+            var base_after = entry.base;
+            if (self.planGrow(entry, new_rows)) |g| base_after = entry.base + g.drop;
+            const offset_after = entry.offset + new_rows;
+            if (base_after > 0 and len > 0 and len < offset_after and len < base_after + entry.window) return false;
+        }
+        return true;
     }
 
     pub fn truncate(self: *KVCache, len: usize, s: mlx.mlx_stream) !void {
@@ -4499,6 +4609,228 @@ const MoeLayerWeights = struct {
 const BITS_CACHE_CAP: usize = 1024; // plenty for 60 layers × ~10 quant weights × factor
 pub const QuantParams = struct { bits: u32, group_size: u32, mode: QuantMode = .affine };
 
+// ── A 2-bit shortlist of the Latin-script head (MLX_SERVE_HEAD_SHORTLIST=1, off by default, lossy) ──
+
+/// The 2-bit copy's group size.
+const HEAD_SHORTLIST_GS: u32 = 64;
+const HEAD_SHORTLIST_TOPK_DEFAULT: c_int = 64;
+
+/// MLX_SERVE_HEAD_SHORTLIST=1 builds the shortlist head at load; anything else (or unset) leaves the Latin-script head alone.
+fn headShortlistEnabled() bool {
+    const v = std.c.getenv("MLX_SERVE_HEAD_SHORTLIST") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "1");
+}
+
+/// MLX_SERVE_HEAD_SHORTLIST_CHECK=1: serve the head's own scores and log the shortlist's agreement and mass per decode step.
+fn headShortlistCheck() bool {
+    const S = struct {
+        var v: ?bool = null;
+    };
+    if (S.v) |b| return b;
+    S.v = if (std.c.getenv("MLX_SERVE_HEAD_SHORTLIST_CHECK")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+    return S.v.?;
+}
+
+/// MLX_SERVE_HEAD_SHORTLIST_TOPK: rows rescored through the head (default 64; 1 to 4096).
+fn headShortlistTopk() c_int {
+    const v = std.c.getenv("MLX_SERVE_HEAD_SHORTLIST_TOPK") orelse return HEAD_SHORTLIST_TOPK_DEFAULT;
+    const n = std.fmt.parseInt(c_int, std.mem.span(v), 10) catch return HEAD_SHORTLIST_TOPK_DEFAULT;
+    return if (n >= 1 and n <= 4096) n else HEAD_SHORTLIST_TOPK_DEFAULT;
+}
+
+/// The shortlist's top-k pick by `topk_select.topk` instead of a full argpartition sort (the same
+/// indices in the same order); MLX_SERVE_HEAD_SHORTLIST_SELECT_OFF=1 keeps the argpartition.
+fn shortlistSelectEnabled() bool {
+    const S = struct {
+        var v: ?bool = null;
+    };
+    if (S.v) |b| return b;
+    S.v = std.c.getenv("MLX_SERVE_HEAD_SHORTLIST_SELECT_OFF") == null;
+    return S.v.?;
+}
+
+/// The head tail's argmax over the k rescored scores alone (`topk_select.headTail64`, the
+/// same token as the kept-row argmax); MLX_SERVE_HEAD_SHORTLIST_ARGMAX_OFF=1 (or MLX_SERVE_HEAD_SHORTLIST_SELECT_OFF=1) keeps the kept-row argmax.
+fn shortlistArgmaxEnabled() bool {
+    const S = struct {
+        var v: ?bool = null;
+    };
+    if (S.v) |b| return b;
+    S.v = shortlistSelectEnabled() and std.c.getenv("MLX_SERVE_HEAD_SHORTLIST_ARGMAX_OFF") == null;
+    return S.v.?;
+}
+
+var shortlist_select_logged = false;
+var shortlist_argmax_logged = false;
+
+/// The last shortlist row's rescored scores and their kept positions, for the head tail of that same row: `id` is
+/// the MLX id of the kept row it built (`own` holds it so the id is not reused).
+const ShortlistSelectSide = struct { own: mlx.mlx_array = .{ .ctx = null }, id: usize = 0, ye: mlx.mlx_array = .{ .ctx = null }, sel: mlx.mlx_array = .{ .ctx = null } };
+var shortlist_select_side: ShortlistSelectSide = .{};
+
+fn shortlistSelectStash(s: mlx.mlx_stream, out: mlx.mlx_array, ye: mlx.mlx_array, idx: mlx.mlx_array, k: c_int) !void {
+    var own = mlx.mlx_array_new();
+    mlx.check(mlx.mlx_array_set(&own, out)) catch |e| {
+        _ = mlx.mlx_array_free(own); // a failed op frees its own output
+        return e;
+    };
+    shortlist_select_side.own = own;
+    shortlist_select_side.id = headTailId(own);
+    if (shortlist_select_side.id == 0) return error.ShortlistSelectNoArrayId;
+    var yc = mlx.mlx_array_new();
+    mlx.check(mlx.mlx_array_set(&yc, ye)) catch |e| {
+        _ = mlx.mlx_array_free(yc); // a failed op frees its own output
+        return e;
+    };
+    shortlist_select_side.ye = yc;
+    var flat = mlx.mlx_array_new();
+    mlx.check(mlx.mlx_reshape(&flat, idx, &[_]c_int{k}, 1, s)) catch |e| {
+        _ = mlx.mlx_array_free(flat); // a failed op frees its own output
+        return e;
+    };
+    shortlist_select_side.sel = flat;
+}
+
+fn shortlistSelectSideClear() void {
+    inline for (.{ "own", "ye", "sel" }) |f| {
+        if (@field(shortlist_select_side, f).ctx != null) _ = mlx.mlx_array_free(@field(shortlist_select_side, f));
+    }
+    shortlist_select_side = .{};
+}
+
+var head_shortlist_logged = false;
+var head_shortlist_check: struct { steps: u64 = 0, agree: u64 = 0, sum_nlm: f64 = 0, max_nlm: f32 = 0 } = .{};
+
+/// Every dimension but the last is 1: one decode row.
+fn oneRow(x: mlx.mlx_array) bool {
+    const sh = mlx.getShape(x);
+    if (sh.len < 1) return false;
+    for (sh[0 .. sh.len - 1]) |d| if (d != 1) return false;
+    return true;
+}
+
+/// One quantized affine matrix [rows, cols / (32 / bits)] with its scales and biases.
+const HeadShortlistBank = struct { w: mlx.mlx_array, s: mlx.mlx_array, b: mlx.mlx_array, bits: u32, gs: u32 };
+
+/// `qmatmul`'s affine branch with known (bits, group_size); the per-step gathered rows are new arrays, so the
+/// pointer-keyed quant-params cache must never see them. `gathered` skips lane_qmm, whose `packedFor` keeps a packed
+/// copy of every scales/biases pair it sees until unload (a fresh pair each step would grow without bound); simd_qmm
+/// and rowqmv key their caches by shape only. Their sums may round apart from lane_qmm's: the check mode measures it.
+fn headShortlistQmm(x: mlx.mlx_array, bank: HeadShortlistBank, row_exact: bool, gathered: bool, s: mlx.mlx_stream) !mlx.mlx_array {
+    if (row_exact) {
+        if (!gathered) {
+            if (try rowExactQmm(x, bank.w, bank.s, bank.b, bank.bits, bank.gs, s)) |y| return y;
+        } else {
+            if (try simd_qmm.qmm(x, bank.w, bank.s, bank.b, bank.bits, bank.gs, s)) |y| return y;
+            if (try rowqmv.qmv(x, bank.w, bank.s, bank.b, bank.bits, bank.gs, s)) |y| return y;
+        }
+    }
+    return qmatmulBits(x, bank.w, bank.s, bank.b, bank.bits, bank.gs, .affine, s);
+}
+
+/// The shortlist's scores for one decode row `x`: every row of `narrow` (the 2-bit copy of `head`) scores `x`; its top
+/// `topk` rows are rescored through `head`'s own rows; the result is `head`-row-sized, holding those scores at their
+/// positions and -1e30 elsewhere. `idx` (the rescored positions, last axis `k`) is returned for the check mode.
+fn headShortlistScores(s: mlx.mlx_stream, x: mlx.mlx_array, head: HeadShortlistBank, narrow: HeadShortlistBank, topk: c_int, row_exact: bool) !struct { out: mlx.mlx_array, idx: mlx.mlx_array, k: c_int, ye: mlx.mlx_array } {
+    const y2 = try headShortlistQmm(x, narrow, row_exact, false, s);
+    defer _ = mlx.mlx_array_free(y2);
+    var shape: [8]c_int = undefined;
+    const ys = mlx.getShape(y2);
+    const n = ys.len;
+    if (n == 0 or n > 8) return error.HeadShortlistShape;
+    @memcpy(shape[0..n], ys);
+    const k = @min(topk, shape[n - 1]);
+    // The same first k of argpartition(-y2) without the full sort; null where it does not serve.
+    const picked: ?mlx.mlx_array = if (shortlistSelectEnabled()) try topk_select.topk(s, y2, k) else null;
+    if (picked != null and !shortlist_select_logged) {
+        shortlist_select_logged = true;
+        log.info("[shortlist-select] top-{d} select engaged for the shortlist (MLX_SERVE_HEAD_SHORTLIST_SELECT_OFF=1 restores the argpartition)\n", .{k});
+    }
+    const idx = if (picked) |p| p else blk: {
+        var neg = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(neg);
+        try mlx.check(mlx.mlx_negative(&neg, y2, s));
+        var part = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(part);
+        try mlx.check(mlx.mlx_argpartition_axis(&part, neg, k - 1, -1, s));
+        var stop = shape;
+        stop[n - 1] = k;
+        const zeros: [8]c_int = @splat(0);
+        const ones: [8]c_int = @splat(1);
+        var sl = mlx.mlx_array_new();
+        mlx.check(mlx.mlx_slice(&sl, part, &zeros, n, &stop, n, &ones, n, s)) catch |e| {
+            _ = mlx.mlx_array_free(sl); // a failed op frees its own output
+            return e;
+        };
+        break :blk sl;
+    };
+    errdefer _ = mlx.mlx_array_free(idx);
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    try mlx.check(mlx.mlx_reshape(&flat, idx, &[_]c_int{k}, 1, s));
+    const wg = try takeContig(s, head.w, flat, 0);
+    defer _ = mlx.mlx_array_free(wg);
+    const sg = try takeContig(s, head.s, flat, 0);
+    defer _ = mlx.mlx_array_free(sg);
+    const bg = try takeContig(s, head.b, flat, 0);
+    defer _ = mlx.mlx_array_free(bg);
+    const ye = try headShortlistQmm(x, .{ .w = wg, .s = sg, .b = bg, .bits = head.bits, .gs = head.gs }, row_exact, true, s);
+    errdefer _ = mlx.mlx_array_free(ye);
+    const neg_val: f32 = -1.0e30;
+    const neg_one = mlx.mlx_array_new_data(&neg_val, &[_]c_int{1}, 1, .float32);
+    defer _ = mlx.mlx_array_free(neg_one);
+    var full = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(full);
+    try mlx.check(mlx.mlx_full(&full, &shape, n, neg_one, mlx.mlx_array_dtype(ye), s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_put_along_axis(&out, full, idx, ye, -1, s));
+    return .{ .out = out, .idx = idx, .k = k, .ye = ye };
+}
+
+const HeadShortlistHead = struct {
+    w: mlx.mlx_array = .{},
+    s: mlx.mlx_array = .{},
+    b: mlx.mlx_array = .{},
+    topk: c_int = HEAD_SHORTLIST_TOPK_DEFAULT,
+    bits: u32 = 0,
+    gs: u32 = 0,
+
+    fn deinit(self: *HeadShortlistHead) void {
+        if (self.w.ctx != null) _ = mlx.mlx_array_free(self.w);
+        if (self.s.ctx != null) _ = mlx.mlx_array_free(self.s);
+        if (self.b.ctx != null) _ = mlx.mlx_array_free(self.b);
+        self.* = .{};
+    }
+};
+
+/// The 2-bit affine copy (group HEAD_SHORTLIST_GS) of a quantized affine head `w`/`sc`/`bi`, through bf16. Refuses a head that is
+/// not affine, is already at 2 bits or less, or whose row width does not split into HEAD_SHORTLIST_GS groups.
+fn buildHeadShortlistHead(config: *const ModelConfig, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, s: mlx.mlx_stream) !HeadShortlistHead {
+    if (bi.ctx == null) return error.HeadShortlistHeadNotAffine;
+    const qp = computeQuantParams(config, w, sc, config.hidden_size);
+    if (qp.mode != .affine) return error.HeadShortlistHeadNotAffine;
+    if (qp.bits <= 2) return error.HeadShortlistHeadAlreadyNarrow;
+    if (config.hidden_size % HEAD_SHORTLIST_GS != 0) return error.HeadShortlistGroupMismatch;
+    var deq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(deq);
+    try mlx.check(mlx.mlx_dequantize(&deq, w, sc, bi, mlx.mlx_optional_int.some(@intCast(qp.group_size)), mlx.mlx_optional_int.some(@intCast(qp.bits)), "affine", .{ .ctx = null }, .{ .value = .bfloat16, .has_value = true }, s));
+    var triple = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(triple);
+    try mlx.check(mlx.mlx_quantize(&triple, deq, mlx.mlx_optional_int.some(@intCast(HEAD_SHORTLIST_GS)), mlx.mlx_optional_int.some(2), "affine", .{}, s));
+    var out: HeadShortlistHead = .{ .topk = headShortlistTopk(), .bits = qp.bits, .gs = qp.group_size };
+    errdefer out.deinit();
+    out.w = mlx.mlx_array_new();
+    out.s = mlx.mlx_array_new();
+    out.b = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&out.w, triple, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&out.s, triple, 1));
+    try mlx.check(mlx.mlx_vector_array_get(&out.b, triple, 2));
+    try mlx.evalFields(.{ out.w, out.s, out.b });
+    log.info("[head-shortlist] 2-bit shortlist head built: {d} rows at 2 bits (group {d}) beside the {d}-bit head (group {d}), top {d} rescored{s}\n", .{ mlx.getShape(w)[0], HEAD_SHORTLIST_GS, qp.bits, qp.group_size, out.topk, if (headShortlistCheck()) "; CHECK mode: the head's own scores serve" else "" });
+    return out;
+}
+
 const OQE_MLP_DOWN_BITS = "5555555555555555555555555556555644444444444444444444444444444444";
 const OQE_LINEAR_Z_BITS = "5554444444545554555454444444444444444444444444444444444444444444";
 const OQE_LINEAR_AB_BITS = "5554544444545554555455545554555444444444444444444444444444444444";
@@ -4633,10 +4965,19 @@ pub const ForwardCtx = struct {
     /// that only fill the KV cache and by the LTX text encoder (which wants the residual stream, not a
     /// next token).
     skip_lm_head: bool = false,
+    /// The caller reads nothing this prefill chunk returns (no prompt logprobs, no hidden or layer capture),
+    /// only the K/V it writes, so the MoE forward skips the cadence eval after the last layer: that eval computed the last
+    /// layer's attention output, dense MLP and experts for every row, and nothing read them. The K/V of every layer,
+    /// the last included, still come from the layer inputs the caller's KV eval reaches. MLX_SERVE_PREFILL_LAST_EVAL_SKIP_OFF=1 keeps the eval.
+    prefill_output_unused: bool = false,
     /// True lets the decode head reduce the kept rows to a token for `Generator.sampleLazy`. `sampleLazy`
     /// sets it after each draw to whether the next draw can take that token (`headTailGreedy`), so sampled, penalised and
     /// constrained requests stop building the kept-row argmax graph.
     head_tail_want: bool = true,
+    /// The head tail reduces under `Transformer.answer_mask` instead of `suppress_mask`: set by
+    /// `Generator.sampleLazy` with `head_tail_want`. A stale value only costs the full row, since the
+    /// draw takes the reduced token only under its own mask (`headTailSlotFor`).
+    head_tail_answer: bool = false,
     /// Batched decode over a GatedDeltaNet trunk (`forwardMoeBatchedDecode`).
     /// Non-null means: this forward runs at `batch == batch_slots.len`,
     /// `seq_len == 1`, and every per-slot KV cache lives on the slot ctxs
@@ -4963,7 +5304,11 @@ pub fn qkvAttnDecodeKernel(
     };
     if (qkv_dec_cfg == null or !std.meta.eql(qkv_dec_cfg_key, key)) {
         if (qkv_dec_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        qkv_dec_cfg = null; // never published after its free
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer if (qkv_dec_cfg == null) {
+            _ = mlx.mlx_fast_metal_kernel_config_free(config); // unpublished
+        };
         const ml_shape = [_]c_int{ h_q, nblk };
         const o_shape = [_]c_int{ h_q, nblk, dv };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &ml_shape, 2, .float32));
@@ -5393,7 +5738,11 @@ pub fn qkvAttnVerifyKernel(
     };
     if (qkv_ver_cfgs[slot] == null or !std.meta.eql(qkv_ver_cfg_keys[slot], key)) {
         if (qkv_ver_cfgs[slot]) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        qkv_ver_cfgs[slot] = null; // never published after its free
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer if (qkv_ver_cfgs[slot] == null) {
+            _ = mlx.mlx_fast_metal_kernel_config_free(config); // unpublished
+        };
         const rows_total: c_int = h_q * t_q;
         const ml_shape = [_]c_int{ rows_total, nblk };
         const o_shape = [_]c_int{ rows_total, nblk, dv };
@@ -5648,7 +5997,11 @@ pub fn qkvAttnMppKernel(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const Den
     const key = QkvMppCfgKey{ .hq = h_q, .dk = dk, .bits = view.bits, .gs = view.group_size, .gqa = gqa, .tq = t_q, .nsplit = nsplit, .dtype = qdt };
     if (qkv_mpp_cfgs[slot] == null or !std.meta.eql(qkv_mpp_cfg_keys[slot], key)) {
         if (qkv_mpp_cfgs[slot]) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        qkv_mpp_cfgs[slot] = null; // never published after its free
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer if (qkv_mpp_cfgs[slot] == null) {
+            _ = mlx.mlx_fast_metal_kernel_config_free(config); // unpublished
+        };
         const ml_shape = [_]c_int{ h_kv, nsplit, m_rows };
         const o_shape = [_]c_int{ h_kv, nsplit, m_rows, dk };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &ml_shape, 3, .float32));
@@ -5723,7 +6076,10 @@ pub fn qkvAttnMppKernel(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const Den
         try mlx.check(mlx.mlx_slice(&cut, sw, &start, nd, &stop, nd, &strd, nd, s));
         var flat = mlx.mlx_array_new();
         const sh3 = [_]c_int{ h_kv * real_rows, nsplit, dk };
-        try mlx.check(mlx.mlx_reshape(&flat, cut, &sh3, if (i == 2) 3 else 2, s));
+        mlx.check(mlx.mlx_reshape(&flat, cut, &sh3, if (i == 2) 3 else 2, s)) catch |e| {
+            _ = mlx.mlx_array_free(flat); // a failed op frees its own output
+            return e;
+        };
         parts[n_parts] = flat;
         n_parts += 1;
     }
@@ -5836,6 +6192,15 @@ pub const Transformer = struct {
     latin_head_s: mlx.mlx_array = .{},
     latin_head_b: mlx.mlx_array = .{},
     latin_head_idx: mlx.mlx_array = .{},
+    // MLX_SERVE_HEAD_SHORTLIST=1 (off by default, lossy): a 2-bit affine copy of the Latin-script head scores
+    // every kept row at one decode row; its top `head_shortlist_topk` rows are rescored through the head itself
+    // (`head_shortlist_bits`, `head_shortlist_gs`) and every other row is -1e30. Null when off.
+    head_shortlist_w: mlx.mlx_array = .{},
+    head_shortlist_s: mlx.mlx_array = .{},
+    head_shortlist_b: mlx.mlx_array = .{},
+    head_shortlist_topk: c_int = 64,
+    head_shortlist_bits: u32 = 0,
+    head_shortlist_gs: u32 = 0,
     layers: []LayerWeights,
 
     owns_lm_head: bool,
@@ -5875,6 +6240,10 @@ pub const Transformer = struct {
     /// samplers reference it non-owning via `SamplingParams.suppress_mask`.
     /// Null = suppression off (kill switch, no chat template).
     suppress_mask: ?mlx.mlx_array = null,
+    /// `suppress_mask` plus the thought-channel opener, for answer-only requests
+    /// (`SamplingParams.answer_only`); built beside it, owned the same way. Null on
+    /// a tokenizer without the opener.
+    answer_mask: ?mlx.mlx_array = null,
     /// Measured spec round-cost table (`round_cost.Table`): per draft
     /// width, per KV bucket, fed by every DFlash round on this model and
     /// read by the EV plan in place of the fitted surface once a bucket has
@@ -5958,6 +6327,8 @@ pub const Transformer = struct {
     decode_forwards: u32 = 0,
     topk_active: u32 = 0,
     topk_prefilling: bool = false,
+    /// Bumped at every request's prompt start, so a forward built ahead can tell its count was not reset.
+    topk_epoch: u64 = 0,
 
     // Vision: set before prefill when images are present, cleared after.
     // Shape: [B, num_image_tokens, hidden_size]. Spliced at image_token_id positions.
@@ -5997,6 +6368,8 @@ pub const Transformer = struct {
         // via `useCurrentThreadStream` before each request.
         const s = mlx.gpuStream();
         const prefix = config.weight_prefix;
+        // The per-device MoE rows layouts' switch and plan, logged once at the first MoE load.
+        if (config.num_experts > 0) moeRowsLayoutAnnounce();
 
         var name_buf: [256]u8 = undefined;
 
@@ -6230,7 +6603,10 @@ pub const Transformer = struct {
                 const factor_scalar = mlx.mlx_array_new_float(config.rope_proportional_factor);
                 defer _ = mlx.mlx_array_free(factor_scalar);
                 var scaled = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_multiply(&scaled, base_pow, factor_scalar, s));
+                mlx.check(mlx.mlx_multiply(&scaled, base_pow, factor_scalar, s)) catch |e| {
+                    _ = mlx.mlx_array_free(scaled); // a failed op frees its own output
+                    return e;
+                };
                 _ = mlx.mlx_array_free(base_pow);
                 base_pow = scaled;
             }
@@ -6404,6 +6780,15 @@ pub const Transformer = struct {
                 log.info("[latin-head] Latin-script head engaged: {d} of {d} rows (MLX_SERVE_LATIN_HEAD_OFF=1 keeps the full head)\n", .{ mlx.getShape(keep)[0], mlx.getShape(lm_head_w)[0] });
             }
         }
+        // The 2-bit shortlist copy of the Latin-script head (see `keptScores`).
+        var head_shortlist: HeadShortlistHead = .{};
+        if (headShortlistEnabled() and latin_head_w.ctx != null) {
+            head_shortlist = buildHeadShortlistHead(&config, latin_head_w, latin_head_s, latin_head_b, s) catch |err| blk: {
+                log.warn("[head-shortlist] 2-bit shortlist head not built ({s}): the Latin-script head serves\n", .{@errorName(err)});
+                break :blk .{};
+            };
+        }
+        errdefer head_shortlist.deinit();
         // `latin_head_idx` is the weights map's own array (freed by Weights.deinit, src/model.zig:4945), so it is not freed here.
         errdefer {
             if (latin_head_w.ctx != null) _ = mlx.mlx_array_free(latin_head_w);
@@ -6437,6 +6822,12 @@ pub const Transformer = struct {
             .latin_head_s = latin_head_s,
             .latin_head_b = latin_head_b,
             .latin_head_idx = latin_head_idx,
+            .head_shortlist_w = head_shortlist.w,
+            .head_shortlist_s = head_shortlist.s,
+            .head_shortlist_b = head_shortlist.b,
+            .head_shortlist_topk = head_shortlist.topk,
+            .head_shortlist_bits = head_shortlist.bits,
+            .head_shortlist_gs = head_shortlist.gs,
             .layers = layers,
             .owns_lm_head = owns_lm_head,
             .owns_norms = config.norm_has_offset,
@@ -6850,13 +7241,17 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
 
             var result = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_vector_array_get(&result, out_vec, 0));
+            mlx.check(mlx.mlx_vector_array_get(&result, out_vec, 0)) catch |e| {
+                _ = mlx.mlx_array_free(result); // a failed op frees its own output
+                return e;
+            };
             return result;
         }
         return self.forward(token_ids);
     }
 
     pub fn deinit(self: *Transformer) void {
+        shortlistSelectSideClear();
         self.releaseJoinedVerifyLogits();
         lane_qmm.release(@intFromPtr(self));
         if (self.rht) |reg| {
@@ -6876,6 +7271,7 @@ pub const Transformer = struct {
         if (self.compiled_moe_routing) |cmr| _ = mlx.mlx_closure_free(cmr);
         if (self.rope_freqs_global) |f| _ = mlx.mlx_array_free(f);
         if (self.suppress_mask) |m| _ = mlx.mlx_array_free(m);
+        if (self.answer_mask) |m| _ = mlx.mlx_array_free(m);
         if (self.prompt_cache) |*pc| pc.deinit();
         self.cache.deinit();
         if (self.emb_scale) |es| _ = mlx.mlx_array_free(es);
@@ -6883,6 +7279,9 @@ pub const Transformer = struct {
         if (self.latin_head_w.ctx != null) _ = mlx.mlx_array_free(self.latin_head_w);
         if (self.latin_head_s.ctx != null) _ = mlx.mlx_array_free(self.latin_head_s);
         if (self.latin_head_b.ctx != null) _ = mlx.mlx_array_free(self.latin_head_b);
+        if (self.head_shortlist_w.ctx != null) _ = mlx.mlx_array_free(self.head_shortlist_w);
+        if (self.head_shortlist_s.ctx != null) _ = mlx.mlx_array_free(self.head_shortlist_s);
+        if (self.head_shortlist_b.ctx != null) _ = mlx.mlx_array_free(self.head_shortlist_b);
         // The head tail keeps process-global state that references this model's keep list; release it when this model owns it.
         if (head_tail_aux.owner == @intFromPtr(self)) {
             headTailClear();
@@ -6996,6 +7395,7 @@ pub const Transformer = struct {
             const wt = try transposeBf16Weight(self.lm_head_w, self.s); // [hidden, vocab] view
             defer _ = mlx.mlx_array_free(wt);
             var result = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(result); // owned until returned
             try mlx.check(mlx.mlx_matmul(&result, x, wt, self.s));
             return result;
         }
@@ -7003,19 +7403,109 @@ pub const Transformer = struct {
         return self.qmatmul(x, self.lm_head_w, self.lm_head_s, self.lm_head_b);
     }
 
+    /// The Latin-script head's scores for `x`, one per kept row. With the shortlist built, one decode row
+    /// takes the shortlist (`headShortlistShortlistScores`); every other shape, and any model with Hadamard rotations or a
+    /// ternary 2-bit pack, scores every kept row through the head.
+    fn keptScores(self: *const Transformer, x: mlx.mlx_array) !mlx.mlx_array {
+        return self.keptScoresFor(x, false);
+    }
+
+    /// `head_tail`: the caller arms the head tail with the returned row (the shortlist's side result is left only for it).
+    fn keptScoresFor(self: *const Transformer, x: mlx.mlx_array, head_tail: bool) !mlx.mlx_array {
+        if (self.head_shortlist_w.ctx != null and self.rht == null and !self.ternary_2bit and oneRow(x))
+            return self.headShortlistShortlistScores(x, head_tail);
+        return self.qmatmul(x, self.latin_head_w, self.latin_head_s, self.latin_head_b);
+    }
+
+    /// Score every kept row with the 2-bit copy, rescore its top `head_shortlist_topk` rows through the Latin-script
+    /// head's own rows, and return a kept-size row holding those scores at their positions and -1e30 elsewhere, so the
+    /// full-vocabulary scatter and the head tail run unchanged. `MLX_SERVE_HEAD_SHORTLIST_CHECK=1` returns the head's own scores
+    /// instead and logs, per step, whether the shortlist's argmax agrees and the head's probability mass outside it.
+    fn headShortlistShortlistScores(self: *const Transformer, x: mlx.mlx_array, head_tail: bool) !mlx.mlx_array {
+        const r = try headShortlistScores(self.s, x, .{ .w = self.latin_head_w, .s = self.latin_head_s, .b = self.latin_head_b, .bits = self.head_shortlist_bits, .gs = self.head_shortlist_gs }, .{ .w = self.head_shortlist_w, .s = self.head_shortlist_s, .b = self.head_shortlist_b, .bits = 2, .gs = HEAD_SHORTLIST_GS }, self.head_shortlist_topk, self.config.rowExactDecode());
+        defer _ = mlx.mlx_array_free(r.idx);
+        shortlistSelectSideClear();
+        if (!headShortlistCheck()) {
+            if (!head_shortlist_logged) {
+                head_shortlist_logged = true;
+                log.info("[head-shortlist] shortlist engaged at a decode row: 2-bit scores over the kept rows, top {d} rescored at {d} bits (unset MLX_SERVE_HEAD_SHORTLIST to turn it off)\n", .{ r.k, self.head_shortlist_bits });
+            }
+            // the side takes its own references; r.ye is released either way
+            if (head_tail and shortlistArgmaxEnabled() and r.k <= topk_select.MAX_K) shortlistSelectStash(self.s, r.out, r.ye, r.idx, r.k) catch shortlistSelectSideClear();
+            _ = mlx.mlx_array_free(r.ye);
+            return r.out;
+        }
+        _ = mlx.mlx_array_free(r.ye);
+        defer _ = mlx.mlx_array_free(r.out);
+        const yf = try self.qmatmul(x, self.latin_head_w, self.latin_head_s, self.latin_head_b);
+        errdefer _ = mlx.mlx_array_free(yf);
+        self.headShortlistCheckStep(yf, r.out, r.idx) catch |err| log.warn("[head-shortlist-check] step not counted ({s})\n", .{@errorName(err)});
+        return yf;
+    }
+
+    /// One check step: argmax agreement between the head's own kept scores `yf` and the shortlist's `ys`, and
+    /// -log of the head's softcapped probability mass on the shortlist's rows `idx` (the KL of the shortlist's
+    /// renormalized distribution from the head's, since those rows hold the head's own scores).
+    fn headShortlistCheckStep(self: *const Transformer, yf: mlx.mlx_array, ys: mlx.mlx_array, idx: mlx.mlx_array) !void {
+        var af = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(af);
+        try mlx.check(mlx.mlx_argmax_axis(&af, yf, -1, false, self.s));
+        var as_ = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(as_);
+        try mlx.check(mlx.mlx_argmax_axis(&as_, ys, -1, false, self.s));
+        var eq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(eq);
+        try mlx.check(mlx.mlx_equal(&eq, af, as_, self.s));
+        const capped = if (self.softcap_scalar != null) try self.applySoftcap(yf) else blk: {
+            var c = mlx.mlx_array_new();
+            mlx.check(mlx.mlx_array_set(&c, yf)) catch |e| {
+                _ = mlx.mlx_array_free(c); // a failed op frees its own output
+                return e;
+            };
+            break :blk c;
+        };
+        defer _ = mlx.mlx_array_free(capped);
+        var cf = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cf);
+        try mlx.check(mlx.mlx_astype(&cf, capped, .float32, self.s));
+        var lse_all = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(lse_all);
+        try mlx.check(mlx.mlx_logsumexp_axis(&lse_all, cf, -1, false, self.s));
+        var sel = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sel);
+        try mlx.check(mlx.mlx_take_along_axis(&sel, cf, idx, -1, self.s));
+        var lse_sel = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(lse_sel);
+        try mlx.check(mlx.mlx_logsumexp_axis(&lse_sel, sel, -1, false, self.s));
+        var d = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(d);
+        try mlx.check(mlx.mlx_subtract(&d, lse_all, lse_sel, self.s));
+        try mlx.check(mlx.mlx_array_eval(eq));
+        try mlx.check(mlx.mlx_array_eval(d));
+        var agree: bool = false;
+        try mlx.check(mlx.mlx_array_item_bool(&agree, eq));
+        var nlm: f32 = 0;
+        try mlx.check(mlx.mlx_array_item_float32(&nlm, d));
+        head_shortlist_check.steps += 1;
+        if (agree) head_shortlist_check.agree += 1;
+        head_shortlist_check.sum_nlm += nlm;
+        head_shortlist_check.max_nlm = @max(head_shortlist_check.max_nlm, nlm);
+        log.info("[head-shortlist-check] steps {d} agree {d} mean_nlm {d:.6} max_nlm {d:.6} this {d:.6} {s}\n", .{ head_shortlist_check.steps, head_shortlist_check.agree, head_shortlist_check.sum_nlm / @as(f64, @floatFromInt(head_shortlist_check.steps)), head_shortlist_check.max_nlm, nlm, if (agree) "agree" else "DIFFER" });
+    }
+
     /// Score only the kept rows, then put them into a full-vocabulary row of -1e30 at their own ids.
     fn latinHeadProject(self: *const Transformer, x: mlx.mlx_array) !mlx.mlx_array {
-        const yk = try self.qmatmul(x, self.latin_head_w, self.latin_head_s, self.latin_head_b);
+        const yk = try self.keptScores(x);
         defer _ = mlx.mlx_array_free(yk);
         return self.latinHeadScatterFull(yk);
     }
 
     /// One decode row of the Gemma 4 forward, Latin-script head, softcap, a GPU stream, and the keep list usable.
-    fn headTailEligible(self: *const Transformer, x: mlx.mlx_array) bool {
+    fn headTailEligible(self: *const Transformer, x: mlx.mlx_array, answer: bool) bool {
         if (!headTailEnabled() or self.latin_head_idx.ctx == null or self.softcap_scalar == null or !mlx.streamIsGpu(self.s)) return false;
         const xs = mlx.getShape(x);
         if (xs.len != 3 or xs[0] != 1 or xs[1] != 1) return false;
-        return headTailPrepare(self);
+        return headTailPrepare(self, answer);
     }
 
     /// After the forward softcapped the full row `logits`, reduce the kept scores `yk` to the token id
@@ -7031,10 +7521,12 @@ pub const Transformer = struct {
     }
 
     fn headTailArmImpl(self: *const Transformer, yk: mlx.mlx_array, logits: mlx.mlx_array) !void {
-        const ykc = try self.applySoftcap(yk);
-        defer _ = mlx.mlx_array_free(ykc);
-        if (mlx.mlx_array_dtype(ykc) != mlx.mlx_array_dtype(head_tail_aux.dv)) return error.HeadTailDtype;
-        const tok = try headTailArgmaxMap(self.s, ykc, self.latin_head_idx, head_tail_aux.cmask, head_tail_aux.dv, head_tail_aux.di, head_tail_aux.masked);
+        const tok = (try self.shortlistSelectHeadTail(yk)) orelse blk: {
+            const ykc = try self.applySoftcap(yk);
+            defer _ = mlx.mlx_array_free(ykc);
+            if (mlx.mlx_array_dtype(ykc) != mlx.mlx_array_dtype(head_tail_aux.dv)) return error.HeadTailDtype;
+            break :blk try headTailArgmaxMap(self.s, ykc, self.latin_head_idx, head_tail_aux.cmask, head_tail_aux.dv, head_tail_aux.di, head_tail_aux.masked);
+        };
         errdefer _ = mlx.mlx_array_free(tok);
         var own = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(own);
@@ -7043,6 +7535,34 @@ pub const Transformer = struct {
         if (id == 0) return error.HeadTailNoArrayId;
         headTailClear();
         head_tail_slot = .{ .own = own, .id = id, .tok = tok, .mask_id = head_tail_aux.mask_id };
+    }
+
+    /// When `yk` is the kept row the shortlist just built, its token from the k rescored scores alone
+    /// (the side `headShortlistShortlistScores` left), the same token headTailArgmaxMap takes from the whole softcapped row.
+    /// Null: use the kept-row argmax. The side is spent either way.
+    fn shortlistSelectHeadTail(self: *const Transformer, yk: mlx.mlx_array) !?mlx.mlx_array {
+        defer shortlistSelectSideClear();
+        if (shortlist_select_side.id == 0 or headTailId(yk) != shortlist_select_side.id) return null;
+        if (mlx.mlx_array_size(shortlist_select_side.sel) > @as(usize, @intCast(topk_select.MAX_K))) return null;
+        const v = try self.applySoftcap(shortlist_select_side.ye);
+        defer _ = mlx.mlx_array_free(v);
+        // the row's other kept positions hold softcap(-1e30) in the row's dtype, as put into `full` by headShortlistScores
+        if (mlx.mlx_array_dtype(v) != mlx.mlx_array_dtype(head_tail_aux.dv) or mlx.mlx_array_dtype(yk) != mlx.mlx_array_dtype(shortlist_select_side.ye)) return null;
+        const neg_val: f32 = -1.0e30;
+        const one = [_]c_int{1};
+        const neg = mlx.mlx_array_new_data(&neg_val, &one, 1, .float32);
+        defer _ = mlx.mlx_array_free(neg);
+        var fill = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(fill);
+        try mlx.check(mlx.mlx_full(&fill, &one, 1, neg, mlx.mlx_array_dtype(yk), self.s));
+        const fv = try self.applySoftcap(fill);
+        defer _ = mlx.mlx_array_free(fv);
+        const tok = try topk_select.headTail64(self.s, v, shortlist_select_side.sel, self.latin_head_idx, head_tail_aux.cmask, fv, head_tail_aux.dv, head_tail_aux.di, head_tail_aux.masked);
+        if (!shortlist_argmax_logged) {
+            shortlist_argmax_logged = true;
+            log.info("[shortlist-argmax] head tail over the {d} rescored rows engaged (MLX_SERVE_HEAD_SHORTLIST_ARGMAX_OFF=1 restores the kept-row argmax)\n", .{mlx.mlx_array_size(shortlist_select_side.sel)});
+        }
+        return tok;
     }
 
     /// The token for `logits` when the head reduced its kept rows for exactly that row under the same
@@ -7068,6 +7588,54 @@ pub const Transformer = struct {
     /// A draw that did not take the token drops it (and the slot's reference to its row).
     pub fn headTailDrop() void {
         headTailClear();
+        shortlistSelectSideClear();
+    }
+
+    /// The global head-tail slot with one more reference on its arrays (an empty slot stays empty).
+    pub fn headTailSlotRef() !HeadTailSlot {
+        var out: HeadTailSlot = .{ .id = head_tail_slot.id, .mask_id = head_tail_slot.mask_id };
+        errdefer headTailSlotFree(&out);
+        if (head_tail_slot.own.ctx != null) {
+            out.own = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&out.own, head_tail_slot.own));
+        }
+        if (head_tail_slot.tok.ctx != null) {
+            out.tok = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&out.tok, head_tail_slot.tok));
+        }
+        return out;
+    }
+
+    /// Whether the global slot still holds the arrays `s` refers to (by array id: a reference taken with
+    /// `headTailSlotRef` is a separate handle on the same array).
+    pub fn headTailSlotIs(s: HeadTailSlot) bool {
+        return head_tail_slot.id == s.id and head_tail_slot.mask_id == s.mask_id and
+            headTailId(head_tail_slot.own) == headTailId(s.own) and headTailId(head_tail_slot.tok) == headTailId(s.tok);
+    }
+
+    /// Move the global slot out, leaving it empty; the caller owns the result.
+    pub fn headTailSlotTake() HeadTailSlot {
+        const s = head_tail_slot;
+        head_tail_slot = .{};
+        return s;
+    }
+
+    /// Clear the global slot and install `s` (ownership passes to the slot).
+    pub fn headTailSlotPut(s: HeadTailSlot) void {
+        headTailClear();
+        head_tail_slot = s;
+    }
+
+    pub fn headTailSlotFree(s: *HeadTailSlot) void {
+        if (s.tok.ctx != null) _ = mlx.mlx_array_free(s.tok);
+        if (s.own.ctx != null) _ = mlx.mlx_array_free(s.own);
+        s.* = .{};
+    }
+
+    /// Modes whose forward evaluates while it is built (a decode profile, the async ladder, the head_shortlist
+    /// shortlist check and its counters), where a forward built ahead would run or count work the step 0 shim runs later.
+    pub fn buildEvaluates(self: *const Transformer) bool {
+        return decodeProfileEnabled() or self.decode_async_ladder != 0 or headShortlistCheck();
     }
 
     /// The kept rows' scores `yk` put into a full-vocabulary row of -1e30 (latinHeadProject's second half).
@@ -7308,7 +7876,10 @@ pub const Transformer = struct {
                     fn q_chain(t: *Transformer, slot: *mlx.mlx_array, r: ProjRung, sh: []const c_int, nrm: mlx.mlx_array, pm: []const c_int, dims: c_int, base: mlx.mlx_optional_float, freqs: mlx.mlx_array) !void {
                         if (@backingInt(r) < @backingInt(ProjRung.reshape)) return;
                         var o = mlx.mlx_array_new();
-                        try mlx.check(mlx.mlx_reshape(&o, slot.*, sh.ptr, sh.len, t.s));
+                        mlx.check(mlx.mlx_reshape(&o, slot.*, sh.ptr, sh.len, t.s)) catch |e| {
+                            _ = mlx.mlx_array_free(o); // a failed op frees its own output
+                            return e;
+                        };
                         _ = mlx.mlx_array_free(slot.*);
                         slot.* = o;
                         if (@backingInt(r) >= @backingInt(ProjRung.qk_norm) and nrm.ctx != null) {
@@ -7318,13 +7889,19 @@ pub const Transformer = struct {
                         }
                         if (@backingInt(r) >= @backingInt(ProjRung.transpose)) {
                             var tr = mlx.mlx_array_new();
-                            try mlx.check(mlx.mlx_transpose_axes(&tr, slot.*, pm.ptr, @intCast(pm.len), t.s));
+                            mlx.check(mlx.mlx_transpose_axes(&tr, slot.*, pm.ptr, @intCast(pm.len), t.s)) catch |e| {
+                                _ = mlx.mlx_array_free(tr); // a failed op frees its own output
+                                return e;
+                            };
                             _ = mlx.mlx_array_free(slot.*);
                             slot.* = tr;
                         }
                         if (@backingInt(r) >= @backingInt(ProjRung.rope)) {
                             var rp = mlx.mlx_array_new();
-                            try mlx.check(mlx.mlx_fast_rope(&rp, slot.*, dims, false, base, 1.0, 0, freqs, t.s));
+                            mlx.check(mlx.mlx_fast_rope(&rp, slot.*, dims, false, base, 1.0, 0, freqs, t.s)) catch |e| {
+                                _ = mlx.mlx_array_free(rp); // a failed op frees its own output
+                                return e;
+                            };
                             _ = mlx.mlx_array_free(slot.*);
                             slot.* = rp;
                         }
@@ -7385,9 +7962,15 @@ pub const Transformer = struct {
                 var head: mlx.mlx_array = undefined;
                 if (@backingInt(rung) >= @backingInt(ProjRung.sdpa)) {
                     var att = mlx.mlx_array_new();
-                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&att, q, k, v, attn_scale, "", none_mask, .{ .ctx = null }, false, self.s));
+                    mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&att, q, k, v, attn_scale, "", none_mask, .{ .ctx = null }, false, self.s)) catch |e| {
+                        _ = mlx.mlx_array_free(att); // a failed op frees its own output
+                        return e;
+                    };
                     var back = mlx.mlx_array_new();
-                    try mlx.check(mlx.mlx_transpose_axes(&back, att, &perm, 4, self.s));
+                    mlx.check(mlx.mlx_transpose_axes(&back, att, &perm, 4, self.s)) catch |e| {
+                        _ = mlx.mlx_array_free(back); // a failed op frees its own output
+                        return e;
+                    };
                     _ = mlx.mlx_array_free(att);
                     head = mlx.mlx_array_new();
                     try mlx.check(mlx.mlx_reshape(&head, back, &flat_shape, 3, self.s));
@@ -7400,7 +7983,10 @@ pub const Transformer = struct {
                         defer _ = mlx.mlx_array_free(s);
                         try mlx.check(mlx.mlx_sum(&s, t, false, self.s));
                         var h2 = mlx.mlx_array_new();
-                        try mlx.check(mlx.mlx_add(&h2, head, s, self.s));
+                        mlx.check(mlx.mlx_add(&h2, head, s, self.s)) catch |e| {
+                            _ = mlx.mlx_array_free(h2); // a failed op frees its own output
+                            return e;
+                        };
                         _ = mlx.mlx_array_free(head);
                         head = h2;
                     }
@@ -7411,7 +7997,10 @@ pub const Transformer = struct {
                 defer _ = mlx.mlx_array_free(op);
                 try mlx.check(mlx.mlx_matmul(&op, head, fa.o_w, self.s));
                 var s1 = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_add(&s1, acc, op, self.s));
+                mlx.check(mlx.mlx_add(&s1, acc, op, self.s)) catch |e| {
+                    _ = mlx.mlx_array_free(s1); // a failed op frees its own output
+                    return e;
+                };
                 _ = mlx.mlx_array_free(acc);
                 acc = s1;
 
@@ -7433,7 +8022,10 @@ pub const Transformer = struct {
                         try mlx.check(mlx.mlx_array_set(&mlp_out, ffn));
                     }
                     var s2 = mlx.mlx_array_new();
-                    try mlx.check(mlx.mlx_add(&s2, acc, mlp_out, self.s));
+                    mlx.check(mlx.mlx_add(&s2, acc, mlp_out, self.s)) catch |e| {
+                        _ = mlx.mlx_array_free(s2); // a failed op frees its own output
+                        return e;
+                    };
                     _ = mlx.mlx_array_free(acc);
                     acc = s2;
                 }
@@ -7447,6 +8039,7 @@ pub const Transformer = struct {
     /// norm keeps rms_norm_eps.
     inline fn rmsNormEps(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array, eps: f32) !mlx.mlx_array {
         var result = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(result); // owned until returned
         try mlx.check(mlx.mlx_fast_rms_norm(&result, x, w, eps, self.s));
         return result;
     }
@@ -7510,6 +8103,7 @@ pub const Transformer = struct {
 
     inline fn rmsNorm(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array) !mlx.mlx_array {
         var result = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(result); // owned until returned
         try mlx.check(mlx.mlx_fast_rms_norm(&result, x, w, self.config.rms_norm_eps, self.s));
         return result;
     }
@@ -7569,8 +8163,11 @@ pub const Transformer = struct {
 
         const out_shape = [_]c_int{ batch, seq_len, @intCast(self.config.hidden_size) };
         var reshaped = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_reshape(&reshaped, emb, &out_shape, 3, self.s));
-        return self.unrotateEmbedding(reshaped);
+        mlx.check(mlx.mlx_reshape(&reshaped, emb, &out_shape, 3, self.s)) catch |e| {
+            _ = mlx.mlx_array_free(reshaped);
+            return e;
+        };
+        return self.unrotateEmbedding(reshaped); // takes `reshaped` on every exit
     }
 
     pub fn embedding(self: *const Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
@@ -7579,6 +8176,7 @@ pub const Transformer = struct {
         if (self.emb_scale) |scale| {
             defer _ = mlx.mlx_array_free(raw);
             var scaled = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(scaled); // owned until returned
             try mlx.check(mlx.mlx_multiply(&scaled, raw, scale, self.s));
             return scaled;
         }
@@ -7622,7 +8220,10 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_array_free(extra_mask);
             try mlx.check(mlx.mlx_equal(&extra_mask, token_ids, extra_arr, s));
             var combined = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_logical_or(&combined, mask_2d, extra_mask, s));
+            mlx.check(mlx.mlx_logical_or(&combined, mask_2d, extra_mask, s)) catch |e| {
+                _ = mlx.mlx_array_free(combined); // a failed op frees its own output
+                return e;
+            };
             _ = mlx.mlx_array_free(mask_2d);
             mask_2d = combined;
         }
@@ -7707,7 +8308,10 @@ pub const Transformer = struct {
 
         // Reshape back to [B, seq_len, hidden]
         var result = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_reshape(&result, result_flat, h_shape.ptr, 3, s));
+        mlx.check(mlx.mlx_reshape(&result, result_flat, h_shape.ptr, 3, s)) catch |e| {
+            _ = mlx.mlx_array_free(result); // a failed op frees its own output
+            return e;
+        };
         _ = mlx.mlx_array_free(h);
         return result;
     }
@@ -7742,6 +8346,7 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_vector_array_free(out_vec);
             try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
             var result = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(result); // owned until returned
             try mlx.check(mlx.mlx_vector_array_get(&result, out_vec, 0));
             return result;
         }
@@ -7772,6 +8377,7 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(x_times);
         try mlx.check(mlx.mlx_multiply(&x_times, x, one_plus, self.s));
         var result = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(result); // owned until returned
         try mlx.check(mlx.mlx_multiply(&result, x_times, self.half, self.s));
         return result;
     }
@@ -7781,6 +8387,7 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(sig);
         try mlx.check(mlx.mlx_sigmoid(&sig, x, self.s));
         var result = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(result); // owned until returned
         try mlx.check(mlx.mlx_multiply(&result, x, sig, self.s));
         return result;
     }
@@ -7834,6 +8441,7 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_vector_array_free(out_vec);
             try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
             var result = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(result); // owned until returned
             try mlx.check(mlx.mlx_vector_array_get(&result, out_vec, 0));
             return result;
         }
@@ -7845,6 +8453,7 @@ pub const Transformer = struct {
         const activated = try self.mlpActivation(gate);
         defer _ = mlx.mlx_array_free(activated);
         var result = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(result); // owned until returned
         try mlx.check(mlx.mlx_multiply(&result, activated, up, self.s));
         return result;
     }
@@ -7866,7 +8475,10 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(col);
         try mlx.check(mlx.mlx_expand_dims(&col, picked, -1, self.s));
         var scaled = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_multiply(&scaled, out.*, col, self.s));
+        mlx.check(mlx.mlx_multiply(&scaled, out.*, col, self.s)) catch |e| {
+            _ = mlx.mlx_array_free(scaled); // a failed op frees its own output
+            return e;
+        };
         _ = mlx.mlx_array_free(out.*);
         out.* = scaled;
     }
@@ -7881,6 +8493,7 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_vector_array_free(out_vec);
             try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
             var result = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(result); // owned until returned
             try mlx.check(mlx.mlx_vector_array_get(&result, out_vec, 0));
             return result;
         }
@@ -7893,6 +8506,7 @@ pub const Transformer = struct {
         try mlx.check(mlx.mlx_tanh(&tanh_val, scaled, self.s));
         defer _ = mlx.mlx_array_free(tanh_val);
         var result = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(result); // owned until returned
         try mlx.check(mlx.mlx_multiply(&result, tanh_val, cap, self.s));
         return result;
     }
@@ -7902,7 +8516,10 @@ pub const Transformer = struct {
         const activated = try self.silu(gate);
         defer _ = mlx.mlx_array_free(activated);
         var result = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_multiply(&result, activated, x, self.s));
+        mlx.check(mlx.mlx_multiply(&result, activated, x, self.s)) catch |e| {
+            _ = mlx.mlx_array_free(result); // a failed op frees its own output
+            return e;
+        };
         return result;
     }
 
@@ -7978,6 +8595,17 @@ pub const Transformer = struct {
         };
         if (S.v) |b| return b;
         S.v = std.c.getenv("MLX_SERVE_MOE_SHORT_PREFILL_ONE_EVAL_OFF") != null;
+        return S.v.?;
+    }
+
+    /// MLX_SERVE_PREFILL_LAST_EVAL_SKIP_OFF=1 keeps the last layer's cadence eval on prefill chunks whose output nobody reads.
+    pub fn prefillLastEvalSkipOff() bool {
+        const S = struct {
+            var v: ?bool = null;
+        };
+        if (S.v) |b| return b;
+        S.v = std.c.getenv("MLX_SERVE_PREFILL_LAST_EVAL_SKIP_OFF") != null;
+        if (!S.v.?) log.info("[prefill-last-eval] the last layer's eval is skipped on prefill chunks whose output is unread (MLX_SERVE_PREFILL_LAST_EVAL_SKIP_OFF=1 keeps it)\n", .{});
         return S.v.?;
     }
 
@@ -8207,6 +8835,7 @@ pub const Transformer = struct {
     /// every forward until `endTopKPrefill` (right after the prompt's last forward) is the prompt's, a one-token tail after
     /// a prefix-cache hit included.
     pub fn beginTopKPrefill(self: *Transformer) void {
+        self.topk_epoch +%= 1;
         self.decode_forwards = 0;
         self.topk_prefilling = true;
     }
@@ -8218,6 +8847,27 @@ pub const Transformer = struct {
     /// k for the one-token forward that follows `decode_forwards` earlier ones of the same request.
     pub fn scheduleK(sch: TopKSchedule, decode_forwards: u32) u32 {
         return if (decode_forwards < sch.n) sch.k1 else sch.k2;
+    }
+
+    /// The schedule's count after a speculative round that kept its anchor and `accepted` drafts.
+    pub fn topkVerifyAdvanceCount(decode_forwards: u32, accepted: u32) u32 {
+        return decode_forwards +| (accepted +| 1);
+    }
+
+    /// True while a probe injects counts, so its forwards never print or use up the verify's line.
+    pub var topk_verify_advance_quiet: bool = false;
+
+    /// The off switch (MLX_SERVE_TOPK_SCHEDULE_VERIFY_ADVANCE_OFF=1): the verify never advances the count, as before.
+    pub fn topkVerifyAdvanceOff() bool {
+        const S = struct {
+            var v: ?bool = null;
+        };
+        if (S.v == null) {
+            const raw = std.c.getenv("MLX_SERVE_TOPK_SCHEDULE_VERIFY_ADVANCE_OFF");
+            S.v = raw != null and std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "1");
+            if (!S.v.?) log.info("[topk-verify-advance] a speculative round's kept tokens advance the top-k schedule (MLX_SERVE_TOPK_SCHEDULE_VERIFY_ADVANCE_OFF=1 keeps the verify at the first k)\n", .{});
+        }
+        return S.v.?;
     }
 
     /// The schedule's k for the forward about to run on `token_ids`, kept in `topk_active` for the routing.
@@ -8244,6 +8894,13 @@ pub const Transformer = struct {
         // it: the tokens it accepts are not known here, so under speculative decoding the switch to k2 comes late.
         if (seq > 1) {
             self.topk_active = scheduleK(sch, self.decode_forwards);
+            // The one-row switch line never prints under speculative decoding, so the verify logs its own
+            if (self.topk_active == sch.k2 and sch.k1 != sch.k2 and !topk_verify_advance_quiet) {
+                const S = struct {
+                    var logged = std.atomic.Value(bool).init(false);
+                };
+                if (!S.logged.swap(true, .acq_rel)) log.info("[topk-schedule] a {d}-row verify routed to {d} experts after {d} reply tokens\n", .{ seq, sch.k2, self.decode_forwards });
+            }
             return;
         }
         const k = scheduleK(sch, self.decode_forwards);
@@ -8511,6 +9168,7 @@ pub const Transformer = struct {
         if (sc.ctx == null) {
             // Dense bf16: gathered rows are the embeddings; no dequantize.
             var result = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(result); // owned until returned
             try mlx.check(mlx.mlx_astype(&result, tw, .bfloat16, self.s));
             return result;
         }
@@ -8524,6 +9182,7 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_take_axis(&tb, bi, ids, 0, self.s));
         }
         var result = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(result); // owned until returned
         const qp = self.quantParamsFor(w, sc);
         try mlx.check(mlx.mlx_dequantize(
             &result,
@@ -8582,7 +9241,10 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_array_free(wt);
             try mlx.check(mlx.mlx_transpose(&wt, self.ple_proj_w, self.s));
             var result = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_matmul(&result, h, wt, self.s));
+            mlx.check(mlx.mlx_matmul(&result, h, wt, self.s)) catch |e| {
+                _ = mlx.mlx_array_free(result);
+                return e;
+            };
             break :blk result;
         };
         defer _ = mlx.mlx_array_free(proj_raw);
@@ -8612,6 +9274,7 @@ pub const Transformer = struct {
         const inv_sqrt2 = bf16Scalar(1.0 / @sqrt(2.0), self.s);
         defer _ = mlx.mlx_array_free(inv_sqrt2);
         var result = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(result); // owned until returned
         try mlx.check(mlx.mlx_multiply(&result, combined, inv_sqrt2, self.s));
 
         _ = &total_ple;
@@ -8677,6 +9340,12 @@ pub const Transformer = struct {
         const attn_scale: f32 = cfg.attnScale();
 
         var h = try self.embedding(token_ids);
+        // `h` is this function's until it is freed after the final norm (the vision splice frees its
+        // input only once it succeeded; residualTail updates it in place and leaves it valid on every exit).
+        var h_owned = true;
+        errdefer if (h_owned) {
+            _ = mlx.mlx_array_free(h);
+        };
 
         // Splice vision embeddings at image_token_id positions (prefill only)
         h = try self.applyVisionEmbeddingsWith(ctx, h, token_ids);
@@ -9188,6 +9857,12 @@ pub const Transformer = struct {
             final_normed = try self.rmsNorm(h, self.final_norm);
         }
         _ = mlx.mlx_array_free(h);
+        h_owned = false;
+        // `final_normed` is this function's until it is returned or freed.
+        var fn_owned = true;
+        errdefer if (fn_owned) {
+            _ = mlx.mlx_array_free(final_normed);
+        };
 
         // Speculative-decoding capture: slice the LAST position of the
         // post-final-norm hidden into `capture_hidden` (refcount-shared).
@@ -9201,21 +9876,29 @@ pub const Transformer = struct {
             const stop = [_]c_int{ fn_shape[0], fn_shape[1], fn_shape[2] };
             const strides = [_]c_int{ 1, 1, 1 };
             var sliced = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(sliced); // freed on every exit (was freed only on success)
             try mlx.check(mlx.mlx_slice(&sliced, final_normed, &start, 3, &stop, 3, &strides, 3, self.s));
             _ = mlx.mlx_array_set(target, sliced);
-            _ = mlx.mlx_array_free(sliced);
+            if (builtin.is_test) test_capture_mark = mlx.op_count.load(.monotonic);
         }
         if (ctx.capture_hidden_all) |target_all| {
             _ = mlx.mlx_array_set(target_all, final_normed);
         }
 
-        if (self.embedding_mode or ctx.skip_lm_head) return final_normed;
+        if (self.embedding_mode or ctx.skip_lm_head) {
+            fn_owned = false;
+            return final_normed;
+        }
         var logits = try self.lmHeadProject(final_normed);
         _ = mlx.mlx_array_free(final_normed);
+        fn_owned = false;
 
         // Gemma 4: logit softcapping - tanh(logits / cap) * cap
         if (self.softcap_scalar != null) {
-            const capped = try self.applySoftcap(logits);
+            const capped = self.applySoftcap(logits) catch |e| {
+                _ = mlx.mlx_array_free(logits);
+                return e;
+            };
             _ = mlx.mlx_array_free(logits);
             logits = capped;
         }
@@ -9461,7 +10144,10 @@ pub const Transformer = struct {
                 const attn_normed = try self.rmsNormEps(o_out, lw.post_attn_norm, cfg.postNormEps());
                 defer _ = mlx.mlx_array_free(attn_normed);
                 var h_new = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_add(&h_new, h, attn_normed, self.s));
+                mlx.check(mlx.mlx_add(&h_new, h, attn_normed, self.s)) catch |e| {
+                    _ = mlx.mlx_array_free(h_new); // a failed op frees its own output
+                    return e;
+                };
                 _ = mlx.mlx_array_free(h);
                 h = h_new;
 
@@ -9473,12 +10159,18 @@ pub const Transformer = struct {
                 const mlp_normed = try self.rmsNormEps(down, lw.post_ff_norm.?, cfg.postNormEps());
                 defer _ = mlx.mlx_array_free(mlp_normed);
                 var h_next = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_add(&h_next, h, mlp_normed, self.s));
+                mlx.check(mlx.mlx_add(&h_next, h, mlp_normed, self.s)) catch |e| {
+                    _ = mlx.mlx_array_free(h_next); // a failed op frees its own output
+                    return e;
+                };
                 _ = mlx.mlx_array_free(h);
                 h = h_next;
             } else {
                 var h_new = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_add(&h_new, h, o_out, self.s));
+                mlx.check(mlx.mlx_add(&h_new, h, o_out, self.s)) catch |e| {
+                    _ = mlx.mlx_array_free(h_new); // a failed op frees its own output
+                    return e;
+                };
                 _ = mlx.mlx_array_free(h);
                 h = h_new;
 
@@ -9488,7 +10180,10 @@ pub const Transformer = struct {
                 defer _ = mlx.mlx_array_free(down);
 
                 var h_next = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_add(&h_next, h, down, self.s));
+                mlx.check(mlx.mlx_add(&h_next, h, down, self.s)) catch |e| {
+                    _ = mlx.mlx_array_free(h_next); // a failed op frees its own output
+                    return e;
+                };
                 _ = mlx.mlx_array_free(h);
                 h = h_next;
             }
@@ -9503,7 +10198,10 @@ pub const Transformer = struct {
             // Gemma 4: layer scalar.
             if (lw.layer_scalar) |ls| {
                 var h_scaled = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_multiply(&h_scaled, h, ls, self.s));
+                mlx.check(mlx.mlx_multiply(&h_scaled, h, ls, self.s)) catch |e| {
+                    _ = mlx.mlx_array_free(h_scaled); // a failed op frees its own output
+                    return e;
+                };
                 _ = mlx.mlx_array_free(h);
                 h = h_scaled;
             }
@@ -9626,7 +10324,10 @@ pub const Transformer = struct {
             const neg_inf = try scalarOf(-std.math.inf(f32), mlx.mlx_array_dtype(mask), self.s);
             defer _ = mlx.mlx_array_free(neg_inf);
             var narrowed = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_where(&narrowed, narrow, mask, neg_inf, self.s));
+            mlx.check(mlx.mlx_where(&narrowed, narrow, mask, neg_inf, self.s)) catch |e| {
+                _ = mlx.mlx_array_free(narrowed); // a failed op frees its own output
+                return e;
+            };
             _ = mlx.mlx_array_free(mask);
             mask = narrowed;
         }
@@ -9738,7 +10439,10 @@ pub const Transformer = struct {
         }
 
         var stacked = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_concatenate_axis(&stacked, padded_vec, 0, self.s));
+        mlx.check(mlx.mlx_concatenate_axis(&stacked, padded_vec, 0, self.s)) catch |e| {
+            _ = mlx.mlx_array_free(stacked); // a failed op frees its own output
+            return e;
+        };
         return stacked;
     }
 
@@ -9784,7 +10488,10 @@ pub const Transformer = struct {
         const neg_inf = try scalarOf(-std.math.inf(f32), dt, self.s);
         defer _ = mlx.mlx_array_free(neg_inf);
         var mask = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_where(&mask, valid, zero, neg_inf, self.s));
+        mlx.check(mlx.mlx_where(&mask, valid, zero, neg_inf, self.s)) catch |e| {
+            _ = mlx.mlx_array_free(mask); // a failed op frees its own output
+            return e;
+        };
         return mask;
     }
 
@@ -9935,7 +10642,8 @@ pub const Transformer = struct {
                 }
             }
 
-            if (is_prefill and (if (moe_short_no_cadence) moePrefillEvalCadenceApplies(seq_len) else prefillEvalCadenceApplies(seq_len)) and ((layer_idx + 1) % moe_eval_cadence == 0 or layer_idx + 1 == layerCap(cfg.num_hidden_layers))) {
+            const last_unread = layer_idx + 1 == layerCap(cfg.num_hidden_layers) and ctx.prefill_output_unused and !prefillLastEvalSkipOff();
+            if (is_prefill and !last_unread and (if (moe_short_no_cadence) moePrefillEvalCadenceApplies(seq_len) else prefillEvalCadenceApplies(seq_len)) and ((layer_idx + 1) % moe_eval_cadence == 0 or layer_idx + 1 == layerCap(cfg.num_hidden_layers))) {
                 try evalCadencePoint(h);
             } else if (ctx.pipeline_build > 0 and (layer_idx + 1) % ctx.pipeline_build == 0 and layer_idx + 1 < n_layers) {
                 const v = mlx.mlx_vector_array_new_value(h);
@@ -9964,7 +10672,10 @@ pub const Transformer = struct {
             const stop = [_]c_int{ fn_shape[0], fn_shape[1], fn_shape[2] };
             const strides = [_]c_int{ 1, 1, 1 };
             var sliced = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_slice(&sliced, final_normed, &start, 3, &stop, 3, &strides, 3, self.s));
+            mlx.check(mlx.mlx_slice(&sliced, final_normed, &start, 3, &stop, 3, &strides, 3, self.s)) catch |e| {
+                _ = mlx.mlx_array_free(sliced); // a failed op frees its own output
+                return e;
+            };
             _ = mlx.mlx_array_set(target, sliced);
             _ = mlx.mlx_array_free(sliced);
         }
@@ -9988,9 +10699,11 @@ pub const Transformer = struct {
         defer if (head_tail_yk.ctx != null) {
             _ = mlx.mlx_array_free(head_tail_yk);
         };
-        var logits = if (ctx.head_tail_want and self.headTailEligible(final_normed)) blk: {
+        // the shortlist's side result, left for this forward's head tail, is spent there or here on a failed exit
+        errdefer shortlistSelectSideClear();
+        var logits = if (ctx.head_tail_want and self.headTailEligible(final_normed, ctx.head_tail_answer)) blk: {
             headTailClear();
-            head_tail_yk = try self.qmatmul(final_normed, self.latin_head_w, self.latin_head_s, self.latin_head_b);
+            head_tail_yk = try self.keptScoresFor(final_normed, true);
             break :blk try self.latinHeadScatterFull(head_tail_yk);
         } else try self.lmHeadProject(final_normed);
         _ = mlx.mlx_array_free(final_normed);
@@ -10060,7 +10773,10 @@ pub const Transformer = struct {
             const attn_normed = try self.rmsNorm(attn_out, lw.post_attn_norm);
             defer _ = mlx.mlx_array_free(attn_normed);
             var h_new = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_add(&h_new, h, attn_normed, self.s));
+            mlx.check(mlx.mlx_add(&h_new, h, attn_normed, self.s)) catch |e| {
+                _ = mlx.mlx_array_free(h_new); // a failed op frees its own output
+                return e;
+            };
             _ = mlx.mlx_array_free(h);
             h = h_new;
             shared_in = try self.rmsNorm(h, lw.pre_ff_norm.?);
@@ -10122,13 +10838,19 @@ pub const Transformer = struct {
         const combined_normed = try self.rmsNorm(combined, lw.post_ff_norm.?);
         defer _ = mlx.mlx_array_free(combined_normed);
         var h_ff = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_add(&h_ff, h, combined_normed, self.s));
+        mlx.check(mlx.mlx_add(&h_ff, h, combined_normed, self.s)) catch |e| {
+            _ = mlx.mlx_array_free(h_ff); // a failed op frees its own output
+            return e;
+        };
         _ = mlx.mlx_array_free(h);
         h = h_ff;
 
         if (scalar) |ls| {
             var h_scaled = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_multiply(&h_scaled, h, ls, self.s));
+            mlx.check(mlx.mlx_multiply(&h_scaled, h, ls, self.s)) catch |e| {
+                _ = mlx.mlx_array_free(h_scaled); // a failed op frees its own output
+                return e;
+            };
             _ = mlx.mlx_array_free(h);
             h = h_scaled;
         }
@@ -10145,7 +10867,10 @@ pub const Transformer = struct {
             const stop = [_]c_int{ shape[0], shape[1], shape[2] };
             const strides = [_]c_int{ 1, 1, 1 };
             var sliced = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_slice(&sliced, src, &start, 3, &stop, 3, &strides, 3, s));
+            mlx.check(mlx.mlx_slice(&sliced, src, &start, 3, &stop, 3, &strides, 3, s)) catch |e| {
+                _ = mlx.mlx_array_free(sliced); // a failed op frees its own output
+                return e;
+            };
             _ = mlx.mlx_array_set(target, sliced);
             _ = mlx.mlx_array_free(sliced);
         }
@@ -10394,18 +11119,22 @@ pub const Transformer = struct {
             };
         };
         var kv_in_place_written = false;
-        if (batch == 1 and seq_len == 1 and (cur_hd == 256 or (cur_hd == 512 and !seamRouterNormOff())) and vnw_opt != null and self.rms_eps_arr.ctx != null and qkNormRopeFusedEnabled()) blk: {
+        // A block of 2 to VERIFY_BLOCK_MAX_ROWS rows (a draft verify) takes the same fused kernel unless
+        // MLX_SERVE_VERIFY_BLOCK_QK_OFF=1, and its in-place K/V write unless MLX_SERVE_VERIFY_BLOCK_KV_OFF=1.
+        if (verifyBlockQkRows(batch, seq_len) and (cur_hd == 256 or (cur_hd == 512 and !seamRouterNormOff())) and vnw_opt != null and self.rms_eps_arr.ctx != null and qkNormRopeFusedEnabled()) blk: {
             const family: usize = if (is_global) 1 else 0;
-            const angles = self.qkAngleRowsFor(family, rope_dims, rope_base, rope_freqs, offset, 1, 1.0, rope_scale) catch break :blk;
-            // The kernel also writes this step's K and V row into the cache when that is safe in place.
-            if (kvInPlaceEnabled()) kv_in_place: {
-                const t = ctx.cache.kvInPlaceTarget(layer, @intCast(cur_kv_h), @intCast(cur_hd), mlx.mlx_array_dtype(q_r)) orelse break :kv_in_place;
-                qkv_fused = (fusedQkNormRope256Impl(self.s, q_r, k_r, v_r, fa.q_norm, fa.k_norm, vnw_opt.?, angles, self.rms_eps_arr, h_count, @intCast(cur_kv_h), 1, rope_dims, t) catch null) orelse break :kv_in_place;
+            const angles = self.qkAngleRowsFor(family, rope_dims, rope_base, rope_freqs, offset, seq_len, 1.0, rope_scale) catch break :blk;
+            // The kernel also writes this step's K and V rows into the cache when that is safe in place.
+            if (kvInPlaceEnabled() and verifyBlockKvRows(seq_len)) kv_in_place: {
+                const t = ctx.cache.kvInPlaceTarget(layer, @intCast(cur_kv_h), @intCast(cur_hd), mlx.mlx_array_dtype(q_r), @intCast(seq_len)) orelse break :kv_in_place;
+                qkv_fused = (fusedQkNormRope256Impl(self.s, q_r, k_r, v_r, fa.q_norm, fa.k_norm, vnw_opt.?, angles, self.rms_eps_arr, h_count, @intCast(cur_kv_h), seq_len, rope_dims, t) catch null) orelse break :kv_in_place;
                 kv_in_place_written = true;
+                if (seq_len > 1) verifyBlockLogOnce(.kv, seq_len);
                 break :blk;
             }
-            qkv_fused = (fusedQkNormRope256(self.s, q_r, k_r, v_r, fa.q_norm, fa.k_norm, vnw_opt.?, angles, self.rms_eps_arr, h_count, @intCast(cur_kv_h), 1, rope_dims) catch null) orelse break :blk;
+            qkv_fused = (fusedQkNormRope256(self.s, q_r, k_r, v_r, fa.q_norm, fa.k_norm, vnw_opt.?, angles, self.rms_eps_arr, h_count, @intCast(cur_kv_h), seq_len, rope_dims) catch null) orelse break :blk;
         }
+        if (qkv_fused != null and seq_len > 1) verifyBlockLogOnce(.qk, seq_len);
 
         var q_rope = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(q_rope);
@@ -10455,7 +11184,7 @@ pub const Transformer = struct {
         // band it declines the trim and `sliding.kv_len == total_kv`.
         const sliding = slidingViewFor(cfg, offset + seq_len, seq_len);
         const max_kv: u32 = if (is_global) 0 else sliding.span;
-        var kv_view = if (kv_in_place_written) try ctx.cache.kvInPlaceCommit(layer, q_rope, self.s, max_kv) else try ctx.cache.update(layer, k_rope, v_t, self.s, max_kv);
+        var kv_view = if (kv_in_place_written) try ctx.cache.kvInPlaceCommit(layer, q_rope, self.s, max_kv, @intCast(seq_len)) else try ctx.cache.update(layer, k_rope, v_t, self.s, max_kv);
         if (kv_in_place_written) kvInPlaceLogOnce(cur_hd);
         defer kv_view.deinit();
         const full_k = kv_view.k;
@@ -10481,7 +11210,17 @@ pub const Transformer = struct {
         } else {
             const sw: c_int = @intCast(cfg.sliding_window);
             const total_kv: c_int = offset + seq_len;
-            if (is_prefill and (is_global or total_kv <= sw)) {
+            if (is_prefill and is_global and verifyBlockSdpaVector(batch, seq_len, @intCast(cur_hd), h_count, @intCast(cur_kv_h))) {
+                // A 2-to-8-row block on a head-dim-512 global layer: MLX's vector kernel with its in-kernel causal
+                // test (bottom-right, so the block's row i reads keys up to offset + i), as the one-row decode
+                // step uses, instead of the composed fallback MLX picks for d512 at more than one query.
+                // MLX_SERVE_VERIFY_BLOCK_SDPA_OFF=1 restores that.
+                _ = mlx.mlx_lesto_sdpa_d512_multi_query(true);
+                const rc = mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, false, self.s);
+                _ = mlx.mlx_lesto_sdpa_d512_multi_query(false);
+                try mlx.check(rc);
+                verifyBlockLogOnce(.sdpa, seq_len);
+            } else if (is_prefill and (is_global or total_kv <= sw)) {
                 // Global layers, or everything fits in the window (the sliding
                 // mask degenerates to plain causal - same kernel and reduction
                 // order the mlx-lm/mlx-vlm reference picks for short prompts,
@@ -10574,12 +11313,19 @@ pub const Transformer = struct {
             _ = mlx.mlx_array_set(&nb, b);
         }
         var sum = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_add(&sum, h.*, nb, self.s));
+        // A failed op frees its own output; `h` stays the caller's on every exit.
+        mlx.check(mlx.mlx_add(&sum, h.*, nb, self.s)) catch |e| {
+            _ = mlx.mlx_array_free(sum);
+            return e;
+        };
         _ = mlx.mlx_array_free(h.*);
         h.* = sum;
         if (scale.ctx != null) {
             var scaled = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_multiply(&scaled, h.*, scale, self.s));
+            mlx.check(mlx.mlx_multiply(&scaled, h.*, scale, self.s)) catch |e| {
+                _ = mlx.mlx_array_free(scaled);
+                return e;
+            };
             _ = mlx.mlx_array_free(h.*);
             h.* = scaled;
         }
@@ -10741,7 +11487,10 @@ pub const Transformer = struct {
             bi_arg = bi_k;
         }
         var out = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_quantized_matmul(&out, x_bc, w_k, sc_k, bi_arg, true, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), mode.cstr(), self.s));
+        mlx.check(mlx.mlx_quantized_matmul(&out, x_bc, w_k, sc_k, bi_arg, true, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), mode.cstr(), self.s)) catch |e| {
+            _ = mlx.mlx_array_free(out); // a failed op frees its own output
+            return e;
+        };
         return out; // [K, 1, out]
     }
 
@@ -11028,6 +11777,16 @@ pub const Transformer = struct {
     ) !bool {
         const B = batch * seq; // one kernel row per token
         if (!gatherQmvDownReduceRowsEligible(self.config.hidden_act, gate_qp, up_qp, down_qp, D)) return false;
+        // GELU-tanh (Gemma 4): the gate+up kernel reads the activation from the same table the
+        // chain's tableGateMul and the one-row moeAffine4Decode use, so only matmul reduction order differs.
+        const act_table: ?mlx.mlx_array = if (self.config.hidden_act == .gelu_approx) blk: {
+            // The table is per 16-bit dtype (an f32 stream would build a mislabelled one), and the
+            // rows kernels apply no per-expert gate or up scale.
+            const xd = mlx.mlx_array_dtype(expert_x);
+            if (xd != .bfloat16 and xd != .float16) return false;
+            if (mw.gate_expert_scale.ctx != null or mw.up_expert_scale.ctx != null) return false;
+            break :blk (try self.geluTanhTable(xd)) orelse return false;
+        } else null;
         var inds_u32 = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(inds_u32);
         {
@@ -11042,7 +11801,7 @@ pub const Transformer = struct {
         const dshape = [_]c_int{ B, D };
         try mlx.check(mlx.mlx_reshape(&x_2d, expert_x, &dshape, 2, self.s));
 
-        const act_3d = (try gatherQmvGateUpRows(
+        const act_3d = (try gatherQmvGateUpRowsAct(
             self.s,
             x_2d,
             mw.switch_gate_w,
@@ -11056,6 +11815,7 @@ pub const Transformer = struct {
             gate_qp.group_size,
             gate_qp.mode,
             if (mw.gate_expert_scale.ctx != null) mw.gate_expert_scale else null,
+            act_table,
         )) orelse return false;
         defer _ = mlx.mlx_array_free(act_3d);
         var scores_2d = mlx.mlx_array_new();
@@ -11078,6 +11838,10 @@ pub const Transformer = struct {
         const hidden = mlx.getShape(sum_2d)[1];
         const bsh_shape = [_]c_int{ batch, seq, hidden };
         try mlx.check(mlx.mlx_reshape(out, sum_2d, &bsh_shape, 3, self.s));
+        if (act_table != null and !moe_rows_gelu_logged) {
+            moe_rows_gelu_logged = true;
+            log.info("[moe-rows-gelu] the MoE rows arm serves gelu_approx for 2 to 8 rows (MLX_SERVE_MOE_ROWS_GELU_OFF=1 keeps the sorted chain)\n", .{});
+        }
         if (seq > 1 and !moe_verify_rows_logged) {
             moe_verify_rows_logged = true;
             log.info("[moe-rows] verify rows engaged: S={d} K={d}\n", .{ seq, K });
@@ -11113,7 +11877,10 @@ pub const Transformer = struct {
             var cur = expert_x_in;
             for (0..n) |_| {
                 var next = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_multiply(&next, cur, self.one, self.s));
+                mlx.check(mlx.mlx_multiply(&next, cur, self.one, self.s)) catch |e| {
+                    _ = mlx.mlx_array_free(next); // a failed op frees its own output
+                    return e;
+                };
                 if (probe_chain.ctx != null) _ = mlx.mlx_array_free(probe_chain);
                 probe_chain = next;
                 cur = next;
@@ -11133,7 +11900,10 @@ pub const Transformer = struct {
 
         const router_logits = if (router_override) |given| blk: {
             var owned = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_array_set(&owned, given));
+            mlx.check(mlx.mlx_array_set(&owned, given)) catch |e| {
+                _ = mlx.mlx_array_free(owned); // a failed op frees its own output
+                return e;
+            };
             break :blk owned;
         } else try self.moeRouterLogits(router_x, mw);
         defer _ = mlx.mlx_array_free(router_logits);
@@ -11176,7 +11946,10 @@ pub const Transformer = struct {
         // `[dtype-trace] residual widened` line.
         if (mlx.mlx_array_dtype(norm_scores) != mlx.mlx_array_dtype(expert_x)) {
             var cast_scores = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_astype(&cast_scores, norm_scores, mlx.mlx_array_dtype(expert_x), self.s));
+            mlx.check(mlx.mlx_astype(&cast_scores, norm_scores, mlx.mlx_array_dtype(expert_x), self.s)) catch |e| {
+                _ = mlx.mlx_array_free(cast_scores); // a failed op frees its own output
+                return e;
+            };
             _ = mlx.mlx_array_free(norm_scores);
             norm_scores = cast_scores;
         }
@@ -11202,7 +11975,10 @@ pub const Transformer = struct {
                 self.s,
             ));
             var scaled_scores = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_multiply(&scaled_scores, norm_scores, selected_scales, self.s));
+            mlx.check(mlx.mlx_multiply(&scaled_scores, norm_scores, selected_scales, self.s)) catch |e| {
+                _ = mlx.mlx_array_free(scaled_scores); // a failed op frees its own output
+                return e;
+            };
             _ = mlx.mlx_array_free(norm_scores);
             norm_scores = scaled_scores;
         }
@@ -11267,7 +12043,7 @@ pub const Transformer = struct {
             shared_fused = shared_down != null;
             cost_arm = 1;
         } else if (moeDecodeDispatchArm(B, S, K, false, (swigluClampLimit(&self.config) orelse 1) != 0) == .rows and
-            useGatherQmvDecode(self, gate_qp, up_qp) and mw.switch_gate_s.ctx != null and mw.switch_up_s.ctx != null and mw.switch_down_s.ctx != null and
+            useGatherQmvRows(self, gate_qp, up_qp) and mw.switch_gate_s.ctx != null and mw.switch_up_s.ctx != null and mw.switch_down_s.ctx != null and
             try self.moeDecodeGatherQmvRows(&down_out, expert_x, inds, norm_scores, &moe_reduced, mw, gate_qp, up_qp, down_qp, D, K, B, S))
         {
             moe_rows_fused_layers +%= 1;
@@ -11626,11 +12402,12 @@ pub const Transformer = struct {
         const neg_inf = bf16Scalar(-std.math.inf(f32), self.s);
         defer _ = mlx.mlx_array_free(neg_inf);
         var mask = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(mask); // freed on every exit (was freed only on success)
         try mlx.check(mlx.mlx_where(&mask, bool_upper, neg_inf, zero, self.s));
         const mask_shape = [_]c_int{ 1, 1, q_len, kv_len };
         var mask_4d = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(mask_4d); // owned until returned
         try mlx.check(mlx.mlx_reshape(&mask_4d, mask, &mask_shape, 4, self.s));
-        _ = mlx.mlx_array_free(mask);
         return mask_4d;
     }
 
@@ -11652,6 +12429,7 @@ pub const Transformer = struct {
         try mlx.check(mlx.mlx_where(&sw_mask, too_old, neg_inf, zero, self.s));
         const mask_shape = [_]c_int{ 1, 1, 1, kv_len };
         var mask_4d = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(mask_4d); // owned until returned
         try mlx.check(mlx.mlx_reshape(&mask_4d, sw_mask, &mask_shape, 4, self.s));
         return mask_4d;
     }
@@ -11694,6 +12472,7 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(sw_4d);
         try mlx.check(mlx.mlx_reshape(&sw_4d, sw_mask, &mask_shape, 4, self.s));
         var combined = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(combined); // owned until returned
         try mlx.check(mlx.mlx_add(&combined, causal, sw_4d, self.s));
         return combined;
     }
@@ -11906,6 +12685,7 @@ fn transposeBf16Weight(w: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     perm[ndim - 2] = @intCast(ndim - 1);
     perm[ndim - 1] = @intCast(ndim - 2);
     var w_t = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(w_t); // owned until returned
     try mlx.check(mlx.mlx_transpose_axes(&w_t, w, &perm, @intCast(ndim), s));
     return w_t;
 }
@@ -12215,7 +12995,10 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
                 const root_scalar = bf16Scalar(root_size, s);
                 defer _ = mlx.mlx_array_free(root_scalar);
                 var folded = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_multiply(&folded, rs, root_scalar, s));
+                mlx.check(mlx.mlx_multiply(&folded, rs, root_scalar, s)) catch |e| {
+                    _ = mlx.mlx_array_free(folded); // a failed op frees its own output
+                    return e;
+                };
                 try owned_bf16.append(allocator, folded);
                 lw.mlp.moe.router_scale = folded;
             }
@@ -12462,7 +13245,10 @@ pub fn encoderBandMask(allocator: std.mem.Allocator, seq_len: usize, window: u32
     const f32_mask = mlx.mlx_array_new_data(buf.ptr, &shape, 4, .float32);
     defer _ = mlx.mlx_array_free(f32_mask);
     var mask = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_astype(&mask, f32_mask, .bfloat16, s));
+    mlx.check(mlx.mlx_astype(&mask, f32_mask, .bfloat16, s)) catch |e| {
+        _ = mlx.mlx_array_free(mask); // a failed op frees its own output
+        return e;
+    };
     return mask;
 }
 
@@ -13186,6 +13972,9 @@ fn routerQmv8TopK(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx
         if (router_qmv8_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         router_qmv8_cfg = null;
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer if (router_qmv8_cfg == null) {
+            _ = mlx.mlx_fast_metal_kernel_config_free(config); // unpublished
+        };
         var out_shape: [4]c_int = undefined;
         for (xsh[0 .. xsh.len - 1], 0..) |d, i| out_shape[i] = d;
         out_shape[xsh.len - 1] = k;
@@ -13588,6 +14377,20 @@ fn useGatherQmvDecode(self: *const Transformer, gate_qp: QuantParams, up_qp: Qua
     if (self.config.hidden_act != .silu) return false;
     // The fused kernel bakes in silu(gate)*up, clamped at a whole-number limit; others stay composed.
     if (swigluClampLimit(&self.config) == null) return false;
+    if (!gatherQmvGateUpEnabled()) return false;
+    return gate_qp.bits == up_qp.bits and
+        gate_qp.group_size == up_qp.group_size and
+        gate_qp.mode == up_qp.mode;
+}
+
+/// The rows arm's gate (2 to 8 rows): `useGatherQmvDecode`, plus gelu_approx (Gemma 4), whose
+/// rows kernel reads the GELU-tanh table. One-row decode keeps `useGatherQmvDecode`.
+fn useGatherQmvRows(self: *const Transformer, gate_qp: QuantParams, up_qp: QuantParams) bool {
+    if (useGatherQmvDecode(self, gate_qp, up_qp)) return true;
+    if (self.config.hidden_act != .gelu_approx or !moeRowsActOk(self.config.hidden_act)) return false;
+    if (envFlagCached(&moe_gather_force_env, "MLX_SERVE_MOE_GATHER_DECODE")) return false;
+    // The rows kernels apply no clamp.
+    if ((swigluClampLimit(&self.config) orelse 1) != 0) return false;
     if (!gatherQmvGateUpEnabled()) return false;
     return gate_qp.bits == up_qp.bits and
         gate_qp.group_size == up_qp.group_size and
@@ -14143,10 +14946,10 @@ fn getQkNormRope256Kernel() !mlx.mlx_fast_metal_kernel {
 
 // The hd-256/512 kernel plus the KV cache write. k and v rows copy the value they just wrote to ok/ov
 // (the same thread reads its own device writes back) into the cache buffers kc/vc, laid out [1, H, cap, HD], at
-// buffer row kpos[0] of capacity kpos[1]. kc and vc are bound as inputs; MLX does not see the write, so the caller
+// buffer rows kpos[0] to kpos[0] + S - 1 of capacity kpos[1] (row seq of the block at kpos[0] + seq). kc and vc are bound as inputs; MLX does not see the write, so the caller
 // rebinds them through mlx_lesto_written_in_place (KVCache.kvInPlaceCommit), which registers them with MLX's command
 // encoder as written after this kernel.
-// The writer only touches row kpos[0], which no earlier reader of the buffers reads (holders read rows below the
+// The writer only touches rows from kpos[0], which no earlier reader of the buffers reads (holders read rows below the
 // offset they hold), so no barrier is needed BEFORE the kernel.
 
 /// Added to mlx-c in lib/mlxc-src/mlx/c/metal.cpp: `res` = arrays sharing `buffers`' memory,
@@ -14156,7 +14959,7 @@ const QK_NORM_ROPE_256_KV_IN_PLACE_SOURCE = QK_NORM_ROPE_256_SOURCE ++
     \\
     \\if (!is_q) {
     \\    device T* cache_rows = (device T*)(is_k ? kc : vc);
-    \\    uint crow = (head * uint(kpos[1]) + uint(kpos[0])) * HD;
+    \\    uint crow = (head * uint(kpos[1]) + uint(kpos[0]) + seq) * HD;
     \\    for (uint i = 0; i < 4; ++i) {
     \\        cache_rows[crow + base + i] = dst[base + i];
     \\    }
@@ -14233,7 +15036,7 @@ pub fn fusedQkNormRope256(
     return fusedQkNormRope256Impl(s, q_in, k_in, v_in, q_norm_w, k_norm_w, v_norm_w, angles, eps_arr, hq, hk, seq, rd, null);
 }
 
-/// `kv_write_target` non-null: also write the k and v rows into the cache buffers it names (S=1 with v only).
+/// `kv_write_target` non-null: also write the k and v rows into the cache buffers it names (S 1..VERIFY_BLOCK_MAX_ROWS, with v only).
 fn fusedQkNormRope256Impl(
     s: mlx.mlx_stream,
     q_in: mlx.mlx_array, // [1, S, HQ, 256] (view ok - ensure_row_contiguous materializes)
@@ -14279,7 +15082,11 @@ fn fusedQkNormRope256Impl(
     const key = Qk256CfgKey{ .hq = hq, .hk = hk, .hv = hv, .seq = seq, .rd = rd, .hd = hd, .normed = normed, .dtype = dt };
     if (qk256_fused_cfg == null or !std.meta.eql(qk256_fused_cfg_key, key)) {
         if (qk256_fused_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        qk256_fused_cfg = null; // never published after its free
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer if (qk256_fused_cfg == null) {
+            _ = mlx.mlx_fast_metal_kernel_config_free(config); // unpublished
+        };
         const oq_shape = [_]c_int{ 1, hq, seq, hd };
         const ok_shape = [_]c_int{ 1, hk, seq, hd };
         const ov_shape = [_]c_int{ 1, @max(hv, 1), if (with_v) seq else 1, hd };
@@ -14300,7 +15107,7 @@ fn fusedQkNormRope256Impl(
         qk256_fused_cfg_key = key;
     }
 
-    if (kv_write_target != null and (!with_v or seq != 1 or hv != hk)) return null;
+    if (kv_write_target != null and (!with_v or seq > VERIFY_BLOCK_MAX_ROWS or hv != hk)) return null;
     const kernel = if (kv_write_target != null) try getQkNormRope256KvInPlaceKernel() else try getQkNormRope256Kernel();
     var kv_in_place_pos = mlx.mlx_array{ .ctx = null };
     defer if (kv_in_place_pos.ctx != null) {
@@ -14503,7 +15310,10 @@ fn fuseRowGroup(parts: []const [3]*mlx.mlx_array, s: mlx.mlx_stream) !?FusedRows
             const hi = [_]c_int{ stop, cols };
             const st = [_]c_int{ 1, 1 };
             var view = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_slice(&view, src, &lo, 2, &hi, 2, &st, 2, s));
+            mlx.check(mlx.mlx_slice(&view, src, &lo, 2, &hi, 2, &st, 2, s)) catch |e| {
+                _ = mlx.mlx_array_free(view); // a failed op frees its own output
+                return e;
+            };
             p[which].* = view;
         }
         start = stop;
@@ -14859,6 +15669,9 @@ fn prefetchConfig(base: ResidualNormCfgKey, ash: []const c_int, dt: mlx.mlx_dtyp
     prefetch_cfg[k] = null;
     const f = base.flags;
     const config = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer if (prefetch_cfg[k] == null) {
+        _ = mlx.mlx_fast_metal_kernel_config_free(config); // unpublished
+    };
     for (0..3) |_| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, ash.ptr, ash.len, dt));
     const one_shape = [_]c_int{1};
     if ((f & 128) != 0) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, ash.ptr, ash.len, dt)) else try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &one_shape, 1, dt));
@@ -15007,7 +15820,11 @@ pub fn fusedResidualNorm(s: mlx.mlx_stream, a: mlx.mlx_array, b1: mlx.mlx_array,
         const k = residual_norm_cfg_next;
         residual_norm_cfg_next = (k + 1) % residual_norm_cfg.len;
         if (residual_norm_cfg[k]) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        residual_norm_cfg[k] = null; // never published after its free
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer if (residual_norm_cfg[k] == null) {
+            _ = mlx.mlx_fast_metal_kernel_config_free(config); // unpublished
+        };
         for (0..3) |_| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, ash.ptr, ash.len, dt));
         const one_shape = [_]c_int{1};
         if (post3) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, ash.ptr, ash.len, dt)) else try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &one_shape, 1, dt));
@@ -15068,9 +15885,18 @@ pub fn fusedResidualNorm(s: mlx.mlx_stream, a: mlx.mlx_array, b1: mlx.mlx_array,
         log.info("[layer-prefetch] seam{d} prefetch engaged: {d} lines of 128 B ({d} KB of {d} KB) by {d} extra threadgroups of {d} threads (MLX_SERVE_LAYER_PREFETCH_OFF=1 restores the plain seams)\n", .{ o.pf_seam, pf_lines, @divTrunc(pf_lines, 8), mlx.mlx_array_size(o.pf) * 4 / 1024, PREFETCH_TGS, tg });
     }
     var outs: [4]mlx.mlx_array = undefined;
+    // The outputs taken so far are freed when a later take fails (nothing after the loop can fail).
+    var taken: usize = 0;
+    errdefer for (outs[0..taken]) |taken_out| {
+        _ = mlx.mlx_array_free(taken_out);
+    };
     for (&outs, 0..) |*oa, k| {
         oa.* = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_vector_array_get(oa, outputs_vec, k));
+        mlx.check(mlx.mlx_vector_array_get(oa, outputs_vec, k)) catch |e| {
+            _ = mlx.mlx_array_free(oa.*);
+            return e;
+        };
+        taken += 1;
     }
     if (!post) {
         _ = mlx.mlx_array_free(outs[1]);
@@ -15237,7 +16063,11 @@ fn fusedAttnGate(
     const key = AttnGateCfgKey{ .shape = ShapeKey.from(ash), .nh = nh, .dtype = dt };
     if (attn_gate_cfg == null or !std.meta.eql(attn_gate_cfg_key, key)) {
         if (attn_gate_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        attn_gate_cfg = null; // never published after its free
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer if (attn_gate_cfg == null) {
+            _ = mlx.mlx_fast_metal_kernel_config_free(config); // unpublished
+        };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, ash.ptr, 3, dt));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, width, rows, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, tg, 1, 1));
@@ -15386,6 +16216,7 @@ fn all16BitPatterns(s: mlx.mlx_stream, dt: mlx.mlx_dtype, allocator: std.mem.All
     const v32 = mlx.mlx_array_new_data(buf.ptr, &sh, 1, .float32);
     defer _ = mlx.mlx_array_free(v32);
     var vals = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(vals); // owned until returned
     try mlx.check(mlx.mlx_astype(&vals, v32, dt, s));
     return vals;
 }
@@ -15474,7 +16305,11 @@ fn tableGateMul(s: mlx.mlx_stream, kind: GateMulKind, gate: mlx.mlx_array, up: m
     const key = GateMulCfgKey{ .shape = ShapeKey.from(gsh), .dtype = dt };
     if (gate_mul_cfg[k] == null or !std.meta.eql(gate_mul_cfg_key[k], key)) {
         if (gate_mul_cfg[k]) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        gate_mul_cfg[k] = null; // never published after its free
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer if (gate_mul_cfg[k] == null) {
+            _ = mlx.mlx_fast_metal_kernel_config_free(config); // unpublished
+        };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, gsh.ptr, gsh.len, dt));
         // Grid is rounded UP to the threadgroup so the launch is uniform; the
         // kernel's own bound check drops the tail threads.
@@ -15553,7 +16388,11 @@ fn stridedSigmoidGateMul(s: mlx.mlx_stream, x: mlx.mlx_array, g: mlx.mlx_array) 
     const key = SigGateCfgKey{ .shape = ShapeKey.from(xsh), .group = 1, .dtype = dt };
     if (strided_sig_gate_cfg == null or !std.meta.eql(strided_sig_gate_key, key)) {
         if (strided_sig_gate_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        strided_sig_gate_cfg = null; // never published after its free
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer if (strided_sig_gate_cfg == null) {
+            _ = mlx.mlx_fast_metal_kernel_config_free(config); // unpublished
+        };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, xsh.ptr, xsh.len, dt));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, @divTrunc(ni + tg - 1, tg) * tg, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, tg, 1, 1));
@@ -15609,7 +16448,11 @@ fn fusedSigmoidGateMul(s: mlx.mlx_stream, x: mlx.mlx_array, g: mlx.mlx_array, he
     const key = SigGateCfgKey{ .shape = ShapeKey.from(xsh), .group = group, .dtype = dt };
     if (sig_gate_cfg == null or !std.meta.eql(sig_gate_cfg_key, key)) {
         if (sig_gate_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        sig_gate_cfg = null; // never published after its free
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer if (sig_gate_cfg == null) {
+            _ = mlx.mlx_fast_metal_kernel_config_free(config); // unpublished
+        };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, xsh.ptr, xsh.len, dt));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, @divTrunc(ni + tg - 1, tg) * tg, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, tg, 1, 1));
@@ -15638,7 +16481,10 @@ fn fusedSigmoidGateMul(s: mlx.mlx_stream, x: mlx.mlx_array, g: mlx.mlx_array, he
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, sig_gate_kernel.?, inputs_vec, sig_gate_cfg.?, s));
     if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
     var y = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_vector_array_get(&y, outputs_vec, 0));
+    mlx.check(mlx.mlx_vector_array_get(&y, outputs_vec, 0)) catch |e| {
+        _ = mlx.mlx_array_free(y); // a failed op frees its own output
+        return e;
+    };
     if (!sig_gate_engaged) {
         sig_gate_engaged = true;
         log.info("[attn] fused sigmoid gate engaged: n={d} group={d}\n", .{ ni, group });
@@ -15719,7 +16565,11 @@ fn fusedGeluPleProj(s: mlx.mlx_stream, g: mlx.mlx_array, ple: mlx.mlx_array, tab
     const key = GeluPleCfgKey{ .hid = hid, .pd = pd, .dtype = dt };
     if (gelu_ple_cfg == null or !std.meta.eql(gelu_ple_cfg_key, key)) {
         if (gelu_ple_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        gelu_ple_cfg = null; // never published after its free
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer if (gelu_ple_cfg == null) {
+            _ = mlx.mlx_fast_metal_kernel_config_free(config); // unpublished
+        };
         const ysh = [_]c_int{ 1, 1, hid };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &ysh, 3, dt));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 64 * @divTrunc(hid, 8), 1, 1));
@@ -15749,7 +16599,10 @@ fn fusedGeluPleProj(s: mlx.mlx_stream, g: mlx.mlx_array, ple: mlx.mlx_array, tab
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, gelu_ple_kernel.?, inputs_vec, gelu_ple_cfg.?, s));
     if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
     var y = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_vector_array_get(&y, outputs_vec, 0));
+    mlx.check(mlx.mlx_vector_array_get(&y, outputs_vec, 0)) catch |e| {
+        _ = mlx.mlx_array_free(y); // a failed op frees its own output
+        return e;
+    };
     if (!gelu_ple_engaged) {
         gelu_ple_engaged = true;
         log.info("[ple] fused gelu*ple + projection engaged: hid={d} pd={d}\n", .{ hid, pd });
@@ -15795,7 +16648,11 @@ fn swigluJoined(s: mlx.mlx_stream, both: mlx.mlx_array) !?mlx.mlx_array {
     const key = GateMulCfgKey{ .shape = ShapeKey.from(sh), .dtype = dt };
     if (swiglu_joined_cfg == null or !std.meta.eql(swiglu_joined_key, key)) {
         if (swiglu_joined_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        swiglu_joined_cfg = null; // never published after its free
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer if (swiglu_joined_cfg == null) {
+            _ = mlx.mlx_fast_metal_kernel_config_free(config); // unpublished
+        };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &out_shape, sh.len, dt));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, @divTrunc(ni + 255, 256) * 256, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1));
@@ -15823,6 +16680,7 @@ fn swigluJoined(s: mlx.mlx_stream, both: mlx.mlx_array) !?mlx.mlx_array {
     defer _ = mlx.mlx_vector_array_free(o);
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o, swiglu_joined_kernel.?, v, swiglu_joined_cfg.?, s));
     var y = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(y); // owned until returned
     try mlx.check(mlx.mlx_vector_array_get(&y, o, 0));
     return y;
 }
@@ -16263,7 +17121,11 @@ pub fn gatherQmvGateUp(
     const key = GateUpCfgKey{ .topk = topk, .n = N, .k = K, .bits = bits, .gs = group_size, .dtype = xd, .limit = limit };
     if (gateup_cfg == null or !std.meta.eql(gateup_cfg_key, key)) {
         if (gateup_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        gateup_cfg = null; // never published after its free
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer if (gateup_cfg == null) {
+            _ = mlx.mlx_fast_metal_kernel_config_free(config); // unpublished
+        };
         const y_shape = [_]c_int{ topk, N };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &y_shape, 2, xd));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, N, topk));
@@ -16347,7 +17209,14 @@ fn gatherQmvGateUpRowsSource(comptime nvfp4: bool) [:0]const u8 {
         \\  T gt = {s};
         \\  T ut = T(acc_u);
         \\  T sig = sigtab[as_type<ushort>(gt)];
-        \\  y[(((size_t)row * (size_t)TOPK) + e) * (size_t)N + (size_t)n] = (gt * sig) * ut;
+        \\  size_t yi = (((size_t)row * (size_t)TOPK) + e) * (size_t)N + (size_t)n;
+        \\  // ACT_TABLE 0: sigtab holds sigmoid, SwiGLU, the expression unchanged. 1: the table holds the
+        \\  // activation itself (GELU-tanh for Gemma 4), act * up as the chain's tableGateMul applies it.
+        \\  if (ACT_TABLE != 0) {{
+        \\    y[yi] = sig * ut;
+        \\  }} else {{
+        \\    y[yi] = (gt * sig) * ut;
+        \\  }}
         \\}}
     , .{
         if (nvfp4) GQMV_GATEUP_BODY_NVFP4 else GQMV_GATEUP_BODY_AFFINE,
@@ -16358,7 +17227,7 @@ fn gatherQmvGateUpRowsSource(comptime nvfp4: bool) [:0]const u8 {
     });
 }
 
-const GQMV_GATEUP_ROWS_SOURCES = [2][:0]const u8{ gatherQmvGateUpRowsSource(false), gatherQmvGateUpRowsSource(true) };
+pub const GQMV_GATEUP_ROWS_SOURCES = [2][:0]const u8{ gatherQmvGateUpRowsSource(false), gatherQmvGateUpRowsSource(true) };
 const GQMV_GATEUP_ROWS_NAMES = [2][*:0]const u8{ "mlxserve_moe_gather_qmv_gateup_rows", "mlxserve_moe_gather_qmv_gateup_rows_nvfp4" };
 var gqmv_gateup_rows_kernels: [2]?mlx.mlx_fast_metal_kernel = @splat(null);
 
@@ -16387,7 +17256,591 @@ fn getGatherQmvGateUpRowsKernel(nvfp4: bool) !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
-const GateUpRowsCfgKey = struct { nrows: c_int, topk: c_int, n: c_int, k: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype, gscale: bool = false };
+// ── Per-device launch layouts for the two MoE rows kernels ──
+//
+// The MoE rows layout switch serves the rows kernels (gate/up and down+reduce, the 2-to-8-row verify and the batched
+// decode tick) in launch layouts an exhaustive search found faster on one device, keyed on the
+// GPU generation the way `downredLanesFor` keys LPR. Each output's arithmetic is the served one: the same lane
+// reads the same packs in the same order into the same four float accumulators, the same simd_sum (gate/up) or
+// LPR-lane xor tree (down), the same bf16 roundings and the same ascending bf16 slot sum. Only who computes an
+// output changes:
+//   gate/up  SG simdgroups a threadgroup (served 8) and AX the grid axis order (0 served: (n, combo); 1: (combo,
+//            n)). AX 0 runs the served kernel itself; AX 1 runs its source with the two axis lines swapped.
+//   down     SPS top-k slots a simdgroup, looping over them (served 1), TPT tiles a threadgroup (served 1) and AX
+//            (0 served: (tile, row); 1: (row, tile)). The served triple runs the served kernel; any other runs the
+//            scalar-body source, the served per-slot body inside a loop over a simdgroup's slots.
+// A device without an entry, an NVFP4 bank, or a shape a layout does not divide keeps the served layout, logged
+// once. The switch: unset, it is on exactly when the device has a table entry; MLX_SERVE_MOE_ROWS_LAYOUT=1
+// turns it on on any device (a device without an entry then serves only what the two overrides below name); any
+// other value (MLX_SERVE_MOE_ROWS_LAYOUT=0) turns it off. Off is the served dispatch call for call. The decision is logged
+// once at the first MoE model's load (`[moe-rows-layout] switch ...`, then the plan line when on). MLX_SERVE_MOE_ROWS_LAYOUT_GATEUP
+// and MLX_SERVE_MOE_ROWS_LAYOUT_DOWN override a device's entry in the search harness's parameter format (its `joint` lines),
+// for example
+// "dd=0 sg=32 nr=1 pf=0 ax=1" and "dd=0 sps=6 tpt=1 nr=1 pf=0 ax=1"; dd, nr and pf, when given, must be the served
+// 0, 1 and 0 (the served body has no other), and a refused value keeps the served layout for that kernel.
+// The local table (`lesto tune`, src/kernel_table.zig): a valid ~/.mlx-serve/tune/kernel-plans.json, or the file named by
+// MLX_SERVE_KERNEL_TABLE (`off` or empty skips it), replaces the device's entry as a whole, "served" for a kernel
+// included, and decides the switch when MLX_SERVE_MOE_ROWS_LAYOUT is unset (`on_local`, or `off_local` when both kernels are
+// "served"). A refused table is logged once and treated as absent. A plan from the local table applies only to the shape
+// it was tuned at; every other call gets the served layout. The decision is `moeRowsLayoutDecideSources`, pure over its inputs,
+// and is made once per process: a table written later applies at the next start.
+
+pub const MoeRowsLayoutGateUp = struct { sg: c_int, ax: u1 };
+/// The two down-reduce rows bodies: the scalar body (per-tile values and accumulators in scalars) and the array body (the
+/// same values in 1-element arrays). Both are bit-identical to the served kernel.
+pub const MoeRowsLayoutDownBody = enum(u1) { scalar = 0, array = 1 };
+pub const MoeRowsLayoutDown = struct { sps: c_int, tpt: c_int, ax: u1, body: MoeRowsLayoutDownBody = .scalar };
+pub const MoeRowsLayoutPlan = struct { gateup: ?MoeRowsLayoutGateUp, down: ?MoeRowsLayoutDown };
+pub const MOE_ROWS_LAYOUT_GATEUP_SERVED = MoeRowsLayoutGateUp{ .sg = 8, .ax = 0 };
+pub const MOE_ROWS_LAYOUT_DOWN_SERVED = MoeRowsLayoutDown{ .sps = 1, .tpt = 1, .ax = 0 };
+
+const MoeRowsLayoutEntry = struct { gen: u32, phone: bool, plan: MoeRowsLayoutPlan };
+/// Measured entries only. G16 (M4 class): tuned on one M4 Pro at Gemma 4 26B-A4B's shapes, 3 rows, top-6, with both
+/// kernels faster than the served layout in the worse of two routing regimes. Another G16 part (M4, M4 Max) shares the entry
+/// unmeasured.
+/// G15 (M3 class): `lesto tune` on one M3 Pro: down SPS 6, TPT 4, AX 0 with the array body, faster than the served kernel and
+/// tied closely with SPS 3 of the same layout; gate/up stays served (its gain is under the 2% floor). Another G15 part shares
+/// it unmeasured.
+const MOE_ROWS_LAYOUT_TABLE = [_]MoeRowsLayoutEntry{
+    .{ .gen = 16, .phone = false, .plan = .{ .gateup = .{ .sg = 32, .ax = 1 }, .down = .{ .sps = 6, .tpt = 1, .ax = 1 } } },
+    .{ .gen = 15, .phone = false, .plan = .{ .gateup = null, .down = .{ .sps = 6, .tpt = 4, .ax = 0, .body = .array } } },
+};
+
+pub fn moeRowsLayoutPlanFor(g: DeviceGen) MoeRowsLayoutPlan {
+    for (MOE_ROWS_LAYOUT_TABLE) |e| if (e.gen == g.gen and e.phone == g.phone) return e.plan;
+    return .{ .gateup = null, .down = null };
+}
+
+pub var moe_rows_layout_override: ?bool = null; // test seam
+pub var moe_rows_layout_plan_override: ?MoeRowsLayoutPlan = null; // test seam: the plan as given, no table and no env
+/// Test seams: the layout the last rows call of each kernel launched with.
+pub var moe_rows_layout_last_gateup: MoeRowsLayoutGateUp = MOE_ROWS_LAYOUT_GATEUP_SERVED;
+pub var moe_rows_layout_last_down: MoeRowsLayoutDown = MOE_ROWS_LAYOUT_DOWN_SERVED;
+/// Which down kernel the last rows call launched: the served one, the scalar body one or the array one.
+pub const MoeRowsLayoutDownKernel = enum { served, scalar_body, array };
+pub var moe_rows_layout_last_down_kernel: MoeRowsLayoutDownKernel = .served;
+var moe_rows_layout_gateup_logged: bool = false;
+var moe_rows_layout_down_logged: bool = false;
+var moe_rows_layout_gateup_fallback_logged: bool = false;
+/// Counters: how many times each rows dispatch rebuilt its kernel config (a layout, shape or seam change). The tune reads
+/// them to tell a layout change from a cache hit.
+pub var moe_rows_layout_cfg_rebuilds_gateup: u64 = 0;
+pub var moe_rows_layout_cfg_rebuilds_down: u64 = 0;
+/// Test seam: replaces the threadgroup thread count of the rows launches after the layout's fit check (gate/up: any
+/// layout, a positive multiple of 32 or the call returns `MoeRowsLayoutBadThreadOverride`; down: a non-served layout, and only a
+/// value above 1,024, which MLX refuses before running, because a smaller one changes the width without the grid or the
+/// kernel's tile indexing). Part of both config keys, so setting and clearing it each rebuild the config.
+pub var moe_rows_layout_tg_threads_override: ?c_int = null;
+var moe_rows_layout_down_fallback_logged: bool = false;
+
+/// How the switch was decided, from MLX_SERVE_MOE_ROWS_LAYOUT and whether the device has a table entry.
+pub const MoeRowsLayoutSwitch = enum {
+    on_default, // unset, the device has an entry
+    off_default, // unset, no entry: the served layouts
+    on_env, // MLX_SERVE_MOE_ROWS_LAYOUT=1
+    off_env, // any other value, MLX_SERVE_MOE_ROWS_LAYOUT=0 among them
+    on_local, // unset, a valid local table names a layout for at least one kernel
+    off_local, // unset, a valid local table names "served" for both kernels
+
+    pub fn on(self: MoeRowsLayoutSwitch) bool {
+        return self == .on_default or self == .on_env or self == .on_local;
+    }
+};
+
+/// Pure over its inputs: `raw` is MLX_SERVE_MOE_ROWS_LAYOUT's value (null when unset), `has_plan` whether the device's
+/// table entry names a layout for either kernel.
+pub fn moeRowsLayoutDecide(raw: ?[]const u8, has_plan: bool) MoeRowsLayoutSwitch {
+    const r = raw orelse return if (has_plan) .on_default else .off_default;
+    return if (std.mem.eql(u8, r, "1")) .on_env else .off_env;
+}
+
+pub fn moeRowsLayoutHasPlan(p: MoeRowsLayoutPlan) bool {
+    return p.gateup != null or p.down != null;
+}
+
+/// The once-logged switch line, without its newline.
+pub fn moeRowsLayoutSwitchLine(buf: []u8, sw: MoeRowsLayoutSwitch, g: DeviceGen) []const u8 {
+    return switch (sw) {
+        .on_default => std.fmt.bufPrint(buf, "[moe-rows-layout] switch on (default: gpu gen={d} phone={} has a table entry; MLX_SERVE_MOE_ROWS_LAYOUT=0 turns it off)", .{ g.gen, g.phone }),
+        .off_default => std.fmt.bufPrint(buf, "[moe-rows-layout] switch off (default: no table entry for gpu gen={d} phone={}): the served MoE rows layouts", .{ g.gen, g.phone }),
+        .on_env => std.fmt.bufPrint(buf, "[moe-rows-layout] switch on (MLX_SERVE_MOE_ROWS_LAYOUT=1, gpu gen={d} phone={})", .{ g.gen, g.phone }),
+        .off_env => std.fmt.bufPrint(buf, "[moe-rows-layout] switch off (MLX_SERVE_MOE_ROWS_LAYOUT set and not 1): the served MoE rows layouts", .{}),
+        // the two local lines name the table and its date, which only `moeRowsLayoutDecideSources` knows
+        .on_local, .off_local => buf[0..0],
+    } catch buf[0..0];
+}
+
+/// Where a kernel's plan came from (spec 3.7). `env_refused`: an override value that failed to parse.
+pub const MoeRowsLayoutSource = enum { env, env_refused, local, builtin, none };
+
+/// The local table as the decision sees it: not there (or not read), refused, or valid. A `"served"` kernel in a valid
+/// table is `null` in `plan`.
+pub const MoeRowsLayoutLocal = union(enum) {
+    absent,
+    refused: kernel_table.RefusalDetail,
+    valid: struct { plan: MoeRowsLayoutPlan, tuned_at: []const u8 },
+};
+
+/// Everything the decision reads, as values: the environment, the device, the table read.
+pub const MoeRowsLayoutInputs = struct {
+    moe_rows_layout_raw: ?[]const u8,
+    gateup_env: ?[]const u8,
+    down_env: ?[]const u8,
+    table_switch: kernel_table.TableSwitch,
+    /// The table path as it prints (`~` for a path under HOME); empty when there is none.
+    table_path: []const u8,
+    local: MoeRowsLayoutLocal,
+    builtin: MoeRowsLayoutPlan,
+    gen: DeviceGen,
+};
+
+pub const MOE_ROWS_LAYOUT_MAX_LINES = 5;
+pub const MOE_ROWS_LAYOUT_LINE_LEN = 480;
+
+pub const MoeRowsLayoutDecision = struct {
+    sw: MoeRowsLayoutSwitch,
+    plan: MoeRowsLayoutPlan,
+    gateup_src: MoeRowsLayoutSource,
+    down_src: MoeRowsLayoutSource,
+    lines: [MOE_ROWS_LAYOUT_MAX_LINES][MOE_ROWS_LAYOUT_LINE_LEN]u8,
+    line_lens: [MOE_ROWS_LAYOUT_MAX_LINES]usize,
+    n_lines: usize,
+
+    pub fn line(self: *const MoeRowsLayoutDecision, i: usize) []const u8 {
+        return self.lines[i][0..self.line_lens[i]];
+    }
+
+    fn push(self: *MoeRowsLayoutDecision, comptime fmt: []const u8, args: anytype) void {
+        if (self.n_lines >= MOE_ROWS_LAYOUT_MAX_LINES) return;
+        var w = std.Io.Writer.fixed(&self.lines[self.n_lines]);
+        w.print(fmt, args) catch {}; // a line that does not fit is cut at the buffer's end
+        const len = w.buffered().len;
+        // A path, a date or a key value from the table file must not split one diagnostic into several log entries.
+        for (self.lines[self.n_lines][0..len]) |*ch| {
+            if (ch.* < 0x20 or ch.* == 0x7f) ch.* = '?';
+        }
+        self.line_lens[self.n_lines] = len;
+        self.n_lines += 1;
+    }
+};
+
+/// A path as the log prints it: at most the last 96 bytes, behind `...` when cut, so the words after it in a line (the
+/// refusal reason above all) always fit the line buffer.
+const MoeRowsLayoutShownPath = struct {
+    cut: bool,
+    text: []const u8,
+
+    pub fn format(self: MoeRowsLayoutShownPath, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (self.cut) try w.writeAll("...");
+        try w.writeAll(self.text);
+    }
+};
+
+fn moeRowsLayoutShownPath(p: []const u8) MoeRowsLayoutShownPath {
+    const max = 96;
+    return if (p.len > max) .{ .cut = true, .text = p[p.len - max ..] } else .{ .cut = false, .text = p };
+}
+
+fn moeRowsLayoutSourceWord(s: MoeRowsLayoutSource) []const u8 {
+    return switch (s) {
+        .env => "env",
+        .env_refused => "refused",
+        .local => "local",
+        .builtin => "table", // the built-in table's word, as before the local table existed
+        .none => "none",
+    };
+}
+
+/// The whole decision, pure (spec 3.7 and 3.8): which layouts serve, where each came from, and the lines to log in order
+/// (the table refusal or skip line, the switch line, the two override-refused lines, the plan line when on).
+pub fn moeRowsLayoutDecideSources(in: MoeRowsLayoutInputs) MoeRowsLayoutDecision {
+    var d: MoeRowsLayoutDecision = .{
+        .sw = .off_env,
+        .plan = .{ .gateup = null, .down = null },
+        .gateup_src = .none,
+        .down_src = .none,
+        .lines = undefined,
+        .line_lens = @splat(0),
+        .n_lines = 0,
+    };
+    // 1: MLX_SERVE_MOE_ROWS_LAYOUT set to anything but 1 reads neither table.
+    const reads_tables = if (in.moe_rows_layout_raw) |r| std.mem.eql(u8, r, "1") else true;
+
+    // 3 and 4: the local table when valid, as a whole, else the built-in entry.
+    var base = in.builtin;
+    var gu_src: MoeRowsLayoutSource = if (in.builtin.gateup != null) .builtin else .none;
+    var dn_src: MoeRowsLayoutSource = if (in.builtin.down != null) .builtin else .none;
+    var local_tuned: ?[]const u8 = null;
+    if (reads_tables) {
+        switch (in.table_switch) {
+            .off, .empty => d.push("[moe-rows-layout] local table skipped (MLX_SERVE_KERNEL_TABLE=off)", .{}),
+            .unset, .path => switch (in.local) {
+                .absent => {},
+                .refused => |det| {
+                    var tb: [256]u8 = undefined;
+                    d.push("[moe-rows-layout] local table {f} refused ({s}); using the built-in table or the served layouts", .{ moeRowsLayoutShownPath(in.table_path), det.text(&tb) });
+                },
+                .valid => |v| {
+                    base = v.plan;
+                    gu_src = .local;
+                    dn_src = .local;
+                    local_tuned = v.tuned_at;
+                },
+            },
+        }
+    }
+
+    // The switch.
+    const has_plan = moeRowsLayoutHasPlan(base);
+    if (in.moe_rows_layout_raw == null and local_tuned != null) {
+        d.sw = if (has_plan) .on_local else .off_local;
+    } else {
+        d.sw = moeRowsLayoutDecide(in.moe_rows_layout_raw, has_plan);
+    }
+    const date = if (local_tuned) |t| t[0..@min(t.len, 10)] else "";
+    switch (d.sw) {
+        .on_local => d.push("[moe-rows-layout] switch on (local table {f}, tuned {s})", .{ moeRowsLayoutShownPath(in.table_path), date }),
+        .off_local => d.push("[moe-rows-layout] switch off (local table {f}, tuned {s}: no confirmed gain on this Mac): the served MoE rows layouts", .{ moeRowsLayoutShownPath(in.table_path), date }),
+        else => {
+            var sb: [256]u8 = undefined;
+            d.push("{s}", .{moeRowsLayoutSwitchLine(&sb, d.sw, in.gen)});
+        },
+    }
+    if (!d.sw.on()) {
+        if (d.sw == .off_local) {
+            d.gateup_src = .local;
+            d.down_src = .local;
+        }
+        return d;
+    }
+
+    // 2: the per-kernel overrides, only with the switch on; a refused value gives that kernel the served layout.
+    var p = base;
+    if (in.gateup_env) |raw| {
+        if (moeRowsLayoutParseGateUp(raw)) |v| {
+            p.gateup = v;
+            gu_src = .env;
+        } else |e| {
+            p.gateup = null;
+            gu_src = .env_refused;
+            d.push("[moe-rows-layout] MLX_SERVE_MOE_ROWS_LAYOUT_GATEUP refused ({s}): the served gate/up layout serves", .{@errorName(e)});
+        }
+    }
+    if (in.down_env) |raw| {
+        if (moeRowsLayoutParseDown(raw)) |v| {
+            p.down = v;
+            dn_src = .env;
+        } else |e| {
+            p.down = null;
+            dn_src = .env_refused;
+            d.push("[moe-rows-layout] MLX_SERVE_MOE_ROWS_LAYOUT_DOWN refused ({s}): the served down layout serves", .{@errorName(e)});
+        }
+    }
+    const gu = p.gateup orelse MOE_ROWS_LAYOUT_GATEUP_SERVED;
+    const dn = p.down orelse MOE_ROWS_LAYOUT_DOWN_SERVED;
+    d.push("[moe-rows-layout] MoE rows layouts on: gpu gen={d} phone={} gateup({s}) sg={d} ax={d} down({s}) sps={d} tpt={d} ax={d} body={d}", .{
+        in.gen.gen, in.gen.phone, moeRowsLayoutSourceWord(gu_src), gu.sg, gu.ax, moeRowsLayoutSourceWord(dn_src), dn.sps, dn.tpt, dn.ax, @intFromEnum(dn.body),
+    });
+    d.plan = p;
+    d.gateup_src = gu_src;
+    d.down_src = dn_src;
+    return d;
+}
+
+/// The switch and its plan, resolved once for the process: the first caller takes the mutex, reads the environment
+/// and the device, logs the switch line (and the plan line when on), stores both and only then publishes them through
+/// `moe_rows_layout_ready` (release); every later caller reads them after an acquire load. So two MoE models loading at once, or a
+/// load racing the first verify, resolve and log once and never read a half-written state.
+const MoeRowsLayoutResolved = struct { on: bool, plan: MoeRowsLayoutPlan, gateup_src: MoeRowsLayoutSource, down_src: MoeRowsLayoutSource };
+var moe_rows_layout_mu: os_mutex.Mutex = .{};
+var moe_rows_layout_ready = std.atomic.Value(bool).init(false);
+var moe_rows_layout_state: MoeRowsLayoutResolved = .{ .on = false, .plan = .{ .gateup = null, .down = null }, .gateup_src = .none, .down_src = .none };
+
+/// Test seam: the inputs `moeRowsLayoutResolved` decides from, in place of the environment, the device and the table file.
+pub var moe_rows_layout_inputs_override: ?MoeRowsLayoutInputs = null;
+
+/// The environment values the decision reads, as values. `moeRowsLayoutEnvFromProcess` is the only reader of these variables.
+pub const MoeRowsLayoutEnv = struct {
+    home: ?[]const u8,
+    tune_root: ?[]const u8,
+    table_switch: kernel_table.TableSwitch,
+    moe_rows_layout_raw: ?[]const u8,
+    gateup_env: ?[]const u8,
+    down_env: ?[]const u8,
+};
+
+fn moeRowsLayoutGetenv(name: [*:0]const u8) ?[]const u8 {
+    const v = std.c.getenv(name) orelse return null;
+    return std.mem.sliceTo(v, 0);
+}
+
+pub fn moeRowsLayoutEnvFromProcess(alloc: std.mem.Allocator) !MoeRowsLayoutEnv {
+    const home = moeRowsLayoutGetenv("HOME");
+    return .{
+        .home = home,
+        .tune_root = try kernel_table.tuneRoot(alloc, home),
+        .table_switch = kernel_table.tableSwitchFromEnv(moeRowsLayoutGetenv("MLX_SERVE_KERNEL_TABLE")),
+        .moe_rows_layout_raw = moeRowsLayoutGetenv("MLX_SERVE_MOE_ROWS_LAYOUT"),
+        .gateup_env = moeRowsLayoutGetenv("MLX_SERVE_MOE_ROWS_LAYOUT_GATEUP"),
+        .down_env = moeRowsLayoutGetenv("MLX_SERVE_MOE_ROWS_LAYOUT_DOWN"),
+    };
+}
+
+/// Builds the decision's inputs from `env`, the device and (when the switch can reach step 3 of spec 3.7) the table file.
+/// It reads no environment variable itself. Allocations go to `alloc` (an arena the caller drops after deciding). A table
+/// that cannot be keyed to this Mac (a failed sysctl) is read as absent.
+pub fn moeRowsLayoutGatherInputs(alloc: std.mem.Allocator, io: std.Io, env: MoeRowsLayoutEnv) !MoeRowsLayoutInputs {
+    const g = deviceGeneration();
+    var in: MoeRowsLayoutInputs = .{
+        .moe_rows_layout_raw = env.moe_rows_layout_raw,
+        .gateup_env = env.gateup_env,
+        .down_env = env.down_env,
+        .table_switch = env.table_switch,
+        .table_path = "",
+        .local = .absent,
+        .builtin = moeRowsLayoutPlanFor(g),
+        .gen = g,
+    };
+    const reads_tables = if (env.moe_rows_layout_raw) |r| std.mem.eql(u8, r, "1") else true;
+    if (!reads_tables) return in;
+    switch (env.table_switch) {
+        .off, .empty => return in,
+        .unset, .path => {},
+    }
+    const path = (try kernel_table.tablePath(alloc, env.tune_root, env.table_switch)) orelse return in;
+    var pbuf: [std.fs.max_path_bytes + 2]u8 = undefined;
+    in.table_path = try alloc.dupe(u8, kernel_table.printablePath(&pbuf, env.home, path));
+    const mac = kernel_table.readMacKey(alloc) catch return in;
+    const res = kernel_table.readTable(alloc, io, path, mac);
+    switch (res) {
+        .absent => {},
+        .refused => |det| in.local = .{ .refused = det },
+        .key_mismatch => |k| in.local = .{ .refused = k.detail },
+        .valid => |parsed| {
+            const t = parsed.value;
+            in.local = .{ .valid = .{
+                .plan = .{
+                    .gateup = switch (t.plan.gateup) {
+                        .layout => |l| l,
+                        else => null,
+                    },
+                    .down = switch (t.plan.down) {
+                        .layout => |l| l,
+                        else => null,
+                    },
+                },
+                .tuned_at = t.info.tuned_at,
+            } };
+        },
+    }
+    return in;
+}
+
+fn moeRowsLayoutResolved() MoeRowsLayoutResolved {
+    if (moe_rows_layout_ready.load(.acquire)) return moe_rows_layout_state;
+    moe_rows_layout_mu.lock();
+    defer moe_rows_layout_mu.unlock();
+    if (moe_rows_layout_ready.load(.acquire)) return moe_rows_layout_state;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const in: MoeRowsLayoutInputs = moe_rows_layout_inputs_override orelse blk: {
+        const env = moeRowsLayoutEnvFromProcess(a) catch MoeRowsLayoutEnv{ .home = null, .tune_root = null, .table_switch = .unset, .moe_rows_layout_raw = moeRowsLayoutGetenv("MLX_SERVE_MOE_ROWS_LAYOUT"), .gateup_env = moeRowsLayoutGetenv("MLX_SERVE_MOE_ROWS_LAYOUT_GATEUP"), .down_env = moeRowsLayoutGetenv("MLX_SERVE_MOE_ROWS_LAYOUT_DOWN") };
+        const io = std.Io.Threaded.global_single_threaded.io();
+        break :blk moeRowsLayoutGatherInputs(a, io, env) catch MoeRowsLayoutInputs{
+            .moe_rows_layout_raw = env.moe_rows_layout_raw,
+            .gateup_env = env.gateup_env,
+            .down_env = env.down_env,
+            .table_switch = env.table_switch,
+            .table_path = "",
+            .local = .absent,
+            .builtin = moeRowsLayoutPlanFor(deviceGeneration()),
+            .gen = deviceGeneration(),
+        };
+    };
+    const d = moeRowsLayoutDecideSources(in);
+    for (0..d.n_lines) |i| log.info("{s}\n", .{d.line(i)});
+    moe_rows_layout_state = .{ .on = d.sw.on(), .plan = d.plan, .gateup_src = d.gateup_src, .down_src = d.down_src };
+    moe_rows_layout_ready.store(true, .release);
+    return moe_rows_layout_state;
+}
+
+/// Test seam: forget the resolved switch, so the next call reads the environment and the device again. Only for a
+/// test that holds no other thread in the engine.
+fn moeRowsLayoutTestForget() void {
+    moe_rows_layout_mu.lock();
+    defer moe_rows_layout_mu.unlock();
+    moe_rows_layout_ready.store(false, .release);
+}
+
+fn moeRowsLayoutEnabled() bool {
+    if (moe_rows_layout_override) |v| return v;
+    return moeRowsLayoutResolved().on;
+}
+
+/// Called at a MoE model's load: resolves the switch and its plan, so both lines print at start instead of at the
+/// first verify. Calls after the first change nothing.
+pub fn moeRowsLayoutAnnounce() void {
+    _ = moeRowsLayoutResolved();
+}
+
+pub const MoeRowsLayoutParseError = error{ MoeRowsLayoutUnknownKey, MoeRowsLayoutBadValue, MoeRowsLayoutMissingKey, MoeRowsLayoutNotServedBody };
+
+fn moeRowsLayoutParsePairs(text: []const u8, keys: []const []const u8, vals: []?i64) MoeRowsLayoutParseError!void {
+    for (vals) |*v| v.* = null;
+    var it = std.mem.tokenizeAny(u8, text, " \t,");
+    while (it.next()) |tok| {
+        const eq = std.mem.indexOfScalar(u8, tok, '=') orelse return error.MoeRowsLayoutBadValue;
+        const k = tok[0..eq];
+        const v = std.fmt.parseInt(i64, tok[eq + 1 ..], 10) catch return error.MoeRowsLayoutBadValue;
+        var found = false;
+        for (keys, 0..) |name, i| {
+            if (std.mem.eql(u8, name, k)) {
+                if (vals[i] != null) return error.MoeRowsLayoutBadValue;
+                vals[i] = v;
+                found = true;
+            }
+        }
+        if (!found) return error.MoeRowsLayoutUnknownKey;
+    }
+}
+
+/// The range check the parsers and the local table's reader share: SG 1 to 32, AX 0 or 1.
+pub fn moeRowsLayoutCheckGateUp(sg: i64, ax: i64) MoeRowsLayoutParseError!void {
+    if (sg < 1 or sg > 32 or (ax != 0 and ax != 1)) return error.MoeRowsLayoutBadValue;
+}
+
+/// The same for the down kernel: SPS and TPT 1 to 32, AX 0 or 1.
+pub fn moeRowsLayoutCheckDown(sps: i64, tpt: i64, ax: i64) MoeRowsLayoutParseError!void {
+    if (sps < 1 or sps > 32 or tpt < 1 or tpt > 32 or (ax != 0 and ax != 1)) return error.MoeRowsLayoutBadValue;
+}
+
+/// The down body value: 0 scalar, 1 array.
+pub fn moeRowsLayoutCheckDownBody(body: i64) MoeRowsLayoutParseError!MoeRowsLayoutDownBody {
+    return switch (body) {
+        0 => .scalar,
+        1 => .array,
+        else => error.MoeRowsLayoutBadValue,
+    };
+}
+
+/// The search harness's gate/up parameter line: "dd=0 sg=<n> nr=1 pf=0 ax=<0|1>" (dd, nr, pf optional).
+pub fn moeRowsLayoutParseGateUp(text: []const u8) MoeRowsLayoutParseError!MoeRowsLayoutGateUp {
+    const keys = [_][]const u8{ "dd", "sg", "nr", "pf", "ax" };
+    var v: [keys.len]?i64 = undefined;
+    try moeRowsLayoutParsePairs(text, &keys, &v);
+    if ((v[0] orelse 0) != 0 or (v[2] orelse 1) != 1 or (v[3] orelse 0) != 0) return error.MoeRowsLayoutNotServedBody;
+    const sg = v[1] orelse return error.MoeRowsLayoutMissingKey;
+    const ax = v[4] orelse return error.MoeRowsLayoutMissingKey;
+    try moeRowsLayoutCheckGateUp(sg, ax);
+    return .{ .sg = @intCast(sg), .ax = @intCast(ax) };
+}
+
+/// The search harness's down parameter line: "dd=0 sps=<n> tpt=<n> nr=1 pf=0 ax=<0|1> [body=<0|1>]" (dd, nr, pf, body
+/// optional; no body means the scalar body).
+pub fn moeRowsLayoutParseDown(text: []const u8) MoeRowsLayoutParseError!MoeRowsLayoutDown {
+    const keys = [_][]const u8{ "dd", "sps", "tpt", "nr", "pf", "ax", "body" };
+    var v: [keys.len]?i64 = undefined;
+    try moeRowsLayoutParsePairs(text, &keys, &v);
+    if ((v[0] orelse 0) != 0 or (v[3] orelse 1) != 1 or (v[4] orelse 0) != 0) return error.MoeRowsLayoutNotServedBody;
+    const sps = v[1] orelse return error.MoeRowsLayoutMissingKey;
+    const tpt = v[2] orelse return error.MoeRowsLayoutMissingKey;
+    const ax = v[5] orelse return error.MoeRowsLayoutMissingKey;
+    try moeRowsLayoutCheckDown(sps, tpt, ax);
+    const body = try moeRowsLayoutCheckDownBody(v[6] orelse 0);
+    return .{ .sps = @intCast(sps), .tpt = @intCast(tpt), .ax = @intCast(ax), .body = body };
+}
+
+/// The plan the switch serves when on (resolved once, `moeRowsLayoutResolved`).
+fn moeRowsLayoutPlan() MoeRowsLayoutPlan {
+    if (moe_rows_layout_plan_override) |p| return p;
+    return moeRowsLayoutResolved().plan;
+}
+
+/// Where each kernel's plan came from, for the shape restriction. A plan given through the test seam counts as built-in.
+fn moeRowsLayoutGateUpSource() MoeRowsLayoutSource {
+    if (moe_rows_layout_plan_override != null) return .builtin;
+    return moeRowsLayoutResolved().gateup_src;
+}
+
+fn moeRowsLayoutDownSource() MoeRowsLayoutSource {
+    if (moe_rows_layout_plan_override != null) return .builtin;
+    return moeRowsLayoutResolved().down_src;
+}
+
+/// A plan that came from the local table applies only to the shape it was tuned at (hidden 2,816, expert width 704, 4-bit
+/// affine at group 64, bf16): gate/up reads N 704 and K 2,816, down N 2,816 and K 704.
+fn moeRowsLayoutLocalShapeOk(N: c_int, K: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype, gateup: bool) bool {
+    const want_n: c_int = if (gateup) @intCast(kernel_table.TUNED_SHAPE.inter) else @intCast(kernel_table.TUNED_SHAPE.hidden);
+    const want_k: c_int = if (gateup) @intCast(kernel_table.TUNED_SHAPE.hidden) else @intCast(kernel_table.TUNED_SHAPE.inter);
+    return N == want_n and K == want_k and bits == kernel_table.TUNED_SHAPE.bits and gs == kernel_table.TUNED_SHAPE.group and dtype == .bfloat16;
+}
+
+/// The gate/up rows layout for N outputs a row: the plan's when the switch is on, the bank affine and N divides
+/// into its threadgroups; the served one otherwise.
+fn moeRowsLayoutGateUp(nvfp4: bool, N: c_int, K: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype) MoeRowsLayoutGateUp {
+    if (!moeRowsLayoutEnabled()) return MOE_ROWS_LAYOUT_GATEUP_SERVED;
+    const want = moeRowsLayoutPlan().gateup orelse return MOE_ROWS_LAYOUT_GATEUP_SERVED;
+    if (moeRowsLayoutGateUpSource() == .local and !moeRowsLayoutLocalShapeOk(N, K, bits, gs, dtype, true)) return MOE_ROWS_LAYOUT_GATEUP_SERVED;
+    if (nvfp4 or want.sg < 1 or want.sg * 32 > 1024 or @rem(N, want.sg) != 0) {
+        if (!moe_rows_layout_gateup_fallback_logged) {
+            moe_rows_layout_gateup_fallback_logged = true;
+            log.info("[moe-rows-layout] gate/up rows: sg={d} ax={d} does not fit (nvfp4={} N={d}), the served layout serves this shape\n", .{ want.sg, want.ax, nvfp4, N });
+        }
+        return MOE_ROWS_LAYOUT_GATEUP_SERVED;
+    }
+    return want;
+}
+
+/// The down rows layout for N outputs in tiles of `rows`, at `topk` slots: the plan's when the switch is on, the
+/// bank affine, its SPS divides the top-k (as the search's generator requires), its TPT divides the tiles and its
+/// threadgroup holds at most 1,024 threads; the served one otherwise (a top-8 or top-4 call under a top-6 entry).
+fn moeRowsLayoutDown(nvfp4: bool, N: c_int, K: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype, rows: c_int, topk: c_int) MoeRowsLayoutDown {
+    if (!moeRowsLayoutEnabled()) return MOE_ROWS_LAYOUT_DOWN_SERVED;
+    const want = moeRowsLayoutPlan().down orelse return MOE_ROWS_LAYOUT_DOWN_SERVED;
+    if (moeRowsLayoutDownSource() == .local and !moeRowsLayoutLocalShapeOk(N, K, bits, gs, dtype, false)) return MOE_ROWS_LAYOUT_DOWN_SERVED;
+    const fits = !nvfp4 and want.sps >= 1 and want.tpt >= 1 and rows > 0 and @rem(N, rows) == 0 and
+        @rem(topk, want.sps) == 0 and @rem(@divExact(N, rows), want.tpt) == 0 and
+        @divExact(topk, want.sps) * want.tpt * 32 <= 1024;
+    if (!fits) {
+        if (!moe_rows_layout_down_fallback_logged) {
+            moe_rows_layout_down_fallback_logged = true;
+            log.info("[moe-rows-layout] down rows: sps={d} tpt={d} ax={d} body={d} does not fit (nvfp4={} N={d} rows={d} topk={d}), the served layout serves this shape\n", .{ want.sps, want.tpt, want.ax, @intFromEnum(want.body), nvfp4, N, rows, topk });
+        }
+        return MOE_ROWS_LAYOUT_DOWN_SERVED;
+    }
+    return want;
+}
+
+/// The served gate/up rows source with its two grid-axis lines swapped, so a (combo, n) grid runs it; nothing
+/// else in the text changes (a compile error if the served lines move).
+fn moeRowsLayoutSwapGateUpAxes(comptime src: [:0]const u8) [:0]const u8 {
+    @setEvalBranchQuota(2_000_000);
+    const from = "uint n = thread_position_in_grid.y;\nuint combo = thread_position_in_grid.z;\n";
+    const to = "uint n = thread_position_in_grid.z;\nuint combo = thread_position_in_grid.y;\n";
+    const at = comptime (std.mem.indexOf(u8, src, from) orelse @compileError("moe-rows-layout: the gate/up rows source's axis lines moved"));
+    if (comptime std.mem.indexOfPos(u8, src, at + 1, from) != null) @compileError("moe-rows-layout: the gate/up rows source has two axis blocks");
+    return comptime std.fmt.comptimePrint("{s}{s}{s}", .{ src[0..at], to, src[at + from.len ..] });
+}
+
+pub const GQMV_GATEUP_ROWS_LAYOUT_SOURCE: [:0]const u8 = moeRowsLayoutSwapGateUpAxes(GQMV_GATEUP_ROWS_SOURCES[0]);
+var gqmv_gateup_rows_layout_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+fn getGatherQmvGateUpRowsLayoutKernel() !mlx.mlx_fast_metal_kernel {
+    if (gqmv_gateup_rows_layout_kernel) |k| return k;
+    const input_names = [_][*:0]const u8{ "x", "wg_q", "g_scales", "g_biases", "wu_q", "u_scales", "u_biases", "inds", "sigtab", "K_size", "N_size" };
+    const output_names = [_][*:0]const u8{"y"};
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new("mlxserve_moe_gather_qmv_gateup_rows_layout", in_vec, out_vec, GQMV_GATEUP_ROWS_LAYOUT_SOURCE, GQMV_AFFINE_HEADER, true, false);
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    gqmv_gateup_rows_layout_kernel = kernel;
+    return kernel;
+}
+
+const GateUpRowsCfgKey = struct { nrows: c_int, topk: c_int, n: c_int, k: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype, gscale: bool = false, act_table: bool = false, moe_rows_layout_sg: c_int = 8, moe_rows_layout_ax: u1 = 0, nvfp4: bool = false, tg_threads: ?c_int = null };
 var gateup_rows_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var gateup_rows_cfg_key: GateUpRowsCfgKey = std.mem.zeroes(GateUpRowsCfgKey);
 var gqmv_gateup_rows_engaged: bool = false;
@@ -16423,6 +17876,119 @@ fn moeVerifyRowsEnabled() bool {
 fn moeVerifyRowsFor(env: ?[]const u8) bool {
     if (env) |e| return !std.mem.eql(u8, e, "0");
     return true;
+}
+
+pub var moe_rows_gelu_off_override: ?bool = null; // test seam
+var moe_rows_gelu_off_cached: ?bool = null;
+var moe_rows_gelu_logged: bool = false;
+
+/// MLX_SERVE_MOE_ROWS_GELU_OFF=1 keeps gelu_approx (Gemma 4) off the MoE rows arm, so 2 to 8 rows
+/// take the sorted chain as before the GELU table.
+fn moeRowsGeluOff() bool {
+    if (moe_rows_gelu_off_override) |v| return v;
+    if (moe_rows_gelu_off_cached) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_MOE_ROWS_GELU_OFF");
+    const off = moeRowsGeluOffFor(if (raw) |r| std.mem.sliceTo(r, 0) else null);
+    moe_rows_gelu_off_cached = off;
+    return off;
+}
+
+fn moeRowsGeluOffFor(env: ?[]const u8) bool {
+    if (env) |e| return !std.mem.eql(u8, e, "0");
+    return false;
+}
+
+/// The attention side: a block of 2 to VERIFY_BLOCK_MAX_ROWS rows at batch 1 (a draft verify) takes the
+/// one-row decode step's attention paths widened to the block, each part behind its own off switch so one
+/// binary times them apart: `qk` the fused QK-norm+RoPE kernel (MLX_SERVE_VERIFY_BLOCK_QK_OFF), `kv` its in-place
+/// K/V write (MLX_SERVE_VERIFY_BLOCK_KV_OFF; needs `qk`), `sdpa` MLX's vector kernel on the head-dim-512 global
+/// layers (MLX_SERVE_VERIFY_BLOCK_SDPA_OFF). Each switch set to anything but "0" restores the prefill path.
+pub const VERIFY_BLOCK_MAX_ROWS: c_int = 8;
+const VerifyBlockPart = enum(u2) { qk = 0, kv = 1, sdpa = 2 };
+pub var verify_block_off_override: [3]?bool = .{ null, null, null }; // test seam
+var verify_block_off_cached: [3]?bool = .{ null, null, null };
+var verify_block_logged: [3]bool = .{ false, false, false };
+
+fn verifyBlockOff(part: VerifyBlockPart) bool {
+    const i = @intFromEnum(part);
+    if (verify_block_off_override[i]) |v| return v;
+    if (verify_block_off_cached[i]) |v| return v;
+    const name: [*:0]const u8 = switch (part) {
+        .qk => "MLX_SERVE_VERIFY_BLOCK_QK_OFF",
+        .kv => "MLX_SERVE_VERIFY_BLOCK_KV_OFF",
+        .sdpa => "MLX_SERVE_VERIFY_BLOCK_SDPA_OFF",
+    };
+    const raw = std.c.getenv(name);
+    const off = moeRowsGeluOffFor(if (raw) |r| std.mem.sliceTo(r, 0) else null);
+    verify_block_off_cached[i] = off;
+    return off;
+}
+
+fn verifyBlockLogOnce(part: VerifyBlockPart, rows: c_int) void {
+    const i = @intFromEnum(part);
+    if (verify_block_logged[i]) return;
+    verify_block_logged[i] = true;
+    log.info("[verify-block] {s} serves a {d}-row block (MLX_SERVE_VERIFY_BLOCK_{s}_OFF=1 restores the prefill path)\n", .{ @tagName(part), rows, switch (part) {
+        .qk => "QK",
+        .kv => "KV",
+        .sdpa => "SDPA",
+    } });
+}
+
+/// The fused QK-norm+RoPE arm: one row at batch 1 as before, or a 2-to-8-row block unless `qk` is off.
+fn verifyBlockQkRows(batch: c_int, seq_len: c_int) bool {
+    if (batch != 1 or seq_len < 1) return false;
+    if (seq_len == 1) return true;
+    return seq_len <= VERIFY_BLOCK_MAX_ROWS and !verifyBlockOff(.qk);
+}
+
+/// The in-place K/V write: one row as before, or a block unless `kv` is off.
+fn verifyBlockKvRows(seq_len: c_int) bool {
+    return seq_len == 1 or (seq_len >= 2 and seq_len <= VERIFY_BLOCK_MAX_ROWS and !verifyBlockOff(.kv));
+}
+
+/// The vector-kernel SDPA arm for a block on a head-dim-512 layer: batch 1, 2 to 8 rows, GQA factor 8 and
+/// rows times GQA factor at most 32 (MLX's own limits for the kernel, scaled_dot_product_attention.cpp
+/// has_fused_kernel), unless `sdpa` is off. MLX still declines below MLX_SDPA_D512_MIN_KL keys (1,024).
+fn verifyBlockSdpaVector(batch: c_int, seq_len: c_int, head_dim: c_int, hq: c_int, hk: c_int) bool {
+    if (batch != 1 or seq_len < 2 or seq_len > VERIFY_BLOCK_MAX_ROWS or head_dim != 512) return false;
+    if (hk <= 0 or @rem(hq, hk) != 0) return false;
+    const gqa = @divExact(hq, hk);
+    if (gqa != 8 or seq_len * gqa > 32) return false;
+    return !verifyBlockOff(.sdpa);
+}
+
+test "verify-block: the k-row attention arms and their off switches" {
+    const saved = verify_block_off_override;
+    defer verify_block_off_override = saved;
+    verify_block_off_override = .{ false, false, false };
+    try std.testing.expect(verifyBlockQkRows(1, 1));
+    try std.testing.expect(verifyBlockQkRows(1, 2));
+    try std.testing.expect(verifyBlockQkRows(1, 8));
+    try std.testing.expect(!verifyBlockQkRows(1, 9));
+    try std.testing.expect(!verifyBlockQkRows(2, 2));
+    try std.testing.expect(!verifyBlockQkRows(2, 1));
+    try std.testing.expect(verifyBlockKvRows(1));
+    try std.testing.expect(verifyBlockKvRows(4));
+    try std.testing.expect(!verifyBlockKvRows(9));
+    try std.testing.expect(verifyBlockSdpaVector(1, 2, 512, 16, 2));
+    try std.testing.expect(verifyBlockSdpaVector(1, 4, 512, 16, 2));
+    try std.testing.expect(!verifyBlockSdpaVector(1, 5, 512, 16, 2));
+    try std.testing.expect(!verifyBlockSdpaVector(1, 1, 512, 16, 2));
+    try std.testing.expect(!verifyBlockSdpaVector(1, 2, 256, 16, 8));
+    try std.testing.expect(!verifyBlockSdpaVector(2, 2, 512, 16, 2));
+    verify_block_off_override = .{ true, true, true };
+    try std.testing.expect(verifyBlockQkRows(1, 1));
+    try std.testing.expect(!verifyBlockQkRows(1, 2));
+    try std.testing.expect(verifyBlockKvRows(1));
+    try std.testing.expect(!verifyBlockKvRows(2));
+    try std.testing.expect(!verifyBlockSdpaVector(1, 2, 512, 16, 2));
+}
+
+/// The activations the rows kernels apply: SiLU (sigmoid table), and GELU-tanh read from
+/// its own table unless MLX_SERVE_MOE_ROWS_GELU_OFF=1.
+fn moeRowsActOk(hidden_act: anytype) bool {
+    return hidden_act == .silu or (hidden_act == .gelu_approx and !moeRowsGeluOff());
 }
 
 const MoeDecodeDispatchArm = enum { rows, sorted, gather_qmv };
@@ -16461,6 +18027,28 @@ pub fn gatherQmvGateUpRows(
     group_size: u32,
     mode: QuantMode,
     gate_scale: ?mlx.mlx_array,
+) !?mlx.mlx_array {
+    return gatherQmvGateUpRowsAct(s, x, gw, gs_arr, gb, uw, us_arr, ub, inds, bits, group_size, mode, gate_scale, null);
+}
+
+/// `gatherQmvGateUpRows` with the activation chosen by the table: null is SwiGLU
+/// (silu(g) = g * sigmoid table[g]); `act_table` is read as the activation itself,
+/// act(g) = act_table[g] (the GELU-tanh table of `Transformer.geluTanhTable`).
+pub fn gatherQmvGateUpRowsAct(
+    s: mlx.mlx_stream,
+    x: mlx.mlx_array,
+    gw: mlx.mlx_array,
+    gs_arr: mlx.mlx_array,
+    gb: mlx.mlx_array,
+    uw: mlx.mlx_array,
+    us_arr: mlx.mlx_array,
+    ub: mlx.mlx_array,
+    inds: mlx.mlx_array,
+    bits: u32,
+    group_size: u32,
+    mode: QuantMode,
+    gate_scale: ?mlx.mlx_array,
+    act_table: ?mlx.mlx_array,
 ) !?mlx.mlx_array {
     if (!gatherQmvGateUpEnabled()) return null;
     if (!moeRowsFusedEnabled()) return null;
@@ -16502,25 +18090,45 @@ pub fn gatherQmvGateUpRows(
     if (@rem(N, sgs_per_tg) != 0) return null;
 
     if (gate_scale) |g| if (mlx.mlx_array_dtype(g) != xd) return null;
-    const key = GateUpRowsCfgKey{ .nrows = nrows, .topk = topk, .n = N, .k = K, .bits = bits, .gs = group_size, .dtype = xd, .gscale = gate_scale != null };
+    // The activation table is indexed by x's 16-bit pattern and read as x's dtype.
+    if (act_table) |t| if (mlx.mlx_array_dtype(t) != xd or mlx.mlx_array_size(t) != (1 << 16)) return null;
+    // The served layout (SG 8, AX 0) unless the MoE rows layout switch is on (by default where the device has an entry) and picks the device's.
+    if (moe_rows_layout_tg_threads_override) |t| if (t < 32 or @rem(t, 32) != 0) return error.MoeRowsLayoutBadThreadOverride;
+    const lay = moeRowsLayoutGateUp(nvfp4, N, K, bits, group_size, xd);
+    const key = GateUpRowsCfgKey{ .nrows = nrows, .topk = topk, .n = N, .k = K, .bits = bits, .gs = group_size, .dtype = xd, .gscale = gate_scale != null, .act_table = act_table != null, .moe_rows_layout_sg = lay.sg, .moe_rows_layout_ax = lay.ax, .nvfp4 = nvfp4, .tg_threads = moe_rows_layout_tg_threads_override };
     if (gateup_rows_cfg == null or !std.meta.eql(gateup_rows_cfg_key, key)) {
+        moe_rows_layout_cfg_rebuilds_gateup += 1;
         if (gateup_rows_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        gateup_rows_cfg = null; // never published after its free
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer if (gateup_rows_cfg == null) {
+            _ = mlx.mlx_fast_metal_kernel_config_free(config); // unpublished
+        };
         const y_shape = [_]c_int{ nrows, topk, N };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &y_shape, 3, xd));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, N, nrows * topk));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, sgs_per_tg, 1));
+        if (lay.ax == 0) {
+            // served: sgs_per_tg (8) unless the MoE rows layout names another SG
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, N, nrows * topk));
+            const sg_ax0: c_int = if (moe_rows_layout_tg_threads_override) |t| @divExact(t, 32) else if (lay.sg == MOE_ROWS_LAYOUT_GATEUP_SERVED.sg) sgs_per_tg else lay.sg;
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, sg_ax0, 1));
+        } else {
+            // AX 1: grid y over (row, slot), z over n, SG simdgroups along z (the swapped-axes source)
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, nrows * topk, N));
+            const sg_ax1: c_int = if (moe_rows_layout_tg_threads_override) |t| @divExact(t, 32) else lay.sg;
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, sg_ax1));
+        }
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", xd));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(group_size)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(bits)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "KP", affineQmvPackUnits(K, bits)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "TOPK", topk));
         if (nvfp4) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GSCALE", @intFromBool(gate_scale != null)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "ACT_TABLE", @intFromBool(act_table != null)));
         gateup_rows_cfg = config;
         gateup_rows_cfg_key = key;
     }
 
-    const sigtab = try swigluSigTable(s, xd, std.heap.c_allocator);
+    const sigtab = act_table orelse try swigluSigTable(s, xd, std.heap.c_allocator);
     const K_arr = cachedScalarInt(K);
     const N_arr = cachedScalarInt(N);
     const affine_inputs = [_]mlx.mlx_array{ x, gw, gs_arr, gb, uw, us_arr, ub, inds, sigtab, K_arr, N_arr };
@@ -16530,7 +18138,8 @@ pub fn gatherQmvGateUpRows(
     const inputs_vec = mlx.mlx_vector_array_new_data(inputs_arr.ptr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
 
-    const kernel = try getGatherQmvGateUpRowsKernel(nvfp4);
+    // AX 1 is only reachable for an affine bank (moeRowsLayoutGateUp), whose input list the layout kernel shares.
+    const kernel = if (lay.ax == 1) try getGatherQmvGateUpRowsLayoutKernel() else try getGatherQmvGateUpRowsKernel(nvfp4);
     var outputs_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, gateup_rows_cfg.?, s));
@@ -16541,6 +18150,11 @@ pub fn gatherQmvGateUpRows(
     if (!gqmv_gateup_rows_engaged) {
         gqmv_gateup_rows_engaged = true;
         log.info("[moe] fused rows gate+up+SwiGLU kernel engaged: B={d} E_topk={d} inter={d} bits={d} gs={d}\n", .{ nrows, topk, N, bits, group_size });
+    }
+    moe_rows_layout_last_gateup = lay;
+    if (!std.meta.eql(lay, MOE_ROWS_LAYOUT_GATEUP_SERVED) and !moe_rows_layout_gateup_logged) {
+        moe_rows_layout_gateup_logged = true;
+        log.info("[moe-rows-layout] gate/up rows layout sg={d} ax={d} engaged: B={d} E_topk={d} inter={d}\n", .{ lay.sg, lay.ax, nrows, topk, N });
     }
     return y;
 }
@@ -16693,7 +18307,11 @@ pub fn gatherQmvAct(
     const slot = &gqmv_cfg_cache[@intFromBool(x_per_expert)];
     if (slot.cfg == null or !std.meta.eql(slot.key, key)) {
         if (slot.cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        slot.cfg = null; // never published after its free
         const cfg = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer if (slot.cfg == null) {
+            _ = mlx.mlx_fast_metal_kernel_config_free(cfg); // unpublished
+        };
         const y_shape = [_]c_int{ topk, N };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &y_shape, 2, xd));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 32, N, topk));
@@ -16925,7 +18543,11 @@ pub fn gatherQmvDownReduce(
     const key = DownRedCfgKey{ .topk = topk, .n = N, .bits = bits, .gs = group_size, .dtype = xd, .lpr = downredLpr() };
     if (downred_cfg == null or !std.meta.eql(downred_cfg_key, key)) {
         if (downred_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        downred_cfg = null; // never published after its free
         const cfg = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer if (downred_cfg == null) {
+            _ = mlx.mlx_fast_metal_kernel_config_free(cfg); // unpublished
+        };
         const y_shape = [_]c_int{N};
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &y_shape, 1, xd));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divExact(N, rows) * topk * 32, 1, 1));
@@ -17020,7 +18642,7 @@ fn gatherQmvDownReduceRowsSource(comptime nvfp4: bool) [:0]const u8 {
     });
 }
 
-const GQMV_DOWNRED_ROWS_SOURCES = [2][:0]const u8{ gatherQmvDownReduceRowsSource(false), gatherQmvDownReduceRowsSource(true) };
+pub const GQMV_DOWNRED_ROWS_SOURCES = [2][:0]const u8{ gatherQmvDownReduceRowsSource(false), gatherQmvDownReduceRowsSource(true) };
 const GQMV_DOWNRED_ROWS_NAMES = [2][*:0]const u8{ "mlxserve_moe_gather_qmv_downred_rows", "mlxserve_moe_gather_qmv_downred_rows_nvfp4" };
 var gqmv_downred_rows_kernels: [2]?mlx.mlx_fast_metal_kernel = @splat(null);
 
@@ -17049,7 +18671,197 @@ fn getGatherQmvDownReduceRowsKernel(nvfp4: bool) !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
-const DownRedRowsCfgKey = struct { nrows: c_int, topk: c_int, n: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype, lpr: c_int };
+/// `gatherQmvDownReduceRowsSource(false)` with SPS slots a simdgroup, TPT tiles a threadgroup and the
+/// AX grid order as template constants. Per slot the served text runs unchanged (the same eid, xoff, wbase and
+/// gbase, the hoisted packs, GQMV_BODY_AFFINE into four accumulators, the LPR xor tree, T(acc) into slot_vals at
+/// the served slot-major index within the tile); a simdgroup runs its SPS slots one after another. After the
+/// barrier the simdgroup holding a tile's slot 0 sums its TOPK weighted slots ascending in T, as served. At SPS 1,
+/// TPT 1 and AX 0 it is the served kernel's arithmetic and indexing; the served kernel itself serves that triple.
+pub const GQMV_DOWNRED_ROWS_LAYOUT_SOURCE: [:0]const u8 = std.fmt.comptimePrint(
+    \\auto lane = thread_index_in_simdgroup;
+    \\uint sgi = simdgroup_index_in_threadgroup;
+    \\uint tgt = (AX == 0) ? threadgroup_position_in_grid.x : threadgroup_position_in_grid.y;
+    \\uint row = (AX == 0) ? threadgroup_position_in_grid.y : threadgroup_position_in_grid.x;
+    \\constexpr int NSG = TOPK / SPS;
+    \\uint tl = sgi / uint(NSG);
+    \\uint sgs = sgi % uint(NSG);
+    \\uint tile = tgt * uint(TPT) + tl;
+    \\
+    \\int K = int(K_size);
+    \\int N = int(N_size);
+    \\constexpr int VPW = (BITS == 3) ? 8 : 32 / BITS;
+    \\int K_by_w = K * BITS / 32;
+    \\int K_by_gs = K / GS;
+    \\uint mask = (1u << BITS) - 1u;
+    \\
+    \\threadgroup T slot_vals[uint(TPT) * uint(TOPK) * uint(ROWS)];
+    \\uint r = lane / uint(LPR);
+    \\uint sub = lane % uint(LPR);
+    \\uint n = tile * uint(ROWS) + r;
+    \\constexpr int IT = (KP + LPR - 1) / LPR;
+    \\for (int sk = 0; sk < SPS; ++sk) {{
+    \\  uint slot = sgs * uint(SPS) + uint(sk);
+    \\  uint eid = inds[(size_t)row * (size_t)TOPK + slot];
+    \\  size_t xoff = ((size_t)row * (size_t)TOPK + (size_t)slot) * (size_t)K;
+    \\  size_t wbase = (size_t)eid * (size_t)N * (size_t)K_by_w + (size_t)n * (size_t)K_by_w;
+    \\  size_t gbase = (size_t)eid * (size_t)N * (size_t)K_by_gs + (size_t)n * (size_t)K_by_gs;
+    \\  float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    \\  uint32_t pw[IT];
+    \\  for (int i = 0; i < IT; ++i) {{
+    \\    int pack = int(sub) + LPR * i;
+    \\    pw[i] = (pack < KP) ? mlxserve_qpack<BITS>(w_q, wbase, pack) : 0u;
+    \\  }}
+    \\  for (int i = 0; i < IT; ++i) {{
+    \\    int pack = int(sub) + LPR * i;
+    \\    if (pack >= KP) break;
+    \\    uint32_t packed = pw[i];
+    \\    int k_base = pack * VPW;
+    \\    int gi = k_base / GS;
+    \\{s}
+    \\  }}
+    \\  float acc = (a0 + a1) + (a2 + a3);
+    \\  for (uint d = uint(LPR) / 2u; d >= 1u; d >>= 1u) acc += simd_shuffle_xor(acc, ushort(d));
+    \\  if (sub == 0u) {{
+    \\    slot_vals[(tl * uint(TOPK) + slot) * uint(ROWS) + r] = T(acc);
+    \\  }}
+    \\}}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\if (sgs == 0u && lane < uint(ROWS)) {{
+    \\  T total = T(0.0f);
+    \\  for (uint s2 = 0; s2 < uint(TOPK); ++s2) {{
+    \\    T p = slot_vals[(tl * uint(TOPK) + s2) * uint(ROWS) + lane] * scores[(size_t)row * (size_t)TOPK + s2];
+    \\    total = total + p;
+    \\  }}
+    \\  y[(size_t)row * (size_t)N + (size_t)tile * (size_t)ROWS + (size_t)lane] = total;
+    \\}}
+, .{GQMV_BODY_AFFINE});
+var gqmv_downred_rows_layout_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+fn getGatherQmvDownReduceRowsLayoutKernel() !mlx.mlx_fast_metal_kernel {
+    if (gqmv_downred_rows_layout_kernel) |k| return k;
+    const input_names = [_][*:0]const u8{ "x", "w_q", "scales", "biases", "inds", "scores", "K_size", "N_size" };
+    const output_names = [_][*:0]const u8{"y"};
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new("mlxserve_moe_gather_qmv_downred_rows_layout", in_vec, out_vec, GQMV_DOWNRED_ROWS_LAYOUT_SOURCE, GQMV_AFFINE_HEADER, true, false);
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    gqmv_downred_rows_layout_kernel = kernel;
+    return kernel;
+}
+
+/// The down-reduce rows body whose per-tile values (weight and scale bases, scale, bias) and accumulators are 1-element
+/// `[NR]` arrays instead of scalars. Served with NR 1 and PF 0 (template arguments), at any SPS, TPT and
+/// AX; bit-identical to the served kernel, with the same arithmetic per value as `GQMV_BODY_AFFINE`. It is faster than the
+/// scalar body on some GPUs and slower on others, so each down plan names its body. Affine banks only.
+pub const GQMV_DOWNRED_ROWS_ARRAY_SOURCE: [:0]const u8 =
+    \\auto lane = thread_index_in_simdgroup;
+    \\uint sgi = simdgroup_index_in_threadgroup;
+    \\uint tgt = (AX == 0) ? threadgroup_position_in_grid.x : threadgroup_position_in_grid.y;
+    \\uint row = (AX == 0) ? threadgroup_position_in_grid.y : threadgroup_position_in_grid.x;
+    \\constexpr int NSG = TOPK / SPS;
+    \\uint tl = sgi / uint(NSG);
+    \\uint sgs = sgi % uint(NSG);
+    \\int K = int(K_size);
+    \\int N = int(N_size);
+    \\constexpr int VPW = (BITS == 3) ? 8 : 32 / BITS;
+    \\int K_by_w = K * BITS / 32;
+    \\int K_by_gs = K / GS;
+    \\uint mask = (1u << BITS) - 1u;
+    \\threadgroup T slot_vals[TPT * NR * TOPK * ROWS];
+    \\uint r = lane / uint(LPR);
+    \\uint sub = lane % uint(LPR);
+    \\constexpr int IT = (KP + LPR - 1) / LPR;
+    \\constexpr int PFE = (PF <= 0 || PF > IT) ? IT : PF;
+    \\uint tbase = (tgt * uint(TPT) + tl) * uint(NR);
+    \\for (int sj = 0; sj < SPS; ++sj) {
+    \\  uint slot = sgs * uint(SPS) + uint(sj);
+    \\  uint eid = inds[(size_t)row * (size_t)TOPK + slot];
+    \\  size_t xoff = ((size_t)row * (size_t)TOPK + (size_t)slot) * (size_t)K;
+    \\  size_t wbase[NR];
+    \\  size_t gbase[NR];
+    \\  float a0[NR], a1[NR], a2[NR], a3[NR];
+    \\  for (int t = 0; t < NR; ++t) {
+    \\    uint n = (tbase + uint(t)) * uint(ROWS) + r;
+    \\    wbase[t] = (size_t)eid * (size_t)N * (size_t)K_by_w + (size_t)n * (size_t)K_by_w;
+    \\    gbase[t] = (size_t)eid * (size_t)N * (size_t)K_by_gs + (size_t)n * (size_t)K_by_gs;
+    \\    a0[t] = 0.0f; a1[t] = 0.0f; a2[t] = 0.0f; a3[t] = 0.0f;
+    \\  }
+    \\  for (int c0 = 0; c0 < IT; c0 += PFE) {
+    \\    uint32_t pw[NR][PFE];
+    \\    for (int j = 0; j < PFE; ++j) {
+    \\      int i = c0 + j;
+    \\      int pack = int(sub) + LPR * i;
+    \\      for (int t = 0; t < NR; ++t) {
+    \\        pw[t][j] = (i < IT && pack < KP) ? mlxserve_qpack<BITS>(w_q, wbase[t], pack) : 0u;
+    \\      }
+    \\    }
+    \\    for (int j = 0; j < PFE; ++j) {
+    \\      int i = c0 + j;
+    \\      int pack = int(sub) + LPR * i;
+    \\      if (i >= IT || pack >= KP) break;
+    \\      int k_base = pack * VPW;
+    \\      int gi = k_base / GS;
+    \\      float sjv[NR], bj[NR];
+    \\      for (int t = 0; t < NR; ++t) {
+    \\        sjv[t] = float(scales[gbase[t] + (size_t)gi]);
+    \\        bj[t] = float(biases[gbase[t] + (size_t)gi]);
+    \\      }
+    \\      // x is loaded once per pack step and applied to all NR tiles (each in its own accumulators)
+    \\      for (int ki = 0; ki < VPW; ki += 4) {
+    \\        size_t xi = xoff + (size_t)(k_base + ki);
+    \\        float x0 = float(x[xi + 0]);
+    \\        float x1 = float(x[xi + 1]);
+    \\        float x2 = float(x[xi + 2]);
+    \\        float x3 = float(x[xi + 3]);
+    \\        for (int t = 0; t < NR; ++t) {
+    \\          uint32_t q = pw[t][j] >> (ki * BITS);
+    \\          a0[t] += x0 * (float((q >> (0 * BITS)) & mask) * sjv[t] + bj[t]);
+    \\          a1[t] += x1 * (float((q >> (1 * BITS)) & mask) * sjv[t] + bj[t]);
+    \\          a2[t] += x2 * (float((q >> (2 * BITS)) & mask) * sjv[t] + bj[t]);
+    \\          a3[t] += x3 * (float((q >> (3 * BITS)) & mask) * sjv[t] + bj[t]);
+    \\        }
+    \\      }
+    \\    }
+    \\  }
+    \\  for (int t = 0; t < NR; ++t) {
+    \\    float acc = (a0[t] + a1[t]) + (a2[t] + a3[t]);
+    \\    for (uint d = uint(LPR) / 2u; d >= 1u; d >>= 1u) acc += simd_shuffle_xor(acc, ushort(d));
+    \\    if (sub == 0u) {
+    \\      slot_vals[((tl * uint(NR) + uint(t)) * uint(TOPK) + slot) * uint(ROWS) + r] = T(acc);
+    \\    }
+    \\  }
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\if (sgs == 0u && lane < uint(ROWS * NR)) {
+    \\  uint t = lane / uint(ROWS);
+    \\  uint rr = lane % uint(ROWS);
+    \\  T total = T(0.0f);
+    \\  for (uint s2 = 0; s2 < uint(TOPK); ++s2) {
+    \\    T p = slot_vals[((tl * uint(NR) + t) * uint(TOPK) + s2) * uint(ROWS) + rr] * scores[(size_t)row * (size_t)TOPK + s2];
+    \\    total = total + p;
+    \\  }
+    \\  y[(size_t)row * (size_t)N + (size_t)(tbase + t) * (size_t)ROWS + (size_t)rr] = total;
+    \\}
+;
+var gqmv_downred_rows_array_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+fn getGatherQmvDownReduceRowsArrayKernel() !mlx.mlx_fast_metal_kernel {
+    if (gqmv_downred_rows_array_kernel) |k| return k;
+    const input_names = [_][*:0]const u8{ "x", "w_q", "scales", "biases", "inds", "scores", "K_size", "N_size" };
+    const output_names = [_][*:0]const u8{"y"};
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new("mlxserve_moe_gather_qmv_downred_rows_array", in_vec, out_vec, GQMV_DOWNRED_ROWS_ARRAY_SOURCE, GQMV_AFFINE_HEADER, true, false);
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    gqmv_downred_rows_array_kernel = kernel;
+    return kernel;
+}
+
+const DownRedRowsCfgKey = struct { nrows: c_int, topk: c_int, n: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype, lpr: c_int, moe_rows_layout_sps: c_int = 1, moe_rows_layout_tpt: c_int = 1, moe_rows_layout_ax: u1 = 0, moe_rows_layout_body: MoeRowsLayoutDownBody = .scalar, k: c_int = 0, nvfp4: bool = false, tg_threads: ?c_int = null };
 var downred_rows_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var downred_rows_cfg_key: DownRedRowsCfgKey = std.mem.zeroes(DownRedRowsCfgKey);
 var downred_rows_engaged: bool = false;
@@ -17060,7 +18872,7 @@ fn gatherQmvDownReduceRowsEligible(hidden_act: anytype, gate_qp: anytype, up_qp:
     if (!downReduceFusedEnabled()) return false;
     if (!moeRowsFusedEnabled()) return false;
     if (envFlagCached(&gqmv_disabled_env, "MLX_SERVE_MOE_GATHER_QMV_OFF")) return false;
-    if (hidden_act != .silu) return false;
+    if (!moeRowsActOk(hidden_act)) return false;
     if (gate_qp.bits != up_qp.bits or gate_qp.group_size != up_qp.group_size or gate_qp.mode != up_qp.mode) return false;
     switch (down_qp.mode) {
         .affine => {
@@ -17132,14 +18944,34 @@ pub fn gatherQmvDownReduceRows(
     const rows: c_int = @divExact(32, downredLpr());
     if (@rem(N, rows) != 0) return null;
 
-    const key = DownRedRowsCfgKey{ .nrows = nrows, .topk = topk, .n = N, .bits = bits, .gs = group_size, .dtype = xd, .lpr = downredLpr() };
+    // The served layout (SPS 1, TPT 1, AX 0) unless the MoE rows layout switch is on (by default where the device has an entry) and picks the device's.
+    const lay = moeRowsLayoutDown(nvfp4, N, K, bits, group_size, xd, rows, topk);
+    const served_lay = std.meta.eql(lay, MOE_ROWS_LAYOUT_DOWN_SERVED);
+    const key = DownRedRowsCfgKey{ .nrows = nrows, .topk = topk, .n = N, .bits = bits, .gs = group_size, .dtype = xd, .lpr = downredLpr(), .moe_rows_layout_sps = lay.sps, .moe_rows_layout_tpt = lay.tpt, .moe_rows_layout_ax = lay.ax, .moe_rows_layout_body = lay.body, .k = K, .nvfp4 = nvfp4, .tg_threads = moe_rows_layout_tg_threads_override };
     if (downred_rows_cfg == null or !std.meta.eql(downred_rows_cfg_key, key)) {
+        moe_rows_layout_cfg_rebuilds_down += 1;
         if (downred_rows_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        downred_rows_cfg = null; // never published after its free
         const cfg = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer if (downred_rows_cfg == null) {
+            _ = mlx.mlx_fast_metal_kernel_config_free(cfg); // unpublished
+        };
         const y_shape = [_]c_int{ nrows, N };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &y_shape, 2, xd));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divExact(N, rows) * topk * 32, nrows, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, topk * 32, 1, 1));
+        if (served_lay) {
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divExact(N, rows) * topk * 32, nrows, 1));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, topk * 32, 1, 1));
+        } else {
+            // Layout: (TOPK / SPS) simdgroups a tile, TPT tiles a threadgroup; AX 1 puts the row on grid x
+            const threads: c_int = @divExact(topk, lay.sps) * lay.tpt * 32;
+            const groups: c_int = @divExact(@divExact(N, rows), lay.tpt);
+            if (lay.ax == 0) {
+                try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, groups * threads, nrows, 1));
+            } else {
+                try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, nrows * threads, groups, 1));
+            }
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, if (moe_rows_layout_tg_threads_override) |t| (if (t > 1024) t else threads) else threads, 1, 1));
+        }
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", xd));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "GS", @intCast(group_size)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "BITS", @intCast(bits)));
@@ -17147,6 +18979,16 @@ pub fn gatherQmvDownReduceRows(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "ROWS", rows));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "LPR", downredLpr()));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "KP", affineQmvPackUnits(K, bits)));
+        if (!served_lay) {
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "SPS", lay.sps));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TPT", lay.tpt));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "AX", lay.ax));
+            if (lay.body == .array) {
+                // the array body's two further template arguments: always these values
+                try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "NR", 1));
+                try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "PF", 0));
+            }
+        }
         downred_rows_cfg = cfg;
         downred_rows_cfg_key = key;
     }
@@ -17159,7 +19001,13 @@ pub fn gatherQmvDownReduceRows(
     const inputs_vec = mlx.mlx_vector_array_new_data(inputs_arr.ptr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
 
-    const kernel = try getGatherQmvDownReduceRowsKernel(nvfp4);
+    // A layout other than the served one is only reachable for an affine bank (moeRowsLayoutDown).
+    const which: MoeRowsLayoutDownKernel = if (served_lay) .served else if (lay.body == .array) .array else .scalar_body;
+    const kernel = switch (which) {
+        .served => try getGatherQmvDownReduceRowsKernel(nvfp4),
+        .array => try getGatherQmvDownReduceRowsArrayKernel(),
+        .scalar_body => try getGatherQmvDownReduceRowsLayoutKernel(),
+    };
     var outputs_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, downred_rows_cfg.?, s));
@@ -17170,6 +19018,12 @@ pub fn gatherQmvDownReduceRows(
     if (!downred_rows_engaged) {
         downred_rows_engaged = true;
         log.info("[moe] fused rows down+reduce kernel engaged: B={d} E_topk={d} hidden={d} bits={d} gs={d}\n", .{ nrows, topk, N, bits, group_size });
+    }
+    moe_rows_layout_last_down = lay;
+    moe_rows_layout_last_down_kernel = which;
+    if (!served_lay and !moe_rows_layout_down_logged) {
+        moe_rows_layout_down_logged = true;
+        log.info("[moe-rows-layout] down rows layout sps={d} tpt={d} ax={d} body={d} engaged: B={d} E_topk={d} hidden={d}\n", .{ lay.sps, lay.tpt, lay.ax, @intFromEnum(lay.body), nrows, topk, N });
     }
     return y;
 }
@@ -18022,7 +19876,10 @@ fn sliceTimestep4(arr: mlx.mlx_array, batch: c_int, heads: c_int, dim: c_int, t:
     try mlx.check(mlx.mlx_slice(&sliced, arr, &start, 4, &stop, 4, &strides, 4, s));
     const out_shape = [_]c_int{ batch, heads, dim };
     var result = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_reshape(&result, sliced, &out_shape, 3, s));
+    mlx.check(mlx.mlx_reshape(&result, sliced, &out_shape, 3, s)) catch |e| {
+        _ = mlx.mlx_array_free(result); // a failed op frees its own output
+        return e;
+    };
     return result;
 }
 
@@ -18036,7 +19893,10 @@ fn sliceTimestep3(arr: mlx.mlx_array, batch: c_int, heads: c_int, t: c_int, s: m
     try mlx.check(mlx.mlx_slice(&sliced, arr, &start, 3, &stop, 3, &strides, 3, s));
     const out_shape = [_]c_int{ batch, heads };
     var result = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_reshape(&result, sliced, &out_shape, 2, s));
+    mlx.check(mlx.mlx_reshape(&result, sliced, &out_shape, 2, s)) catch |e| {
+        _ = mlx.mlx_array_free(result); // a failed op frees its own output
+        return e;
+    };
     return result;
 }
 
@@ -18081,7 +19941,10 @@ fn biasNegScalePeak(weights: *const Weights, base: []const u8, s: mlx.mlx_stream
     defer _ = mlx.mlx_array_free(peak);
     try mlx.check(mlx.mlx_max(&peak, mx_abs, false, s));
     var peak32 = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_astype(&peak32, peak, .float32, s));
+    mlx.check(mlx.mlx_astype(&peak32, peak, .float32, s)) catch |e| {
+        _ = mlx.mlx_array_free(peak32); // a failed op frees its own output
+        return e;
+    };
     return peak32;
 }
 
@@ -18193,7 +20056,10 @@ test "firstRowExactMiss: 4, 6 and 8-bit trunk projections are inside the row ker
             try mlx.check(mlx.mlx_quantize(&triple, zeros, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(bits), "affine", .{}, st));
             for ([_][]const u8{ ".weight", ".scales", ".biases" }, 0..) |suf, i| {
                 var a = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_vector_array_get(&a, triple, i));
+                mlx.check(mlx.mlx_vector_array_get(&a, triple, i)) catch |e| {
+                    _ = mlx.mlx_array_free(a); // a failed op frees its own output
+                    return e;
+                };
                 try w.map.put(try std.fmt.allocPrint(std.testing.allocator, "{s}{s}", .{ base, suf }), a);
             }
         }
@@ -18436,7 +20302,10 @@ pub fn scalarOf(val: f32, dt: mlx.mlx_dtype, s: mlx.mlx_stream) !mlx.mlx_array {
     const raw = mlx.mlx_array_new_float(val);
     defer _ = mlx.mlx_array_free(raw);
     var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_astype(&out, raw, dt, s));
+    mlx.check(mlx.mlx_astype(&out, raw, dt, s)) catch |e| {
+        _ = mlx.mlx_array_free(out); // a failed op frees its own output
+        return e;
+    };
     return out;
 }
 
@@ -18460,7 +20329,10 @@ fn addOne(arr: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     const one = bf16Scalar(1.0, s);
     defer _ = mlx.mlx_array_free(one);
     var result = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_add(&result, one, arr, s));
+    mlx.check(mlx.mlx_add(&result, one, arr, s)) catch |e| {
+        _ = mlx.mlx_array_free(result); // a failed op frees its own output
+        return e;
+    };
     return result;
 }
 
@@ -18742,7 +20614,10 @@ test "KVCache affine quant carries an asymmetric K/V too (--kv-quant on MLA)" {
         fn f(str: mlx.mlx_stream, len: c_int, d: c_int) !mlx.mlx_array {
             const shape = [_]c_int{ 1, 2, len, d };
             var a = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_ones(&a, &shape, 4, .bfloat16, str));
+            mlx.check(mlx.mlx_ones(&a, &shape, 4, .bfloat16, str)) catch |e| {
+                _ = mlx.mlx_array_free(a); // a failed op frees its own output
+                return e;
+            };
             return a;
         }
     }.f;
@@ -19020,7 +20895,10 @@ fn qkvDecParityCase(h_q: c_int, h_kv: c_int, d: c_int, bits: u8, t_prefill: usiz
             const f32_arr = mlx.mlx_array_new_data(buf.ptr, &shape, 4, .float32);
             defer _ = mlx.mlx_array_free(f32_arr);
             var bf = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_astype(&bf, f32_arr, .bfloat16, str));
+            mlx.check(mlx.mlx_astype(&bf, f32_arr, .bfloat16, str)) catch |e| {
+                _ = mlx.mlx_array_free(bf); // a failed op frees its own output
+                return e;
+            };
             return bf;
         }
     }.f;
@@ -19064,7 +20942,10 @@ fn qkvDecParityCase(h_q: c_int, h_kv: c_int, d: c_int, bits: u8, t_prefill: usiz
         const mf32 = mlx.mlx_array_new_data(mbuf.ptr, &mshape, 4, .float32);
         defer _ = mlx.mlx_array_free(mf32);
         var mbf = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_astype(&mbf, mf32, .bfloat16, s));
+        mlx.check(mlx.mlx_astype(&mbf, mf32, .bfloat16, s)) catch |e| {
+            _ = mlx.mlx_array_free(mbf); // a failed op frees its own output
+            return e;
+        };
         mask = mbf;
     }
 
@@ -19192,7 +21073,10 @@ fn qkvVerParityCaseWith(h_q: c_int, h_kv: c_int, d: c_int, bits: u8, t_prefill: 
             const f32_arr = mlx.mlx_array_new_data(buf.ptr, &shape, 4, .float32);
             defer _ = mlx.mlx_array_free(f32_arr);
             var bf = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_astype(&bf, f32_arr, .bfloat16, str));
+            mlx.check(mlx.mlx_astype(&bf, f32_arr, .bfloat16, str)) catch |e| {
+                _ = mlx.mlx_array_free(bf); // a failed op frees its own output
+                return e;
+            };
             return bf;
         }
     }.f;
@@ -19390,7 +21274,10 @@ fn composedStridedCase(h_q: c_int, h_kv: c_int, d: c_int, bits: u8, t_pre: usize
             const f32_arr = mlx.mlx_array_new_data(buf.ptr, &shape, 4, .float32);
             defer _ = mlx.mlx_array_free(f32_arr);
             var bf = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_astype(&bf, f32_arr, .bfloat16, str));
+            mlx.check(mlx.mlx_astype(&bf, f32_arr, .bfloat16, str)) catch |e| {
+                _ = mlx.mlx_array_free(bf); // a failed op frees its own output
+                return e;
+            };
             return bf;
         }
     }.f;
@@ -19437,7 +21324,10 @@ fn composedStridedCase(h_q: c_int, h_kv: c_int, d: c_int, bits: u8, t_pre: usize
         const mf32 = mlx.mlx_array_new_data(mbuf.ptr, &mshape, 4, .float32);
         defer _ = mlx.mlx_array_free(mf32);
         var mbf = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_astype(&mbf, mf32, .bfloat16, s));
+        mlx.check(mlx.mlx_astype(&mbf, mf32, .bfloat16, s)) catch |e| {
+            _ = mlx.mlx_array_free(mbf); // a failed op frees its own output
+            return e;
+        };
         mask = mbf;
     }
     const none = mlx.mlx_array{ .ctx = null };
@@ -19709,6 +21599,111 @@ test "KVCache step resets on truncate" {
     try testing.expectEqual(@as(usize, 3), cache.step);
 }
 
+fn drafterRollbackRows(start: f64, n: usize, s: mlx.mlx_stream) !mlx.mlx_array {
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    try mlx.check(mlx.mlx_arange(&flat, start, start + @as(f64, @floatFromInt(n)), 1.0, .float32, s));
+    const shape = [_]c_int{ 1, 1, @intCast(n), 1 };
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&out, flat, &shape, 4, s));
+    return out;
+}
+
+fn drafterRollbackRowsSlice(src: mlx.mlx_array, n: usize, s: mlx.mlx_stream) !mlx.mlx_array {
+    const start = [_]c_int{ 0, 0, 0, 0 };
+    const stop = [_]c_int{ 1, 1, @intCast(n), 1 };
+    const strides = [_]c_int{ 1, 1, 1, 1 };
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_slice(&out, src, &start, 4, &stop, 4, &strides, 4, s));
+    return out;
+}
+
+test "drafter-rollback a partial accept's rollback leaves the cache the restore and re-forward leave" {
+    // A prefix of 4 rows, a 3-row verify (t1 and 2 drafts), then `accepted` kept drafts. Path A rolls
+    // the verify's rows back (truncate); path B restores the pre-verify snapshot and writes the kept rows again. The next
+    // write must see the same K/V, offsets and step on both.
+    const s = mlx.gpuStream();
+    for ([_]usize{ 0, 1 }) |accepted| {
+        var a = try KVCache.init(testing.allocator, 1);
+        defer a.deinit();
+        var b = try KVCache.init(testing.allocator, 1);
+        defer b.deinit();
+        const prefix = try drafterRollbackRows(100, 4, s);
+        defer _ = mlx.mlx_array_free(prefix);
+        const verify = try drafterRollbackRows(200, 3, s);
+        defer _ = mlx.mlx_array_free(verify);
+        const next = try drafterRollbackRows(300, 1, s);
+        defer _ = mlx.mlx_array_free(next);
+        for ([_]*KVCache{ &a, &b }) |c| {
+            var v0 = try c.update(0, prefix, prefix, s, 0);
+            v0.deinit();
+        }
+        var snap = try b.snapshot();
+        defer snap.deinit();
+        for ([_]*KVCache{ &a, &b }) |c| {
+            var v1 = try c.update(0, verify, verify, s, 0);
+            v1.deinit();
+        }
+        const keep = 4 + 1 + accepted;
+        try a.truncate(keep, s);
+        try b.restore(&snap);
+        const kept = try drafterRollbackRowsSlice(verify, 1 + accepted, s);
+        defer _ = mlx.mlx_array_free(kept);
+        var v2 = try b.update(0, kept, kept, s, 0);
+        v2.deinit();
+        try testing.expectEqual(b.step, a.step);
+        try testing.expectEqual(b.entries[0].offset, a.entries[0].offset);
+        try testing.expectEqual(@as(usize, keep), a.entries[0].offset);
+        var va = try a.update(0, next, next, s, 0);
+        defer va.deinit();
+        var vb = try b.update(0, next, next, s, 0);
+        defer vb.deinit();
+        try testing.expectEqualSlices(c_int, mlx.getShape(vb.k), mlx.getShape(va.k));
+        try testing.expect(probeBitEqual(s, va.k, vb.k));
+        try testing.expect(probeBitEqual(s, va.v, vb.v));
+    }
+}
+
+test "drafter-no-snapshot the snapshot-skip prediction agrees with truncate after the verify's write" {
+    // `truncateServesAfterWrite(len, rows)`, read before a write of `rows` rows, must say whether
+    // `truncate(len)` then succeeds. Full buffers always serve; a sliding ring (keep and window set by hand, as a ring
+    // restored from disk carries them) serves only while the rows it would drop on a grow stay below `len`.
+    const s = mlx.gpuStream();
+    const cases = [_]struct { prefix: usize, ring: usize }{
+        .{ .prefix = 4, .ring = 0 },   .{ .prefix = 600, .ring = 0 },
+        .{ .prefix = 4, .ring = 8 },   .{ .prefix = 254, .ring = 8 },
+        .{ .prefix = 255, .ring = 8 }, .{ .prefix = 510, .ring = 8 },
+        .{ .prefix = 511, .ring = 8 }, .{ .prefix = 600, .ring = 600 },
+    };
+    var refused: usize = 0;
+    for (cases) |c| for ([_]usize{ 1, 0 }) |deep| {
+        // the round's own shortest kept length (prefix + 1), and a deeper rewind that a ring which dropped rows refuses
+        if (deep == 0 and c.prefix <= 8) continue;
+        var cache = try KVCache.init(testing.allocator, 1);
+        defer cache.deinit();
+        const prefix = try drafterRollbackRows(100, c.prefix, s);
+        defer _ = mlx.mlx_array_free(prefix);
+        var v0 = try cache.update(0, prefix, prefix, s, 0);
+        v0.deinit();
+        cache.entries[0].keep = c.ring;
+        cache.entries[0].window = c.ring;
+        const len = if (deep == 1) c.prefix + 1 else c.prefix - 4;
+        const predicted = cache.truncateServesAfterWrite(len, 3);
+        const verify = try drafterRollbackRows(9000, 3, s);
+        defer _ = mlx.mlx_array_free(verify);
+        var v1 = try cache.update(0, verify, verify, s, 0);
+        v1.deinit();
+        const served = if (cache.truncate(len, s)) |_| true else |err| blk: {
+            try testing.expectEqual(error.SlidingRowsDropped, err);
+            break :blk false;
+        };
+        try testing.expectEqual(served, predicted);
+        if (!served) refused += 1;
+    };
+    // the cases include rings that refuse, or the check would only ever see `true`
+    try testing.expect(refused > 0);
+}
+
 test "KVCache step without trimming matches offset" {
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 1);
@@ -19817,6 +21812,112 @@ test "KVCache snapshot/restore round-trip preserves entries and step" {
     try testing.expectEqual(@as(usize, 4), cache.entries[1].offset);
 }
 
+test "first-token-prebuild a shadow clone takes a write the live cache never sees, and adopting it equals writing the live cache" {
+    const s = mlx.gpuStream();
+    var live = try KVCache.init(testing.allocator, 2);
+    defer live.deinit();
+    var ref = try KVCache.init(testing.allocator, 2);
+    defer ref.deinit();
+    for (0..2) |layer| {
+        const k = testKV(4, s);
+        defer _ = mlx.mlx_array_free(k);
+        const v = testKV(4, s);
+        defer _ = mlx.mlx_array_free(v);
+        _ = try live.update(@intCast(layer), k, v, s, 0);
+        _ = try ref.update(@intCast(layer), k, v, s, 0);
+    }
+    const before = live.entries[0];
+    const keys_id = headTailId(before.keys);
+    const view_id = headTailId(before.key_view);
+
+    var orig_ref = try live.shadowClone();
+    defer orig_ref.deinit();
+    try testing.expect(live.sameStateAs(&orig_ref));
+    var shadow = try live.shadowClone();
+    defer shadow.deinit();
+    try testing.expectEqual(keys_id, headTailId(shadow.entries[0].keys));
+    try testing.expectEqual(view_id, headTailId(shadow.entries[0].key_view));
+    try testing.expectEqual(before.kv_in_place_off, shadow.entries[0].kv_in_place_off);
+    const row_shape = [_]c_int{ 1, 1, 1, 1 };
+    for (0..2) |layer| {
+        // ones over a zero prefix, so a write landing in the live buffer shows in its data, not only its metadata
+        var k = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k);
+        try mlx.check(mlx.mlx_ones(&k, &row_shape, 4, .float32, s));
+        var v = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(v);
+        try mlx.check(mlx.mlx_ones(&v, &row_shape, 4, .float32, s));
+        _ = try shadow.update(@intCast(layer), k, v, s, 0);
+        _ = try ref.update(@intCast(layer), k, v, s, 0);
+    }
+    // The shadow's write is evaluated, then the live cache is read: still 4 rows of zeros, its own arrays and positions.
+    for (0..2) |layer| {
+        try mlx.check(mlx.mlx_array_eval(shadow.entries[layer].key_view));
+        for ([_]mlx.mlx_array{ live.entries[layer].keys, live.entries[layer].key_view, shadow.entries[layer].key_view }, [_]f32{ 0, 0, 1 }) |arr, want| {
+            var total = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(total);
+            try mlx.check(mlx.mlx_sum(&total, arr, false, s));
+            try mlx.check(mlx.mlx_array_eval(total));
+            var got: f32 = -1;
+            try mlx.check(mlx.mlx_array_item_float32(&got, total));
+            try testing.expectEqual(want, got);
+        }
+        try testing.expectEqual(@as(c_int, 4), mlx.getShape(live.entries[layer].key_view)[2]);
+    }
+    try testing.expect(live.sameStateAs(&orig_ref));
+    try testing.expect(!shadow.sameStateAs(&orig_ref));
+    // The live cache is exactly as before the shadow's write.
+    try testing.expectEqual(@as(usize, 4), live.step);
+    try testing.expectEqual(@as(usize, 4), live.entries[0].offset);
+    try testing.expectEqual(keys_id, headTailId(live.entries[0].keys));
+    try testing.expectEqual(view_id, headTailId(live.entries[0].key_view));
+    try testing.expectEqual(before.kv_in_place_off, live.entries[0].kv_in_place_off);
+    try testing.expectEqual(@as(usize, 5), shadow.step);
+
+    const shadow_keys = headTailId(shadow.entries[1].keys);
+    live.adoptShadow(&shadow);
+    try testing.expectEqual(@as(usize, 0), shadow.entries.len);
+    try testing.expectEqual(@as(usize, 5), live.step);
+    try testing.expectEqual(ref.entries[1].offset, live.entries[1].offset);
+    try testing.expectEqual(ref.entries[1].kv_in_place_off, live.entries[1].kv_in_place_off);
+    try testing.expectEqual(shadow_keys, headTailId(live.entries[1].keys));
+    for (0..2) |layer| {
+        var eq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(eq);
+        try mlx.check(mlx.mlx_array_equal(&eq, live.entries[layer].key_view, ref.entries[layer].key_view, false, s));
+        try mlx.check(mlx.mlx_array_eval(eq));
+        var same: bool = false;
+        try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+        try testing.expect(same);
+    }
+}
+
+test "first-token-prebuild the head-tail slot helpers keep, compare, move and put back the global slot" {
+    defer headTailClear();
+    const one = [_]c_int{1};
+    const a_val: f32 = 1.0;
+    const t_val: u32 = 7;
+    const own = mlx.mlx_array_new_data(&a_val, &one, 1, .float32);
+    const tok = mlx.mlx_array_new_data(&t_val, &one, 1, .uint32);
+    head_tail_slot = .{ .own = own, .id = headTailId(own), .tok = tok, .mask_id = 0 };
+
+    const kept = try Transformer.headTailSlotRef(); // a second handle on the same arrays
+    try testing.expect(Transformer.headTailSlotIs(kept));
+    var moved = Transformer.headTailSlotTake();
+    try testing.expect(!Transformer.headTailSlotIs(kept));
+    try testing.expectEqual(@as(usize, 0), head_tail_slot.id);
+    Transformer.headTailSlotPut(kept); // back as before, ownership to the slot
+    try testing.expect(Transformer.headTailSlotIs(moved));
+    Transformer.headTailSlotFree(&moved);
+    try testing.expectEqual(@as(usize, 0), moved.id);
+    try testing.expect(head_tail_slot.id != 0 and head_tail_slot.id == headTailId(head_tail_slot.own));
+    // An empty slot is still "the same" after a forward that did not touch it.
+    headTailClear();
+    var none = try Transformer.headTailSlotRef();
+    defer Transformer.headTailSlotFree(&none);
+    try testing.expect(Transformer.headTailSlotIs(none));
+}
+
 test "KVCache snapshot then more updates does not corrupt the snapshot" {
     // Critical invariant for spec-decode rollback: if we snapshot, then verify, then
     // (rejected) restore, snapshot must NOT have been mutated by the intervening
@@ -19866,7 +21967,10 @@ test "KVCache: an append after a short restore sizes its copy from the prefix, n
         fn f(str: mlx.mlx_stream, len: c_int) !mlx.mlx_array {
             const shape = [_]c_int{ 1, 2, len, 64 };
             var a = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_ones(&a, &shape, 4, .bfloat16, str));
+            mlx.check(mlx.mlx_ones(&a, &shape, 4, .bfloat16, str)) catch |e| {
+                _ = mlx.mlx_array_free(a); // a failed op frees its own output
+                return e;
+            };
             return a;
         }
     }.f;
@@ -19990,7 +22094,10 @@ fn kvAppendPacked(n: c_int, seq: c_int, seed: u32, s: mlx.mlx_stream) !mlx.mlx_a
     const f32_arr = mlx.mlx_array_new_data(buf.ptr, &shape, 4, .float32);
     defer _ = mlx.mlx_array_free(f32_arr);
     var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_astype(&out, f32_arr, .bfloat16, s));
+    mlx.check(mlx.mlx_astype(&out, f32_arr, .bfloat16, s)) catch |e| {
+        _ = mlx.mlx_array_free(out); // a failed op frees its own output
+        return e;
+    };
     return out;
 }
 
@@ -20247,7 +22354,10 @@ test "add_norm: plain and MoE-combine arms match the composed ops" {
             const src = mlx.mlx_array_new_data(&buf, shape.ptr, @intCast(shape.len), .float32);
             defer _ = mlx.mlx_array_free(src);
             var out = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_astype(&out, src, dt, st));
+            mlx.check(mlx.mlx_astype(&out, src, dt, st)) catch |e| {
+                _ = mlx.mlx_array_free(out); // a failed op frees its own output
+                return e;
+            };
             return out;
         }
     }.f;
@@ -20442,7 +22552,10 @@ test "affineParamsFromGeometry: exact per-weight solve for off-config sidecar qu
     const mk = struct {
         fn arr(shape: []const c_int, dt: mlx.mlx_dtype, st: mlx.mlx_stream) !mlx.mlx_array {
             var a = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_zeros(&a, shape.ptr, shape.len, dt, st));
+            mlx.check(mlx.mlx_zeros(&a, shape.ptr, shape.len, dt, st)) catch |e| {
+                _ = mlx.mlx_array_free(a); // a failed op frees its own output
+                return e;
+            };
             return a;
         }
     };
@@ -20508,7 +22621,10 @@ test "computeQuantParams resolves an fp override INSIDE the fp family (mxfp8 emb
     const mk = struct {
         fn arr(shape: []const c_int, dt: mlx.mlx_dtype, st: mlx.mlx_stream) !mlx.mlx_array {
             var a = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_zeros(&a, shape.ptr, shape.len, dt, st));
+            mlx.check(mlx.mlx_zeros(&a, shape.ptr, shape.len, dt, st)) catch |e| {
+                _ = mlx.mlx_array_free(a); // a failed op frees its own output
+                return e;
+            };
             return a;
         }
     };
@@ -20917,7 +23033,10 @@ test "fused softmax router folds the shared-expert gate's logit: routing unchang
             const a32 = mlx.mlx_array_new_data(buf.ptr, shape.ptr, @intCast(shape.len), .float32);
             defer _ = mlx.mlx_array_free(a32);
             var out = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_astype(&out, a32, .bfloat16, st));
+            mlx.check(mlx.mlx_astype(&out, a32, .bfloat16, st)) catch |e| {
+                _ = mlx.mlx_array_free(out); // a failed op frees its own output
+                return e;
+            };
             return out;
         }
     }.f;
@@ -21254,11 +23373,20 @@ test "fused QKV concatenation is bit-identical to three separate projections" {
                 defer _ = mlx.mlx_vector_array_free(triple);
                 try mlx.check(mlx.mlx_quantize(&triple, bf, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, s));
                 var w = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_vector_array_get(&w, triple, 0));
+                mlx.check(mlx.mlx_vector_array_get(&w, triple, 0)) catch |e| {
+                    _ = mlx.mlx_array_free(w); // a failed op frees its own output
+                    return e;
+                };
                 var sc = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_vector_array_get(&sc, triple, 1));
+                mlx.check(mlx.mlx_vector_array_get(&sc, triple, 1)) catch |e| {
+                    _ = mlx.mlx_array_free(sc); // a failed op frees its own output
+                    return e;
+                };
                 var bi = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_vector_array_get(&bi, triple, 2));
+                mlx.check(mlx.mlx_vector_array_get(&bi, triple, 2)) catch |e| {
+                    _ = mlx.mlx_array_free(bi); // a failed op frees its own output
+                    return e;
+                };
                 made[i] = .{ .w = w, .s = sc, .b = bi };
             }
             qw = made[0].w;
@@ -21454,7 +23582,7 @@ test "fused row projections are bit-identical to the separate matmuls at decode 
 
 test "fused residual norm chain is bit-identical to the composed ops in every stage combination" {
     // Bar: pre-norm / scale / post-norm on and off in all eight combinations,
-    // aligned and ragged widths, rows 1 and 3, bf16 and f32, byte for byte
+    // aligned and ragged widths, the first and third rows, bf16 and f32, byte for byte
     // against rms_norm -> add -> multiply -> rms_norm as separate MLX ops.
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
@@ -21476,7 +23604,10 @@ test "fused residual norm chain is bit-identical to the composed ops in every st
             const a32 = mlx.mlx_array_new_data(buf.ptr, shape.ptr, @intCast(shape.len), .float32);
             defer _ = mlx.mlx_array_free(a32);
             var out = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_astype(&out, a32, dt, st));
+            mlx.check(mlx.mlx_astype(&out, a32, dt, st)) catch |e| {
+                _ = mlx.mlx_array_free(out); // a failed op frees its own output
+                return e;
+            };
             return out;
         }
     }.f;
@@ -21546,7 +23677,10 @@ fn parityRand(rnd: std.Random, shape: []const c_int, scale: f32, dt: mlx.mlx_dty
     const b = try attn256RandBf16Scaled(rnd, shape, scale, s);
     defer _ = mlx.mlx_array_free(b);
     var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_astype(&out, b, dt, s));
+    mlx.check(mlx.mlx_astype(&out, b, dt, s)) catch |e| {
+        _ = mlx.mlx_array_free(out); // a failed op frees its own output
+        return e;
+    };
     return out;
 }
 
@@ -21756,7 +23890,10 @@ test "fused residual norm chain: two normed branches, combine norm and both post
             const a32 = mlx.mlx_array_new_data(buf.ptr, shape.ptr, @intCast(shape.len), .float32);
             defer _ = mlx.mlx_array_free(a32);
             var out = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_astype(&out, a32, .bfloat16, st));
+            mlx.check(mlx.mlx_astype(&out, a32, .bfloat16, st)) catch |e| {
+                _ = mlx.mlx_array_free(out); // a failed op frees its own output
+                return e;
+            };
             return out;
         }
     }.f;
@@ -22011,9 +24148,15 @@ test "fused gate+up+SwiGLU expert kernel is bit-identical to the split gatherQmv
             defer _ = mlx.mlx_vector_array_free(triple);
             try mlx.check(mlx.mlx_quantize(&triple, wb, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(bits)), if (nvfp4) "nvfp4" else "affine", .{}, s));
             var wq = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_vector_array_get(&wq, triple, 0));
+            mlx.check(mlx.mlx_vector_array_get(&wq, triple, 0)) catch |e| {
+                _ = mlx.mlx_array_free(wq); // a failed op frees its own output
+                return e;
+            };
             var sc = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_vector_array_get(&sc, triple, 1));
+            mlx.check(mlx.mlx_vector_array_get(&sc, triple, 1)) catch |e| {
+                _ = mlx.mlx_array_free(sc); // a failed op frees its own output
+                return e;
+            };
             var bias = mlx.mlx_array{ .ctx = null };
             if (!nvfp4) {
                 bias = mlx.mlx_array_new();
@@ -22086,7 +24229,10 @@ fn moeRowsAffineBank(s: mlx.mlx_stream, rnd: std.Random, E: c_int, N: c_int, K: 
     try mlx.check(mlx.mlx_random_key(&key, rnd.int(u64)));
     const w_shape = [_]c_int{ E, N, words };
     var w = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_random_bits(&w, &w_shape, 3, 4, key, s));
+    mlx.check(mlx.mlx_random_bits(&w, &w_shape, 3, 4, key, s)) catch |e| {
+        _ = mlx.mlx_array_free(w); // a failed op frees its own output
+        return e;
+    };
     const s_shape = [_]c_int{ E, N, groups };
     const sc = try testRandUniformBf16(rnd, &s_shape, 0.01, 0.06, s);
     const bi = try testRandUniformBf16(rnd, &s_shape, -0.5, 0.5, s);
@@ -22331,6 +24477,265 @@ fn moeRowsFusedCase(s: mlx.mlx_stream, rnd: std.Random, E: c_int, hid: c_int, in
     }
 }
 
+test "moe-rows-gelu: MLX_SERVE_MOE_ROWS_GELU_OFF keeps gelu_approx off the MoE rows arm, silu unchanged" {
+    moe_rows_fused_override = true;
+    defer moe_rows_fused_override = null;
+    moe_verify_rows_override = true;
+    defer moe_verify_rows_override = null;
+    downred_override = true;
+    defer downred_override = null;
+    defer moe_rows_gelu_off_override = null;
+    const qp = QuantParams{ .bits = 4, .group_size = 64 };
+    // Gemma 4 26B-A4B geometry: hidden 2816.
+    moe_rows_gelu_off_override = false;
+    try std.testing.expect(moeRowsActOk(model_mod.HiddenAct.gelu_approx));
+    try std.testing.expect(gatherQmvDownReduceRowsEligible(model_mod.HiddenAct.gelu_approx, qp, qp, qp, 2816));
+    try std.testing.expect(gatherQmvDownReduceRowsEligible(model_mod.HiddenAct.silu, qp, qp, qp, 2816));
+    // The switch on: today's dispatch, the rows arm declines gelu_approx and the sorted chain runs.
+    moe_rows_gelu_off_override = true;
+    try std.testing.expect(!moeRowsActOk(model_mod.HiddenAct.gelu_approx));
+    try std.testing.expect(!gatherQmvDownReduceRowsEligible(model_mod.HiddenAct.gelu_approx, qp, qp, qp, 2816));
+    try std.testing.expect(gatherQmvDownReduceRowsEligible(model_mod.HiddenAct.silu, qp, qp, qp, 2816));
+    try std.testing.expect(moeRowsActOk(model_mod.HiddenAct.silu));
+    // The arm choice itself does not depend on the activation; the eligibility above is what declines.
+    try std.testing.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(1, 4, 8, false, false));
+
+    try std.testing.expect(!moeRowsGeluOffFor(null));
+    try std.testing.expect(moeRowsGeluOffFor("1"));
+    try std.testing.expect(!moeRowsGeluOffFor("0"));
+}
+
+test "moe-rows-gelu: the gelu_approx rows arm matches the sorted chain and one-row affine-4 decode at 2, 3, 4 and 7 rows" {
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0x153E);
+    const rnd = prng.random();
+    moe_rows_fused_override = true;
+    defer moe_rows_fused_override = null;
+    gqmv_gateup_override = true;
+    defer gqmv_gateup_override = null;
+    downred_override = true;
+    defer downred_override = null;
+    moe_affine4.override = true;
+    defer moe_affine4.override = null;
+    // Gemma 4 26B-A4B geometry (hidden 2816, expert intermediate 704, top 8), 4-bit affine at group 64.
+    const E: c_int = 16;
+    const H: c_int = 2816;
+    const I: c_int = 704;
+    const TOPK: c_int = 8;
+    const gate = try moeRowsGeluQuantBank(s, rnd, E, I, H);
+    defer moeRowsGeluFreeBank(gate);
+    const up = try moeRowsGeluQuantBank(s, rnd, E, I, H);
+    defer moeRowsGeluFreeBank(up);
+    const down = try moeRowsGeluQuantBank(s, rnd, E, H, I);
+    defer moeRowsGeluFreeBank(down);
+
+    // The GELU-tanh table over every bf16 pattern, computed in f64 and rounded once to bf16 (as in
+    // moe_affine4's GELU test). All three paths read the same table, so the comparison is of the arms.
+    const NT: usize = 1 << 16;
+    const tb = try std.testing.allocator.alloc(f32, NT);
+    defer std.testing.allocator.free(tb);
+    for (tb, 0..) |*v, i| {
+        const xv: f64 = @floatCast(@as(f32, @bitCast(@as(u32, @intCast(i)) << 16)));
+        const gv = 0.5 * xv * (1.0 + std.math.tanh(0.7978845608028654 * (xv + 0.044715 * xv * xv * xv)));
+        v.* = if (std.math.isFinite(gv)) @floatCast(gv) else @floatCast(xv);
+    }
+    const t32 = mlx.mlx_array_new_data(tb.ptr, &[_]c_int{@intCast(NT)}, 1, .float32);
+    defer _ = mlx.mlx_array_free(t32);
+    var table = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(table);
+    try mlx.check(mlx.mlx_astype(&table, t32, .bfloat16, s));
+    try mlx.check(mlx.mlx_array_eval(table));
+
+    for ([_]c_int{ 2, 3, 4, 7 }) |R| try moeRowsGeluGeluRowsCase(s, rnd, gate, up, down, table, R, E, H, TOPK);
+}
+
+pub const MoeRowsGeluBank = struct { w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array };
+
+/// A random [E, N, K] bf16 bank in U(-0.05, 0.05), quantized 4-bit affine at group 64. With x in
+/// U(-1, 1) over K = 2816 the gate pre-activations have a standard deviation near 0.9, the range
+/// where GELU-tanh and SiLU differ by about 10% (the control below relies on it).
+fn moeRowsGeluQuantBank(s: mlx.mlx_stream, rnd: std.Random, E: c_int, N: c_int, K: c_int) !MoeRowsGeluBank {
+    const w = try testRandUniformBf16(rnd, &[_]c_int{ E, N, K }, -0.05, 0.05, s);
+    defer _ = mlx.mlx_array_free(w);
+    var triple = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(triple);
+    try mlx.check(mlx.mlx_quantize(&triple, w, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, s));
+    var b: MoeRowsGeluBank = .{ .w = mlx.mlx_array_new(), .sc = mlx.mlx_array_new(), .bi = mlx.mlx_array_new() };
+    try mlx.check(mlx.mlx_vector_array_get(&b.w, triple, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&b.sc, triple, 1));
+    try mlx.check(mlx.mlx_vector_array_get(&b.bi, triple, 2));
+    return b;
+}
+
+fn moeRowsGeluFreeBank(b: MoeRowsGeluBank) void {
+    _ = mlx.mlx_array_free(b.w);
+    _ = mlx.mlx_array_free(b.sc);
+    _ = mlx.mlx_array_free(b.bi);
+}
+
+/// sqrt(sum (a - b)^2 / sum b^2) over the whole array, read on the host in f32.
+fn moeRowsGeluRelRms(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !f64 {
+    var arrs: [2]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new() };
+    defer for (arrs) |v| {
+        _ = mlx.mlx_array_free(v);
+    };
+    for (&arrs, [_]mlx.mlx_array{ a, b }) |*o, src| {
+        var c = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(c);
+        try mlx.check(mlx.mlx_contiguous(&c, src, false, s));
+        try mlx.check(mlx.mlx_astype(o, c, .float32, s));
+        try mlx.check(mlx.mlx_array_eval(o.*));
+    }
+    const n = mlx.mlx_array_size(arrs[0]);
+    if (n != mlx.mlx_array_size(arrs[1])) return error.ShapeMismatch;
+    const ad = mlx.mlx_array_data_float32(arrs[0]) orelse return error.InvalidDtype;
+    const bd = mlx.mlx_array_data_float32(arrs[1]) orelse return error.InvalidDtype;
+    var se: f64 = 0;
+    var sb: f64 = 0;
+    for (0..n) |i| {
+        if (!std.math.isFinite(ad[i])) return error.NotFinite;
+        const d: f64 = @as(f64, ad[i]) - @as(f64, bd[i]);
+        se += d * d;
+        sb += @as(f64, bd[i]) * @as(f64, bd[i]);
+    }
+    return @sqrt(se / sb);
+}
+
+/// The sorted chain moeMLP2WithRouter runs for 2 to 8 rows when the rows arm declines (stock
+/// gather_qmm, no NAX, no fused prefill tiles at these sizes): argsort the flat routes, gather
+/// gate and up sorted, `tableGateMul(.gelu_tanh)` (computeGeglu's fused GeGLU), gather down,
+/// inverse-permute, multiply by the scores and sum over the K axis.
+fn moeRowsGeluSortedChainRef(s: mlx.mlx_stream, x: mlx.mlx_array, gate: MoeRowsGeluBank, up: MoeRowsGeluBank, down: MoeRowsGeluBank, inds: mlx.mlx_array, scores: mlx.mlx_array, table: mlx.mlx_array, K: c_int) !mlx.mlx_array {
+    const xs = mlx.getShape(x);
+    const R = xs[0];
+    const H = xs[1];
+    const total = R * K;
+    const no_idx = mlx.mlx_array{ .ctx = null };
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    try mlx.check(mlx.mlx_reshape(&flat, inds, &[_]c_int{total}, 1, s));
+    var order = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(order);
+    try mlx.check(mlx.mlx_argsort_axis(&order, flat, 0, s));
+    var inv = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(inv);
+    try mlx.check(mlx.mlx_argsort_axis(&inv, order, 0, s));
+    var sorted = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sorted);
+    try mlx.check(mlx.mlx_take_axis(&sorted, flat, order, 0, s));
+    const k_arr = mlx.mlx_array_new_int(K);
+    defer _ = mlx.mlx_array_free(k_arr);
+    var lhs = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(lhs);
+    try mlx.check(mlx.mlx_floor_divide(&lhs, order, k_arr, s));
+    var xg = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(xg);
+    try mlx.check(mlx.mlx_take_axis(&xg, x, lhs, 0, s));
+    var xrep = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(xrep);
+    try mlx.check(mlx.mlx_reshape(&xrep, xg, &[_]c_int{ total, 1, H }, 3, s));
+    var g3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g3);
+    try gatherExpertMm(&g3, xrep, gate.w, gate.sc, gate.bi, no_idx, sorted, 4, 64, .affine, true, s);
+    var g = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g);
+    try mlx.check(mlx.mlx_squeeze(&g, g3, s));
+    var up3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(up3);
+    try gatherExpertMm(&up3, xrep, up.w, up.sc, up.bi, no_idx, sorted, 4, 64, .affine, true, s);
+    var u = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(u);
+    try mlx.check(mlx.mlx_squeeze(&u, up3, s));
+    const act = (try tableGateMul(s, .gelu_tanh, g, u, table, null)) orelse return error.ChainDeclined;
+    defer _ = mlx.mlx_array_free(act);
+    var ae = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ae);
+    try mlx.check(mlx.mlx_expand_dims(&ae, act, -2, s));
+    var d3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(d3);
+    try gatherExpertMm(&d3, ae, down.w, down.sc, down.bi, no_idx, sorted, 4, 64, .affine, true, s);
+    var d = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(d);
+    try mlx.check(mlx.mlx_squeeze(&d, d3, s));
+    var du = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(du);
+    try mlx.check(mlx.mlx_take_axis(&du, d, inv, 0, s));
+    var d4 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(d4);
+    try mlx.check(mlx.mlx_reshape(&d4, du, &[_]c_int{ R, K, H }, 3, s));
+    var se = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(se);
+    try mlx.check(mlx.mlx_expand_dims(&se, scores, -1, s));
+    var weighted = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(weighted);
+    try mlx.check(mlx.mlx_multiply(&weighted, d4, se, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_sum_axis(&out, weighted, -2, false, s));
+    return out;
+}
+
+fn moeRowsGeluGeluRowsCase(s: mlx.mlx_stream, rnd: std.Random, gate: MoeRowsGeluBank, up: MoeRowsGeluBank, down: MoeRowsGeluBank, table: mlx.mlx_array, R: c_int, E: c_int, H: c_int, TOPK: c_int) !void {
+    const x = try testRandUniformBf16(rnd, &[_]c_int{ R, H }, -1.0, 1.0, s);
+    defer _ = mlx.mlx_array_free(x);
+    const scores = try testRandUniformBf16(rnd, &[_]c_int{ R, TOPK }, 0.02, 0.3, s);
+    defer _ = mlx.mlx_array_free(scores);
+    // Distinct experts within a row (3 is coprime to E = 16), shared across rows so the sorted chain groups them.
+    // MLX copies the first R * TOPK entries (the shape's size).
+    var idata: [8 * 8]u32 = @splat(0);
+    for (0..@intCast(R)) |ri| {
+        for (0..@intCast(TOPK)) |ki| idata[ri * @as(usize, @intCast(TOPK)) + ki] = @intCast((ri * 5 + ki * 3) % @as(usize, @intCast(E)));
+    }
+    const inds = mlx.mlx_array_new_data(&idata, &[_]c_int{ R, TOPK }, 2, .uint32);
+    defer _ = mlx.mlx_array_free(inds);
+
+    const gu = (try gatherQmvGateUpRowsAct(s, x, gate.w, gate.sc, gate.bi, up.w, up.sc, up.bi, inds, 4, 64, .affine, null, table)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(gu);
+    const rows = (try gatherQmvDownReduceRows(s, gu, down.w, down.sc, down.bi, inds, scores, 4, 64, .affine)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(rows);
+    const chain = try moeRowsGeluSortedChainRef(s, x, gate, up, down, inds, scores, table, TOPK);
+    defer _ = mlx.mlx_array_free(chain);
+
+    // Tolerance 1e-2 relative RMS. Every path rounds gate and up to bf16 after an f32 dot product
+    // and reads the same table, so they differ only by f32 summation order (a gate value off by one
+    // bf16 ulp, 2^-8 relative, now and then) and by how the K = 8 weighted slots are summed: the rows
+    // kernel rounds each slot product and each running sum to bf16 (up to 8 half-ulp roundings,
+    // about 2e-3 to 6e-3 relative per element), the chain sums the bf16 products in one reduction
+    // and the one-row kernel accumulates all slots in f32. That puts the expected relative RMS near
+    // 2e-3 to 3e-3, so 1e-2 leaves a 3x margin, while the wrong activation (the SiLU control below)
+    // lands above 3e-2.
+    const tol: f64 = 1e-2;
+    const rel_chain = try moeRowsGeluRelRms(rows, chain, s);
+
+    var worst_solo: f64 = 0;
+    var r: c_int = 0;
+    while (r < R) : (r += 1) {
+        const xr = try moeRowsSliceRow(s, x, r);
+        defer _ = mlx.mlx_array_free(xr);
+        const ir = try moeRowsSliceRow(s, inds, r);
+        defer _ = mlx.mlx_array_free(ir);
+        const sr = try moeRowsSliceRow(s, scores, r);
+        defer _ = mlx.mlx_array_free(sr);
+        const solo = (try moe_affine4.decodeAct(s, xr, moe_affine4.Bank{ .w = gate.w, .s = gate.sc, .b = gate.bi }, moe_affine4.Bank{ .w = up.w, .s = up.sc, .b = up.bi }, moe_affine4.Bank{ .w = down.w, .s = down.sc, .b = down.bi }, null, null, null, ir, sr, table, 64, true, null)) orelse return error.OneRowDeclined;
+        defer _ = mlx.mlx_array_free(solo);
+        const rr = try moeRowsSliceRow(s, rows, r);
+        defer _ = mlx.mlx_array_free(rr);
+        worst_solo = @max(worst_solo, try moeRowsGeluRelRms(rr, solo, s));
+    }
+
+    // Control: the same rows kernels with the SiLU table must land far from the GELU chain.
+    const gu_silu = (try gatherQmvGateUpRowsAct(s, x, gate.w, gate.sc, gate.bi, up.w, up.sc, up.bi, inds, 4, 64, .affine, null, null)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(gu_silu);
+    const rows_silu = (try gatherQmvDownReduceRows(s, gu_silu, down.w, down.sc, down.bi, inds, scores, 4, 64, .affine)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(rows_silu);
+    const rel_silu = try moeRowsGeluRelRms(rows_silu, chain, s);
+
+    std.debug.print("\n[moe-rows-gelu test] R={d}: rel_rms vs sorted chain={e:.3}, worst row vs one-row affine-4={e:.3}, silu control vs chain={e:.3}\n", .{ R, rel_chain, worst_solo, rel_silu });
+    try std.testing.expect(rel_chain < tol);
+    try std.testing.expect(worst_solo < tol);
+    try std.testing.expect(rel_silu > 3e-2);
+}
+
 test "moe rows fused nvfp4: verify rows with per-expert gate scales match fp32 truth" {
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x4E5F);
@@ -22370,7 +24775,10 @@ test "moe rows fused nvfp4: verify rows with per-expert gate scales match fp32 t
             _ = try P.keep(&tr, x.*);
         }
         var dq = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_dequantize(&dq, b[0], b[1], .{ .ctx = null }, mlx.mlx_optional_int.some(16), mlx.mlx_optional_int.some(4), "nvfp4", .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
+        mlx.check(mlx.mlx_dequantize(&dq, b[0], b[1], .{ .ctx = null }, mlx.mlx_optional_int.some(16), mlx.mlx_optional_int.some(4), "nvfp4", .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s)) catch |e| {
+            _ = mlx.mlx_array_free(dq); // a failed op frees its own output
+            return e;
+        };
         d.* = try P.keep(&tr, dq);
     }
     const gsc = try P.keep(&tr, try attn256RandBf16(rnd, &[_]c_int{E}, s));
@@ -25086,7 +27494,7 @@ test "NAX host scaffolding: zero-pad to 16 rows + slice-back are exact (runs off
         defer _ = mlx.mlx_array_free(x);
         try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
 
-        // Pad half: [1, m, K] → [16, K]; real rows byte-preserved, pad rows 0.
+        // Pad half: [1, m, K] → [16, K]; real rows byte-preserved, the padding rows zero.
         const x16 = try naxPadRows(s, x, m, 16, K, .bfloat16);
         defer _ = mlx.mlx_array_free(x16);
         const psh = mlx.getShape(x16);
@@ -25221,12 +27629,18 @@ test "MoE decode gather µbench (MLX_SERVE_MOE_GATHER_UBENCH=1)" {
                 const sc = mlx.mlx_array_new_float(add);
                 defer _ = mlx.mlx_array_free(sc);
                 var xa = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_add(&xa, xe, sc, str));
+                mlx.check(mlx.mlx_add(&xa, xe, sc, str)) catch |e| {
+                    _ = mlx.mlx_array_free(xa); // a failed op frees its own output
+                    return e;
+                };
                 _ = mlx.mlx_array_free(xe);
                 xe = xa;
             }
             var out5 = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_gather_qmm(&out5, xe, bank[0], bank[1], bank[2], .{ .ctx = null }, ind, true, mlx.mlx_optional_int.some(GS), mlx.mlx_optional_int.some(BITS), "affine", false, str));
+            mlx.check(mlx.mlx_gather_qmm(&out5, xe, bank[0], bank[1], bank[2], .{ .ctx = null }, ind, true, mlx.mlx_optional_int.some(GS), mlx.mlx_optional_int.some(BITS), "affine", false, str)) catch |e| {
+                _ = mlx.mlx_array_free(out5); // a failed op frees its own output
+                return e;
+            };
             return out5;
         }
     }.go;
@@ -25267,7 +27681,10 @@ test "MoE decode gather µbench (MLX_SERVE_MOE_GATHER_UBENCH=1)" {
                     first = false;
                 } else {
                     var na = mlx.mlx_array_new();
-                    try mlx.check(mlx.mlx_add(&na, acc, g, s));
+                    mlx.check(mlx.mlx_add(&na, acc, g, s)) catch |e| {
+                        _ = mlx.mlx_array_free(na); // a failed op frees its own output
+                        return e;
+                    };
                     _ = mlx.mlx_array_free(acc);
                     _ = mlx.mlx_array_free(g);
                     acc = na;
@@ -25290,7 +27707,10 @@ test "MoE decode gather µbench (MLX_SERVE_MOE_GATHER_UBENCH=1)" {
                     first = false;
                 } else {
                     var na = mlx.mlx_array_new();
-                    try mlx.check(mlx.mlx_add(&na, acc, g, s));
+                    mlx.check(mlx.mlx_add(&na, acc, g, s)) catch |e| {
+                        _ = mlx.mlx_array_free(na); // a failed op frees its own output
+                        return e;
+                    };
                     _ = mlx.mlx_array_free(acc);
                     _ = mlx.mlx_array_free(g);
                     acc = na;
@@ -25343,7 +27763,10 @@ test "MoE decode gather µbench (MLX_SERVE_MOE_GATHER_UBENCH=1)" {
                 }
                 defer _ = mlx.mlx_array_free(xe);
                 var out = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_quantized_matmul(&out, xe, wq_, wsc_, wbi_, true, mlx.mlx_optional_int.some(GS), mlx.mlx_optional_int.some(BITS), "affine", str));
+                mlx.check(mlx.mlx_quantized_matmul(&out, xe, wq_, wsc_, wbi_, true, mlx.mlx_optional_int.some(GS), mlx.mlx_optional_int.some(BITS), "affine", str)) catch |e| {
+                    _ = mlx.mlx_array_free(out); // a failed op frees its own output
+                    return e;
+                };
                 return out;
             }
         }.go;
@@ -25361,7 +27784,10 @@ test "MoE decode gather µbench (MLX_SERVE_MOE_GATHER_UBENCH=1)" {
                     first = false;
                 } else {
                     var na = mlx.mlx_array_new();
-                    try mlx.check(mlx.mlx_add(&na, acc, g, s));
+                    mlx.check(mlx.mlx_add(&na, acc, g, s)) catch |e| {
+                        _ = mlx.mlx_array_free(na); // a failed op frees its own output
+                        return e;
+                    };
                     _ = mlx.mlx_array_free(acc);
                     _ = mlx.mlx_array_free(g);
                     acc = na;
@@ -25384,7 +27810,10 @@ test "MoE decode gather µbench (MLX_SERVE_MOE_GATHER_UBENCH=1)" {
                     first = false;
                 } else {
                     var na = mlx.mlx_array_new();
-                    try mlx.check(mlx.mlx_add(&na, acc, g, s));
+                    mlx.check(mlx.mlx_add(&na, acc, g, s)) catch |e| {
+                        _ = mlx.mlx_array_free(na); // a failed op frees its own output
+                        return e;
+                    };
                     _ = mlx.mlx_array_free(acc);
                     _ = mlx.mlx_array_free(g);
                     acc = na;
@@ -25423,7 +27852,10 @@ test "MoE decode gather µbench (MLX_SERVE_MOE_GATHER_UBENCH=1)" {
                     const scl = mlx.mlx_array_new_float(add);
                     defer _ = mlx.mlx_array_free(scl);
                     var xa = mlx.mlx_array_new();
-                    try mlx.check(mlx.mlx_add(&xa, xe, scl, str));
+                    mlx.check(mlx.mlx_add(&xa, xe, scl, str)) catch |e| {
+                        _ = mlx.mlx_array_free(xa); // a failed op frees its own output
+                        return e;
+                    };
                     _ = mlx.mlx_array_free(xe);
                     xe = xa;
                 }
@@ -25433,7 +27865,10 @@ test "MoE decode gather µbench (MLX_SERVE_MOE_GATHER_UBENCH=1)" {
                 defer _ = mlx.mlx_array_free(xbc);
                 try mlx.check(mlx.mlx_broadcast_to(&xbc, xe, &bsh, 3, str));
                 var out = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_quantized_matmul(&out, xbc, wq_, wsc_, wbi_, true, mlx.mlx_optional_int.some(GS), mlx.mlx_optional_int.some(BITS), "affine", str));
+                mlx.check(mlx.mlx_quantized_matmul(&out, xbc, wq_, wsc_, wbi_, true, mlx.mlx_optional_int.some(GS), mlx.mlx_optional_int.some(BITS), "affine", str)) catch |e| {
+                    _ = mlx.mlx_array_free(out); // a failed op frees its own output
+                    return e;
+                };
                 return out; // [10,1,N]
             }
         }.go;
@@ -25451,7 +27886,10 @@ test "MoE decode gather µbench (MLX_SERVE_MOE_GATHER_UBENCH=1)" {
                     first = false;
                 } else {
                     var na = mlx.mlx_array_new();
-                    try mlx.check(mlx.mlx_add(&na, acc, g, s));
+                    mlx.check(mlx.mlx_add(&na, acc, g, s)) catch |e| {
+                        _ = mlx.mlx_array_free(na); // a failed op frees its own output
+                        return e;
+                    };
                     _ = mlx.mlx_array_free(acc);
                     _ = mlx.mlx_array_free(g);
                     acc = na;
@@ -25474,7 +27912,10 @@ test "MoE decode gather µbench (MLX_SERVE_MOE_GATHER_UBENCH=1)" {
                     first = false;
                 } else {
                     var na = mlx.mlx_array_new();
-                    try mlx.check(mlx.mlx_add(&na, acc, g, s));
+                    mlx.check(mlx.mlx_add(&na, acc, g, s)) catch |e| {
+                        _ = mlx.mlx_array_free(na); // a failed op frees its own output
+                        return e;
+                    };
                     _ = mlx.mlx_array_free(acc);
                     _ = mlx.mlx_array_free(g);
                     acc = na;
@@ -25554,12 +27995,18 @@ test "MoE decode gather µbench (MLX_SERVE_MOE_GATHER_UBENCH=1)" {
                     const sc = mlx.mlx_array_new_float(add);
                     defer _ = mlx.mlx_array_free(sc);
                     var xa = mlx.mlx_array_new();
-                    try mlx.check(mlx.mlx_add(&xa, xe, sc, str));
+                    mlx.check(mlx.mlx_add(&xa, xe, sc, str)) catch |e| {
+                        _ = mlx.mlx_array_free(xa); // a failed op frees its own output
+                        return e;
+                    };
                     _ = mlx.mlx_array_free(xe);
                     xe = xa;
                 }
                 var out5 = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_gather_qmm(&out5, xe, bank[0], bank[1], bank[2], lhs, ind, true, mlx.mlx_optional_int.some(GS), mlx.mlx_optional_int.some(BITS), "affine", false, str));
+                mlx.check(mlx.mlx_gather_qmm(&out5, xe, bank[0], bank[1], bank[2], lhs, ind, true, mlx.mlx_optional_int.some(GS), mlx.mlx_optional_int.some(BITS), "affine", false, str)) catch |e| {
+                    _ = mlx.mlx_array_free(out5); // a failed op frees its own output
+                    return e;
+                };
                 return out5;
             }
         }.go;
@@ -25594,7 +28041,10 @@ test "MoE decode gather µbench (MLX_SERVE_MOE_GATHER_UBENCH=1)" {
                             first = false;
                         } else {
                             var na = mlx.mlx_array_new();
-                            try mlx.check(mlx.mlx_add(&na, acc, g, str));
+                            mlx.check(mlx.mlx_add(&na, acc, g, str)) catch |e| {
+                                _ = mlx.mlx_array_free(na); // a failed op frees its own output
+                                return e;
+                            };
                             _ = mlx.mlx_array_free(acc);
                             _ = mlx.mlx_array_free(g);
                             acc = na;
@@ -25642,7 +28092,10 @@ test "MoE decode gather µbench (MLX_SERVE_MOE_GATHER_UBENCH=1)" {
                 const scl = mlx.mlx_array_new_float(@as(f32, @floatFromInt(j)) * 0.001);
                 defer _ = mlx.mlx_array_free(scl);
                 var xa = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_add(&xa, xr, scl, s));
+                mlx.check(mlx.mlx_add(&xa, xr, scl, s)) catch |e| {
+                    _ = mlx.mlx_array_free(xa); // a failed op frees its own output
+                    return e;
+                };
                 try mlx.check(mlx.mlx_array_eval(xa)); // materialize: no producer left
                 slot.* = xa;
             }
@@ -26296,11 +28749,20 @@ test "prefill qmm µbench: stock qmm vs dequant+GEMM at 27B prefill shapes (MLX_
                 while (it < WARM + ITERS) : (it += 1) {
                     if (it == WARM) sw.reset();
                     var dq = mlx.mlx_array_new();
-                    try mlx.check(mlx.mlx_dequantize(&dq, wq, wsc, wbi, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(sh.bits), "affine", .{ .ctx = null }, mlx.mlx_optional_dtype{ .value = .bfloat16, .has_value = true }, s));
+                    mlx.check(mlx.mlx_dequantize(&dq, wq, wsc, wbi, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(sh.bits), "affine", .{ .ctx = null }, mlx.mlx_optional_dtype{ .value = .bfloat16, .has_value = true }, s)) catch |e| {
+                        _ = mlx.mlx_array_free(dq); // a failed op frees its own output
+                        return e;
+                    };
                     var dq_t = mlx.mlx_array_new();
-                    try mlx.check(mlx.mlx_transpose(&dq_t, dq, s));
+                    mlx.check(mlx.mlx_transpose(&dq_t, dq, s)) catch |e| {
+                        _ = mlx.mlx_array_free(dq_t); // a failed op frees its own output
+                        return e;
+                    };
                     var r2 = mlx.mlx_array_new();
-                    try mlx.check(mlx.mlx_matmul(&r2, x, dq_t, s));
+                    mlx.check(mlx.mlx_matmul(&r2, x, dq_t, s)) catch |e| {
+                        _ = mlx.mlx_array_free(r2); // a failed op frees its own output
+                        return e;
+                    };
                     try mlx.check(mlx.mlx_array_eval(r2));
                     _ = mlx.mlx_array_free(dq);
                     _ = mlx.mlx_array_free(dq_t);
@@ -26315,7 +28777,10 @@ test "prefill qmm µbench: stock qmm vs dequant+GEMM at 27B prefill shapes (MLX_
                 while (it < WARM + ITERS) : (it += 1) {
                     if (it == WARM) sw.reset();
                     var r3 = mlx.mlx_array_new();
-                    try mlx.check(mlx.mlx_matmul(&r3, x, wdq_t, s));
+                    mlx.check(mlx.mlx_matmul(&r3, x, wdq_t, s)) catch |e| {
+                        _ = mlx.mlx_array_free(r3); // a failed op frees its own output
+                        return e;
+                    };
                     try mlx.check(mlx.mlx_array_eval(r3));
                     _ = mlx.mlx_array_free(r3);
                 }
@@ -26472,7 +28937,10 @@ fn attn256RandBf16(rnd: std.Random, shape: []const c_int, s: mlx.mlx_stream) !ml
     const f32arr = mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
     defer _ = mlx.mlx_array_free(f32arr);
     var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_astype(&out, f32arr, .bfloat16, s));
+    mlx.check(mlx.mlx_astype(&out, f32arr, .bfloat16, s)) catch |e| {
+        _ = mlx.mlx_array_free(out); // a failed op frees its own output
+        return e;
+    };
     return out;
 }
 
@@ -26490,7 +28958,10 @@ fn testRandUniformBf16(rnd: std.Random, shape: []const c_int, lo: f32, hi: f32, 
     defer _ = mlx.mlx_array_free(u);
     try mlx.check(mlx.mlx_random_uniform(&u, lo_a, hi_a, shape.ptr, shape.len, .float32, key, s));
     var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_astype(&out, u, .bfloat16, s));
+    mlx.check(mlx.mlx_astype(&out, u, .bfloat16, s)) catch |e| {
+        _ = mlx.mlx_array_free(out); // a failed op frees its own output
+        return e;
+    };
     return out;
 }
 
@@ -26507,7 +28978,10 @@ fn attn256RandBf16Scaled(rnd: std.Random, shape: []const c_int, scale: f32, s: m
     defer _ = mlx.mlx_array_free(wide);
     try mlx.check(mlx.mlx_multiply(&wide, unit, k, s));
     var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_astype(&out, wide, .bfloat16, s));
+    mlx.check(mlx.mlx_astype(&out, wide, .bfloat16, s)) catch |e| {
+        _ = mlx.mlx_array_free(out); // a failed op frees its own output
+        return e;
+    };
     return out;
 }
 
@@ -27003,7 +29477,10 @@ fn causalPerRowReference(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, s
     const vec = mlx.mlx_vector_array_new_data(parts.items.ptr, parts.items.len);
     defer _ = mlx.mlx_vector_array_free(vec);
     var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 2, s));
+    mlx.check(mlx.mlx_concatenate_axis(&out, vec, 2, s)) catch |e| {
+        _ = mlx.mlx_array_free(out); // a failed op frees its own output
+        return e;
+    };
     return out;
 }
 
@@ -27812,10 +30289,16 @@ fn qkComposedRef(
     defer _ = mlx.mlx_array_free(t);
     try mlx.check(mlx.mlx_transpose_axes(&t, normed, &perm, 4, s));
     var roped = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_fast_rope(&roped, t, rd, false, base, 1.0, offset, freqs, s));
+    mlx.check(mlx.mlx_fast_rope(&roped, t, rd, false, base, 1.0, offset, freqs, s)) catch |e| {
+        _ = mlx.mlx_array_free(roped); // a failed op frees its own output
+        return e;
+    };
     if (ms) |m| {
         var scaled = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_multiply(&scaled, roped, m, s));
+        mlx.check(mlx.mlx_multiply(&scaled, roped, m, s)) catch |e| {
+            _ = mlx.mlx_array_free(scaled); // a failed op frees its own output
+            return e;
+        };
         _ = mlx.mlx_array_free(roped);
         return scaled;
     }
@@ -28022,6 +30505,131 @@ test "qk norm rope fused hd-256 with v rows: bit-identical at gemma 8q/2kv, rd 2
                 }
             }
         }
+    }
+}
+
+test "verify-block: a k-row block's in-place K/V write leaves the cache bit-identical to the slice_update path, at hd 256 and 512" {
+    const s = mlx.gpuStream();
+    qk_fused_override = true;
+    defer qk_fused_override = null;
+    var prng = std.Random.DefaultPrng.init(0x153A);
+    const rnd = prng.random();
+    const hq: c_int = 16;
+    const eps: f32 = 1.0e-6;
+    const eps_arr = mlx.mlx_array_new_float(eps);
+    defer _ = mlx.mlx_array_free(eps_arr);
+    const no_freqs = mlx.mlx_array{ .ctx = null };
+    const base = mlx.mlx_optional_float{ .value = 10000.0, .has_value = true };
+    const prior: c_int = 37;
+    for ([_]c_int{ 256, 512 }) |hd| {
+        const hk: c_int = if (hd == 512) 2 else 8;
+        for ([_]c_int{ 1, 2, 4, 8 }) |rows| {
+            var in_place = try KVCache.init(std.testing.allocator, 1);
+            defer in_place.deinit();
+            var composed = try KVCache.init(std.testing.allocator, 1);
+            defer composed.deinit();
+            // the same `prior` rows in both caches, written by slice_update
+            const p_shape = [_]c_int{ 1, hk, prior, hd };
+            const pk = try parityRand(rnd, &p_shape, 1.0, .bfloat16, s);
+            defer _ = mlx.mlx_array_free(pk);
+            const pv = try parityRand(rnd, &p_shape, 1.0, .bfloat16, s);
+            defer _ = mlx.mlx_array_free(pv);
+            inline for (.{ &in_place, &composed }) |c| {
+                var dv = try c.update(0, pk, pv, s, 0);
+                dv.deinit();
+            }
+            const q_shape = [_]c_int{ 1, rows, hq, hd };
+            const q = try parityRand(rnd, &q_shape, 1.0, .bfloat16, s);
+            defer _ = mlx.mlx_array_free(q);
+            const kv_shape = [_]c_int{ 1, rows, hk, hd };
+            const k = try parityRand(rnd, &kv_shape, 1.0, .bfloat16, s);
+            defer _ = mlx.mlx_array_free(k);
+            const v = try parityRand(rnd, &kv_shape, 1.0, .bfloat16, s);
+            defer _ = mlx.mlx_array_free(v);
+            const w_shape = [_]c_int{hd};
+            const qw = try parityRand(rnd, &w_shape, 1.0, .bfloat16, s);
+            defer _ = mlx.mlx_array_free(qw);
+            const kw = try parityRand(rnd, &w_shape, 1.0, .bfloat16, s);
+            defer _ = mlx.mlx_array_free(kw);
+            const vw = try parityRand(rnd, &w_shape, 1.0, .bfloat16, s);
+            defer _ = mlx.mlx_array_free(vw);
+            const angles = try ropeAngleRows(s, hd, base, no_freqs, prior, rows, std.testing.allocator, 1.0, 1.0);
+            defer _ = mlx.mlx_array_free(angles);
+
+            const t = in_place.kvInPlaceTarget(0, hk, hd, .bfloat16, @intCast(rows)) orelse return error.NoInPlaceTarget;
+            const got = (try fusedQkNormRope256Impl(s, q, k, v, qw, kw, vw, angles, eps_arr, hq, hk, rows, hd, t)) orelse return error.FusedDeclined;
+            defer for (got) |a| {
+                _ = mlx.mlx_array_free(a);
+            };
+            var view_a = try in_place.kvInPlaceCommit(0, got[0], s, 0, @intCast(rows));
+            defer view_a.deinit();
+
+            const ref = (try fusedQkNormRope256(s, q, k, v, qw, kw, vw, angles, eps_arr, hq, hk, rows, hd)) orelse return error.FusedDeclined;
+            defer for (ref) |a| {
+                _ = mlx.mlx_array_free(a);
+            };
+            var view_b = try composed.update(0, ref[1], ref[2], s, 0);
+            defer view_b.deinit();
+
+            try std.testing.expectEqual(composed.entries[0].offset, in_place.entries[0].offset);
+            try std.testing.expectEqual(@as(usize, @intCast(prior + rows)), in_place.entries[0].offset);
+            try std.testing.expectEqual(composed.step, in_place.step);
+            try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(got[0], ref[0], s));
+            try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(view_a.k, view_b.k, s));
+            try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(view_a.v, view_b.v, s));
+        }
+    }
+}
+
+test "verify-block: head-dim-512 SDPA for a k-row block under the multi-query switch is causal and matches MLX's composed path" {
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0x153B);
+    const rnd = prng.random();
+    const none_mask = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(none_mask);
+    const kl: c_int = 1100;
+    for ([_]c_int{ 2, 3, 4 }) |rows| {
+        const q_shape = [_]c_int{ 1, 16, rows, 512 };
+        const q = try parityRand(rnd, &q_shape, 1.0, .bfloat16, s);
+        defer _ = mlx.mlx_array_free(q);
+        const kv_shape = [_]c_int{ 1, 2, kl, 512 };
+        const k = try parityRand(rnd, &kv_shape, 0.05, .bfloat16, s);
+        defer _ = mlx.mlx_array_free(k);
+        const v = try parityRand(rnd, &kv_shape, 1.0, .bfloat16, s);
+        defer _ = mlx.mlx_array_free(v);
+        // the last key changed: only the block's last row may read it
+        const last_shape = [_]c_int{ 1, 2, 1, 512 };
+        const other = try parityRand(rnd, &last_shape, 1.0, .bfloat16, s);
+        defer _ = mlx.mlx_array_free(other);
+        var v2 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(v2);
+        try mlx.check(mlx.mlx_slice_update(&v2, v, other, &.{ 0, 0, kl - 1, 0 }, 4, &.{ 1, 2, kl, 512 }, 4, &.{ 1, 1, 1, 1 }, 4, s));
+
+        var vec = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(vec);
+        var vec2 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(vec2);
+        _ = mlx.mlx_lesto_sdpa_d512_multi_query(true);
+        const rc1 = mlx.mlx_fast_scaled_dot_product_attention(&vec, q, k, v, 1.0, "causal", none_mask, .{ .ctx = null }, false, s);
+        const rc2 = mlx.mlx_fast_scaled_dot_product_attention(&vec2, q, k, v2, 1.0, "causal", none_mask, .{ .ctx = null }, false, s);
+        _ = mlx.mlx_lesto_sdpa_d512_multi_query(false);
+        try mlx.check(rc1);
+        try mlx.check(rc2);
+        var composed = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(composed);
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&composed, q, k, v, 1.0, "causal", none_mask, .{ .ctx = null }, false, s));
+
+        // close to the composed path (bf16 rounding only)
+        try std.testing.expect((try attn256MaxDiff(vec, composed, s)) < 0.03);
+        // every row but the last never reads the last key; the last row does
+        var head = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(head);
+        var head2 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(head2);
+        try mlx.check(mlx.mlx_slice(&head, vec, &.{ 0, 0, 0, 0 }, 4, &.{ 1, 16, rows - 1, 512 }, 4, &.{ 1, 1, 1, 1 }, 4, s));
+        try mlx.check(mlx.mlx_slice(&head2, vec2, &.{ 0, 0, 0, 0 }, 4, &.{ 1, 16, rows - 1, 512 }, 4, &.{ 1, 1, 1, 1 }, 4, s));
+        try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(head, head2, s));
+        try std.testing.expect((try attn256MaxDiff(vec, vec2, s)) > 0.0);
     }
 }
 
@@ -28658,7 +31266,10 @@ test "growQuantBuf else-arm: a faulted zeros leaves the old buffer owned (no dou
     const old_shape = [_]c_int{ B, heads, old_cap, last_dim };
 
     var warm = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_zeros(&warm, &old_shape, 4, .float32, s));
+    mlx.check(mlx.mlx_zeros(&warm, &old_shape, 4, .float32, s)) catch |e| {
+        _ = mlx.mlx_array_free(warm); // a failed op frees its own output
+        return e;
+    };
     try mlx.check(mlx.mlx_array_eval(warm));
     const c0 = mlx.op_count.load(.monotonic);
     try KVCache.growQuantBuf(s, &warm, .{ .cap = new_cap, .drop = 0, .kept = 0 }, B, heads, last_dim, .float32);
@@ -28672,7 +31283,10 @@ test "growQuantBuf else-arm: a faulted zeros leaves the old buffer owned (no dou
     var k: u64 = 1;
     while (k <= n_ops) : (k += 1) {
         var buf = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_zeros(&buf, &old_shape, 4, .float32, s));
+        mlx.check(mlx.mlx_zeros(&buf, &old_shape, 4, .float32, s)) catch |e| {
+            _ = mlx.mlx_array_free(buf); // a failed op frees its own output
+            return e;
+        };
         try mlx.check(mlx.mlx_array_eval(buf));
         mlx.fault.arm(k);
         const r = KVCache.growQuantBuf(s, &buf, .{ .cap = new_cap, .drop = 0, .kept = 0 }, B, heads, last_dim, .float32);
@@ -29273,7 +31887,10 @@ test "weightsHaveDenseAttnProj: decode-attn-quant applies only to a dense text a
         fn add(w: *Weights, name: []const u8, dtype: mlx.mlx_dtype, st: mlx.mlx_stream) !void {
             const shape = [_]c_int{ 64, 64 };
             var arr = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_zeros(&arr, &shape, 2, dtype, st));
+            mlx.check(mlx.mlx_zeros(&arr, &shape, 2, dtype, st)) catch |e| {
+                _ = mlx.mlx_array_free(arr); // a failed op frees its own output
+                return e;
+            };
             try w.map.put(try w.allocator.dupe(u8, name), arr);
         }
     }.add;
@@ -29425,6 +32042,11 @@ var head_tail_warned: bool = false;
 extern fn mlx_lesto_array_id(res: *usize, a: mlx.mlx_array) c_int;
 
 /// The MLX id of `a`, 0 for none (or on error, which then matches nothing).
+/// The MLX id of `a` (0 for an empty handle); `headTailId` without the optional.
+pub fn arrayId(a: mlx.mlx_array) usize {
+    return headTailId(a);
+}
+
 fn headTailId(a: ?mlx.mlx_array) usize {
     const x = a orelse return 0;
     if (x.ctx == null) return 0;
@@ -29436,7 +32058,7 @@ fn headTailId(a: ?mlx.mlx_array) usize {
 /// The token one head forward reduced from its kept rows, for the full row it returned: `own` is the slot's own
 /// reference to that row, which keeps its id `id` from being reused while the slot is armed; `mask_id` is the id of
 /// the suppression mask applied (0: none).
-const HeadTailSlot = struct { own: mlx.mlx_array = .{ .ctx = null }, id: usize = 0, tok: mlx.mlx_array = .{ .ctx = null }, mask_id: usize = 0 };
+pub const HeadTailSlot = struct { own: mlx.mlx_array = .{ .ctx = null }, id: usize = 0, tok: mlx.mlx_array = .{ .ctx = null }, mask_id: usize = 0 };
 var head_tail_slot: HeadTailSlot = .{};
 
 fn headTailClear() void {
@@ -29477,8 +32099,9 @@ fn headTailAuxFree() void {
     head_tail_aux = .{};
 }
 
-fn headTailPrepare(xfm: *const Transformer) bool {
-    const mask: mlx.mlx_array = xfm.suppress_mask orelse .{ .ctx = null };
+fn headTailPrepare(xfm: *const Transformer, answer: bool) bool {
+    const chosen = if (answer and xfm.answer_mask != null) xfm.answer_mask else xfm.suppress_mask;
+    const mask: mlx.mlx_array = chosen orelse .{ .ctx = null };
     const idx_id = headTailId(xfm.latin_head_idx);
     const mask_id = headTailId(mask);
     if (head_tail_aux.state != 0 and head_tail_aux.owner == @intFromPtr(xfm) and head_tail_aux.idx_id == idx_id and head_tail_aux.mask_id == mask_id) return head_tail_aux.state == 1;
@@ -29510,7 +32133,7 @@ fn headTailPrepare(xfm: *const Transformer) bool {
 /// The kept-rows list (`lm_head_keep_idx`) both the Latin-script head and the head tail index with: one dimension, `uint32`, non-empty and
 /// shorter than the vocabulary, strictly ascending (the lowest compact index is then the lowest kept id) and inside
 /// the vocabulary. Evaluates the array.
-fn validateKeepList(idx: mlx.mlx_array, vocab: usize) !void {
+pub fn validateKeepList(idx: mlx.mlx_array, vocab: usize) !void {
     const ish = mlx.getShape(idx);
     if (ish.len != 1 or mlx.mlx_array_dtype(idx) != .uint32) return error.KeepListShape;
     const kept: usize = @intCast(ish[0]);
@@ -29676,6 +32299,9 @@ fn headTailArgmaxMap(s: mlx.mlx_stream, lg: mlx.mlx_array, idx: mlx.mlx_array, c
         if (head_tail_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         head_tail_cfg = null;
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer if (head_tail_cfg == null) {
+            _ = mlx.mlx_fast_metal_kernel_config_free(config); // unpublished
+        };
         // argmax over the last axis without keepdims: the logits' shape less its last axis ([1, 1] at decode).
         const one = [_]c_int{1};
         if (lsh.len > 1) {
@@ -29713,4 +32339,1240 @@ fn headTailArgmaxMap(s: mlx.mlx_stream, lg: mlx.mlx_array, idx: mlx.mlx_array, c
     errdefer _ = mlx.mlx_array_free(y);
     try mlx.check(mlx.mlx_vector_array_get(&y, outputs_vec, 0));
     return y;
+}
+
+fn headShortlistTestArray(data: []const f32, shape: []const c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    const f = mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
+    defer _ = mlx.mlx_array_free(f);
+    var out = mlx.mlx_array_new();
+    mlx.check(mlx.mlx_astype(&out, f, .bfloat16, s)) catch |e| {
+        _ = mlx.mlx_array_free(out); // a failed op frees its own output
+        return e;
+    };
+    return out;
+}
+
+fn headShortlistTestQuant(w: mlx.mlx_array, bits: c_int, s: mlx.mlx_stream) !HeadShortlistBank {
+    var triple = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(triple);
+    try mlx.check(mlx.mlx_quantize(&triple, w, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(bits), "affine", .{}, s));
+    var b: HeadShortlistBank = .{ .w = mlx.mlx_array_new(), .s = mlx.mlx_array_new(), .b = mlx.mlx_array_new(), .bits = @intCast(bits), .gs = 64 };
+    errdefer headShortlistTestFree(b);
+    try mlx.check(mlx.mlx_vector_array_get(&b.w, triple, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&b.s, triple, 1));
+    try mlx.check(mlx.mlx_vector_array_get(&b.b, triple, 2));
+    return b;
+}
+
+fn headShortlistTestFree(b: HeadShortlistBank) void {
+    _ = mlx.mlx_array_free(b.w);
+    _ = mlx.mlx_array_free(b.s);
+    _ = mlx.mlx_array_free(b.b);
+}
+
+fn headShortlistTestSame(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !bool {
+    var eq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eq);
+    try mlx.check(mlx.mlx_array_equal(&eq, a, b, false, s));
+    var same = false;
+    try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+    return same;
+}
+
+test "head-shortlist: with every row kept it equals the head bit for bit; at top 16 it keeps 16 of the head's own scores and the planted argmax" {
+    const s = mlx.gpuStream();
+    const a = testing.allocator;
+    const rows: c_int = 1024;
+    const hid: c_int = 512;
+    const planted: usize = 777;
+    var prng = std.Random.DefaultPrng.init(0x67c);
+    const rnd = prng.random();
+    const xs = try a.alloc(f32, @intCast(hid));
+    defer a.free(xs);
+    for (xs) |*v| v.* = rnd.floatNorm(f32);
+    const ws = try a.alloc(f32, @intCast(rows * hid));
+    defer a.free(ws);
+    for (ws) |*v| v.* = 0.02 * rnd.floatNorm(f32);
+    // One row aligned with x, so its score clears every other by far and survives the 2-bit copy.
+    for (0..@intCast(hid)) |j| ws[planted * @as(usize, @intCast(hid)) + j] = 0.05 * xs[j];
+    const x = try headShortlistTestArray(xs, &.{ 1, 1, hid }, s);
+    defer _ = mlx.mlx_array_free(x);
+    const wf = try headShortlistTestArray(ws, &.{ rows, hid }, s);
+    defer _ = mlx.mlx_array_free(wf);
+    const head = try headShortlistTestQuant(wf, 4, s);
+    defer headShortlistTestFree(head);
+    // The 2-bit copy goes through the 4-bit head's bf16 values, as buildHeadShortlistHead does.
+    var deq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(deq);
+    try mlx.check(mlx.mlx_dequantize(&deq, head.w, head.s, head.b, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{ .ctx = null }, .{ .value = .bfloat16, .has_value = true }, s));
+    const narrow = try headShortlistTestQuant(deq, 2, s);
+    defer headShortlistTestFree(narrow);
+    const full = try headShortlistQmm(x, head, false, false, s);
+    defer _ = mlx.mlx_array_free(full);
+
+    // Every row kept: the scatter of the rescored rows is the head's own row.
+    {
+        const r = try headShortlistScores(s, x, head, narrow, rows, false);
+        defer _ = mlx.mlx_array_free(r.ye);
+        defer _ = mlx.mlx_array_free(r.out);
+        defer _ = mlx.mlx_array_free(r.idx);
+        try testing.expectEqual(rows, r.k);
+        try testing.expect(try headShortlistTestSame(r.out, full, s));
+    }
+    // Top 16: 16 finite entries, each the head's own score at its row, and the planted row is the argmax of both.
+    {
+        const r = try headShortlistScores(s, x, head, narrow, 16, false);
+        defer _ = mlx.mlx_array_free(r.ye);
+        defer _ = mlx.mlx_array_free(r.out);
+        defer _ = mlx.mlx_array_free(r.idx);
+        try testing.expectEqual(@as(c_int, 16), r.k);
+        var sel_out = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sel_out);
+        try mlx.check(mlx.mlx_take_along_axis(&sel_out, r.out, r.idx, -1, s));
+        var sel_full = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sel_full);
+        try mlx.check(mlx.mlx_take_along_axis(&sel_full, full, r.idx, -1, s));
+        try testing.expect(try headShortlistTestSame(sel_out, sel_full, s));
+        const thr_v: f32 = -1.0e29;
+        const thr = mlx.mlx_array_new_data(&thr_v, &[_]c_int{1}, 1, .float32);
+        defer _ = mlx.mlx_array_free(thr);
+        var gt = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(gt);
+        try mlx.check(mlx.mlx_greater(&gt, r.out, thr, s));
+        var cnt = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cnt);
+        try mlx.check(mlx.mlx_sum(&cnt, gt, false, s));
+        var cnt32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cnt32);
+        try mlx.check(mlx.mlx_astype(&cnt32, cnt, .int32, s));
+        var finite: i32 = 0;
+        try mlx.check(mlx.mlx_array_item_int32(&finite, cnt32));
+        try testing.expectEqual(@as(i32, 16), finite);
+        var am_out = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(am_out);
+        try mlx.check(mlx.mlx_argmax_axis(&am_out, r.out, -1, false, s));
+        var am_full = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(am_full);
+        try mlx.check(mlx.mlx_argmax_axis(&am_full, full, -1, false, s));
+        var am32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(am32);
+        try mlx.check(mlx.mlx_astype(&am32, am_out, .int32, s));
+        var amf32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(amf32);
+        try mlx.check(mlx.mlx_astype(&amf32, am_full, .int32, s));
+        var got: i32 = 0;
+        try mlx.check(mlx.mlx_array_item_int32(&got, am32));
+        var want: i32 = 0;
+        try mlx.check(mlx.mlx_array_item_int32(&want, amf32));
+        try testing.expectEqual(@as(i32, @intCast(planted)), want);
+        try testing.expectEqual(want, got);
+    }
+}
+
+// ── The 64-wide head tail against the kept-row argmax it replaces ──
+
+fn shortlistSelectTestSoftcap(x: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    const cap: f32 = 30.0;
+    const c = mlx.mlx_array_new_data(&cap, &[_]c_int{1}, 1, .float32);
+    defer _ = mlx.mlx_array_free(c);
+    var cc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cc);
+    try mlx.check(mlx.mlx_astype(&cc, c, mlx.mlx_array_dtype(x), s));
+    var d = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(d);
+    try mlx.check(mlx.mlx_divide(&d, x, cc, s));
+    var t = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(t);
+    try mlx.check(mlx.mlx_tanh(&t, d, s));
+    var out = mlx.mlx_array_new();
+    mlx.check(mlx.mlx_multiply(&out, t, cc, s)) catch |e| {
+        _ = mlx.mlx_array_free(out); // a failed op frees its own output
+        return e;
+    };
+    return out;
+}
+
+fn shortlistSelectTestU32(data: []const u32, s: mlx.mlx_stream) !mlx.mlx_array {
+    _ = s;
+    return mlx.mlx_array_new_data(data.ptr, &[_]c_int{@intCast(data.len)}, 1, .uint32);
+}
+
+fn shortlistSelectTestItemU32(a: mlx.mlx_array) !u32 {
+    try mlx.check(mlx.mlx_array_eval(a));
+    var c = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(c);
+    try mlx.check(mlx.mlx_astype(&c, a, .int32, mlx.gpuStream()));
+    var v: i32 = 0;
+    try mlx.check(mlx.mlx_array_item_int32(&v, c));
+    return @intCast(v);
+}
+
+/// One case: the kept row the shortlist builds from `ye` at `sel`, through the kept-row argmax and through headTail64.
+fn shortlistSelectTestCase(s: mlx.mlx_stream, nk: usize, ye_f: []const f32, sel_u: []const u32, mask_b: ?[]const bool, dv_mode: enum { fill, ninf }, di_val: u32) !void {
+    const k: c_int = @intCast(ye_f.len);
+    const ids = try testing.allocator.alloc(u32, nk);
+    defer testing.allocator.free(ids);
+    for (ids, 0..) |*v, i| v.* = @intCast(3 * i + 1);
+    const idx = try shortlistSelectTestU32(ids, s);
+    defer _ = mlx.mlx_array_free(idx);
+    const ye = try headShortlistTestArray(ye_f, &.{ 1, 1, k }, s);
+    defer _ = mlx.mlx_array_free(ye);
+    const sel = try shortlistSelectTestU32(sel_u, s);
+    defer _ = mlx.mlx_array_free(sel);
+    var sel3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sel3);
+    try mlx.check(mlx.mlx_reshape(&sel3, sel, &[_]c_int{ 1, 1, k }, 3, s));
+    // headShortlistScores's kept row: -1e30 in ye's dtype, the rescored scores at their positions
+    const neg_val: f32 = -1.0e30;
+    const neg = mlx.mlx_array_new_data(&neg_val, &[_]c_int{1}, 1, .float32);
+    defer _ = mlx.mlx_array_free(neg);
+    var full = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(full);
+    try mlx.check(mlx.mlx_full(&full, &[_]c_int{ 1, 1, @intCast(nk) }, 3, neg, .bfloat16, s));
+    var yk = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(yk);
+    try mlx.check(mlx.mlx_put_along_axis(&yk, full, sel3, ye, -1, s));
+    var fill = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(fill);
+    try mlx.check(mlx.mlx_full(&fill, &[_]c_int{1}, 1, neg, .bfloat16, s));
+    const fv = try shortlistSelectTestSoftcap(fill, s);
+    defer _ = mlx.mlx_array_free(fv);
+    var dv = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dv);
+    if (dv_mode == .fill) {
+        try mlx.check(mlx.mlx_array_set(&dv, fv));
+    } else {
+        const ninf: f32 = -std.math.inf(f32);
+        const ni = mlx.mlx_array_new_data(&ninf, &[_]c_int{1}, 1, .float32);
+        defer _ = mlx.mlx_array_free(ni);
+        try mlx.check(mlx.mlx_astype(&dv, ni, .bfloat16, s));
+    }
+    const di = mlx.mlx_array_new_data(&di_val, &[_]c_int{1}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(di);
+    var cmask = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cmask);
+    if (mask_b) |m| {
+        _ = mlx.mlx_array_free(cmask);
+        cmask = mlx.mlx_array_new_data(m.ptr, &[_]c_int{@intCast(nk)}, 1, .bool_);
+    } else {
+        try mlx.check(mlx.mlx_array_set(&cmask, idx));
+    }
+    const ykc = try shortlistSelectTestSoftcap(yk, s);
+    defer _ = mlx.mlx_array_free(ykc);
+    const want = try headTailArgmaxMap(s, ykc, idx, cmask, dv, di, mask_b != null);
+    defer _ = mlx.mlx_array_free(want);
+    const v = try shortlistSelectTestSoftcap(ye, s);
+    defer _ = mlx.mlx_array_free(v);
+    const got = try topk_select.headTail64(s, v, sel, idx, cmask, fv, dv, di, mask_b != null);
+    defer _ = mlx.mlx_array_free(got);
+    try testing.expectEqualSlices(c_int, mlx.getShape(want), mlx.getShape(got));
+    const w = try shortlistSelectTestItemU32(want);
+    const g = try shortlistSelectTestItemU32(got);
+    if (w != g) std.debug.print("shortlist-select head tail differs: want {d} got {d}\n", .{ w, g });
+    try testing.expectEqual(w, g);
+}
+
+test "shortlist-select headTail64: the kept-row argmax's token from the 64 rescored scores, ties, masks, NaN and the fill value included" {
+    const s = mlx.gpuStream();
+    const a = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x167b);
+    const rnd = prng.random();
+    for ([_]usize{ 162489, 5000, 64 }) |nk| {
+        var ye: [64]f32 = undefined;
+        var sel: [64]u32 = undefined;
+        // 64 distinct positions in random order (the pick's own order is by score, not by position)
+        var used = std.AutoHashMap(u32, void).init(a);
+        defer used.deinit();
+        var n: usize = 0;
+        while (n < 64) {
+            const p: u32 = if (nk == 64) @intCast(n) else rnd.intRangeLessThan(u32, 0, @intCast(nk));
+            if (used.contains(p)) continue;
+            try used.put(p, {});
+            sel[n] = p;
+            n += 1;
+        }
+        if (nk == 64) rnd.shuffle(u32, &sel);
+        const mask = try a.alloc(bool, nk);
+        defer a.free(mask);
+        // 1. continuous scores, no mask
+        for (&ye) |*v| v.* = 4.0 * rnd.floatNorm(f32);
+        try shortlistSelectTestCase(s, nk, &ye, &sel, null, .fill, 7);
+        // 2. ties at the top among the rescored: the lowest kept position wins
+        for (&ye, 0..) |*v, i| v.* = if (i % 3 == 0) 5.0 else 1.0;
+        try shortlistSelectTestCase(s, nk, &ye, &sel, null, .fill, 7);
+        // 3. the best rescored rows suppressed
+        @memset(mask, false);
+        for (&ye, 0..) |*v, i| {
+            v.* = 4.0 * rnd.floatNorm(f32);
+            if (i % 2 == 0) mask[sel[i]] = true;
+        }
+        try shortlistSelectTestCase(s, nk, &ye, &sel, mask, .fill, 7);
+        // 4. every rescored row suppressed: the lowest open other position (fill value) wins, then the dropped rule
+        @memset(mask, false);
+        for (sel) |p| mask[p] = true;
+        if (nk > 64) mask[0] = true;
+        try shortlistSelectTestCase(s, nk, &ye, &sel, mask, .fill, 7);
+        try shortlistSelectTestCase(s, nk, &ye, &sel, mask, .fill, 0xFFFFFFF0);
+        // 5. every kept row suppressed
+        @memset(mask, true);
+        try shortlistSelectTestCase(s, nk, &ye, &sel, mask, .fill, 7);
+        try shortlistSelectTestCase(s, nk, &ye, &sel, mask, .ninf, 7);
+        // 6. every rescored score saturates to the fill value (softcap of a large negative): ties with the other rows
+        @memset(&ye, -1.0e4);
+        try shortlistSelectTestCase(s, nk, &ye, &sel, null, .fill, 7);
+        try shortlistSelectTestCase(s, nk, &ye, &sel, null, .fill, 0xFFFFFFF0);
+        try shortlistSelectTestCase(s, nk, &ye, &sel, null, .ninf, 7);
+        // 7. a NaN among the rescored, and two NaNs: the lowest position among the NaN wins
+        for (&ye) |*v| v.* = 4.0 * rnd.floatNorm(f32);
+        ye[10] = std.math.nan(f32);
+        try shortlistSelectTestCase(s, nk, &ye, &sel, null, .fill, 7);
+        ye[40] = std.math.nan(f32);
+        try shortlistSelectTestCase(s, nk, &ye, &sel, null, .fill, 7);
+        // 8. the dropped-row rule when every kept row is below the fill value: all dropped suppressed (dv -inf)
+        for (&ye) |*v| v.* = 2.0 * rnd.floatNorm(f32);
+        try shortlistSelectTestCase(s, nk, &ye, &sel, null, .ninf, 7);
+    }
+}
+
+
+// ── MoE rows layout tests ──
+
+test "moe-rows-layout: the device table, the fallback, the override parser and the swapped gate/up source" {
+    const m4 = moeRowsLayoutPlanFor(.{ .gen = 16, .phone = false });
+    try std.testing.expectEqual(@as(?MoeRowsLayoutGateUp, .{ .sg = 32, .ax = 1 }), m4.gateup);
+    try std.testing.expectEqual(@as(?MoeRowsLayoutDown, .{ .sps = 6, .tpt = 1, .ax = 1 }), m4.down);
+    // the M3 (G15): down only, the array body; gate/up stays served
+    const m3 = moeRowsLayoutPlanFor(.{ .gen = 15, .phone = false });
+    try std.testing.expect(m3.gateup == null);
+    try std.testing.expectEqual(@as(?MoeRowsLayoutDown, .{ .sps = 6, .tpt = 4, .ax = 0, .body = .array }), m3.down);
+    // every other device keeps the served layouts: the M5 (G17), a G16 phone, an unparsed architecture
+    for ([_]DeviceGen{ .{ .gen = 17, .phone = false }, .{ .gen = 16, .phone = true }, .{ .gen = 0, .phone = false } }) |g| {
+        const p = moeRowsLayoutPlanFor(g);
+        try std.testing.expect(p.gateup == null and p.down == null);
+    }
+
+    // the search harness's parameter lines, as its `joint` lines print them
+    try std.testing.expectEqual(MoeRowsLayoutGateUp{ .sg = 32, .ax = 1 }, try moeRowsLayoutParseGateUp("dd=0 sg=32 nr=1 pf=0 ax=1"));
+    try std.testing.expectEqual(MoeRowsLayoutGateUp{ .sg = 16, .ax = 0 }, try moeRowsLayoutParseGateUp("sg=16 ax=0"));
+    try std.testing.expectError(error.MoeRowsLayoutNotServedBody, moeRowsLayoutParseGateUp("dd=1 sg=32 nr=1 pf=0 ax=1"));
+    try std.testing.expectError(error.MoeRowsLayoutNotServedBody, moeRowsLayoutParseGateUp("dd=0 sg=32 nr=2 pf=0 ax=1"));
+    try std.testing.expectError(error.MoeRowsLayoutNotServedBody, moeRowsLayoutParseGateUp("dd=0 sg=32 nr=1 pf=4 ax=1"));
+    try std.testing.expectError(error.MoeRowsLayoutMissingKey, moeRowsLayoutParseGateUp("sg=32"));
+    try std.testing.expectError(error.MoeRowsLayoutBadValue, moeRowsLayoutParseGateUp("sg=32 ax=2"));
+    try std.testing.expectError(error.MoeRowsLayoutBadValue, moeRowsLayoutParseGateUp("sg=64 ax=0"));
+    try std.testing.expectError(error.MoeRowsLayoutBadValue, moeRowsLayoutParseGateUp("sg=x ax=0"));
+    try std.testing.expectError(error.MoeRowsLayoutBadValue, moeRowsLayoutParseGateUp("sg=32 sg=16 ax=1"));
+    try std.testing.expectError(error.MoeRowsLayoutUnknownKey, moeRowsLayoutParseGateUp("sps=6 sg=32 ax=1"));
+    try std.testing.expectEqual(MoeRowsLayoutDown{ .sps = 6, .tpt = 1, .ax = 1 }, try moeRowsLayoutParseDown("dd=0 sps=6 tpt=1 nr=1 pf=0 ax=1"));
+    try std.testing.expectError(error.MoeRowsLayoutNotServedBody, moeRowsLayoutParseDown("dd=1 sps=1 tpt=1 nr=1 pf=0 ax=0"));
+    try std.testing.expectError(error.MoeRowsLayoutMissingKey, moeRowsLayoutParseDown("sps=6 ax=1"));
+    try std.testing.expectError(error.MoeRowsLayoutUnknownKey, moeRowsLayoutParseDown("sps=6 tpt=1 sg=8 ax=1"));
+
+    // which layout each shape gets, with the switch off, on at the M4 entry, and on with no entry
+    const saved_on = moe_rows_layout_override;
+    const saved_plan = moe_rows_layout_plan_override;
+    defer {
+        moe_rows_layout_override = saved_on;
+        moe_rows_layout_plan_override = saved_plan;
+    }
+    moe_rows_layout_plan_override = m4;
+    moe_rows_layout_override = false;
+    try std.testing.expectEqual(MOE_ROWS_LAYOUT_GATEUP_SERVED, moeRowsLayoutGateUp(false, 704, 2816, 4, 64, .bfloat16));
+    try std.testing.expectEqual(MOE_ROWS_LAYOUT_DOWN_SERVED, moeRowsLayoutDown(false, 2816, 704, 4, 64, .bfloat16, 4, 6));
+    moe_rows_layout_override = true;
+    try std.testing.expectEqual(MoeRowsLayoutGateUp{ .sg = 32, .ax = 1 }, moeRowsLayoutGateUp(false, 704, 2816, 4, 64, .bfloat16));
+    try std.testing.expectEqual(MOE_ROWS_LAYOUT_GATEUP_SERVED, moeRowsLayoutGateUp(false, 700, 2816, 4, 64, .bfloat16)); // 32 does not divide 700
+    try std.testing.expectEqual(MOE_ROWS_LAYOUT_GATEUP_SERVED, moeRowsLayoutGateUp(true, 704, 2816, 4, 64, .bfloat16)); // NVFP4 keeps the served kernel
+    try std.testing.expectEqual(MoeRowsLayoutDown{ .sps = 6, .tpt = 1, .ax = 1 }, moeRowsLayoutDown(false, 2816, 704, 4, 64, .bfloat16, 4, 6));
+    try std.testing.expectEqual(MoeRowsLayoutDown{ .sps = 6, .tpt = 1, .ax = 1 }, moeRowsLayoutDown(false, 2816, 704, 4, 64, .bfloat16, 2, 6)); // G17's 16 lanes
+    try std.testing.expectEqual(MOE_ROWS_LAYOUT_DOWN_SERVED, moeRowsLayoutDown(false, 2816, 704, 4, 64, .bfloat16, 4, 8)); // 6 slots a simdgroup do not divide 8
+    try std.testing.expectEqual(MOE_ROWS_LAYOUT_DOWN_SERVED, moeRowsLayoutDown(false, 2816, 704, 4, 64, .bfloat16, 4, 4));
+    try std.testing.expectEqual(MOE_ROWS_LAYOUT_DOWN_SERVED, moeRowsLayoutDown(true, 2816, 704, 4, 64, .bfloat16, 4, 6));
+    // 6 slots x 8 tiles x 32 lanes = 1,536 threads, over 1,024 (704 tiles divide by 8, so only the thread cap refuses it)
+    moe_rows_layout_plan_override = .{ .gateup = .{ .sg = 8, .ax = 0 }, .down = .{ .sps = 1, .tpt = 8, .ax = 0 } };
+    try std.testing.expectEqual(MOE_ROWS_LAYOUT_DOWN_SERVED, moeRowsLayoutDown(false, 2816, 704, 4, 64, .bfloat16, 4, 6));
+    // and a layout inside the cap is taken: 3 x 4 x 32 = 384 threads
+    moe_rows_layout_plan_override = .{ .gateup = .{ .sg = 8, .ax = 0 }, .down = .{ .sps = 2, .tpt = 4, .ax = 0 } };
+    try std.testing.expectEqual(MoeRowsLayoutDown{ .sps = 2, .tpt = 4, .ax = 0 }, moeRowsLayoutDown(false, 2816, 704, 4, 64, .bfloat16, 4, 6));
+    moe_rows_layout_plan_override = .{ .gateup = null, .down = null };
+    try std.testing.expectEqual(MOE_ROWS_LAYOUT_GATEUP_SERVED, moeRowsLayoutGateUp(false, 704, 2816, 4, 64, .bfloat16));
+    try std.testing.expectEqual(MOE_ROWS_LAYOUT_DOWN_SERVED, moeRowsLayoutDown(false, 2816, 704, 4, 64, .bfloat16, 4, 6));
+
+    // the swapped source is the served one with its two axis lines exchanged, and nothing else
+    const served = GQMV_GATEUP_ROWS_SOURCES[0];
+    const from = "uint n = thread_position_in_grid.y;\nuint combo = thread_position_in_grid.z;\n";
+    const to = "uint n = thread_position_in_grid.z;\nuint combo = thread_position_in_grid.y;\n";
+    try std.testing.expectEqual(served.len, GQMV_GATEUP_ROWS_LAYOUT_SOURCE.len);
+    const at = std.mem.indexOf(u8, served, from) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(served[0..at], GQMV_GATEUP_ROWS_LAYOUT_SOURCE[0..at]);
+    try std.testing.expectEqualStrings(to, GQMV_GATEUP_ROWS_LAYOUT_SOURCE[at .. at + to.len]);
+    try std.testing.expectEqualStrings(served[at + from.len ..], GQMV_GATEUP_ROWS_LAYOUT_SOURCE[at + to.len ..]);
+}
+
+const moe_rows_layout_test_env = struct {
+    extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+    extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+};
+
+test "moe-rows-layout switch: the switch is on by default where the device has a plan, MLX_SERVE_MOE_ROWS_LAYOUT=0 turns it off, no plan keeps the served layouts" {
+    // the pure decision
+    try std.testing.expectEqual(MoeRowsLayoutSwitch.on_default, moeRowsLayoutDecide(null, true));
+    try std.testing.expectEqual(MoeRowsLayoutSwitch.off_default, moeRowsLayoutDecide(null, false));
+    try std.testing.expectEqual(MoeRowsLayoutSwitch.off_env, moeRowsLayoutDecide("0", true));
+    try std.testing.expectEqual(MoeRowsLayoutSwitch.off_env, moeRowsLayoutDecide("0", false));
+    try std.testing.expectEqual(MoeRowsLayoutSwitch.on_env, moeRowsLayoutDecide("1", true));
+    try std.testing.expectEqual(MoeRowsLayoutSwitch.on_env, moeRowsLayoutDecide("1", false));
+    try std.testing.expectEqual(MoeRowsLayoutSwitch.off_env, moeRowsLayoutDecide("", true)); // set but empty: off, as before
+    try std.testing.expectEqual(MoeRowsLayoutSwitch.off_env, moeRowsLayoutDecide("true", true));
+    try std.testing.expect(MoeRowsLayoutSwitch.on_default.on() and MoeRowsLayoutSwitch.on_env.on());
+    try std.testing.expect(!MoeRowsLayoutSwitch.off_default.on() and !MoeRowsLayoutSwitch.off_env.on());
+
+    // the table: the M4 and M3 entries have a plan, every other device none
+    const m4: DeviceGen = .{ .gen = 16, .phone = false };
+    try std.testing.expect(moeRowsLayoutHasPlan(moeRowsLayoutPlanFor(m4)));
+    try std.testing.expect(moeRowsLayoutHasPlan(moeRowsLayoutPlanFor(.{ .gen = 15, .phone = false })));
+    const no_plan = [_]DeviceGen{ .{ .gen = 17, .phone = false }, .{ .gen = 16, .phone = true }, .{ .gen = 0, .phone = false } };
+    for (no_plan) |g| try std.testing.expect(!moeRowsLayoutHasPlan(moeRowsLayoutPlanFor(g)));
+
+    // the log lines name the decision and the device
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("[moe-rows-layout] switch on (default: gpu gen=16 phone=false has a table entry; MLX_SERVE_MOE_ROWS_LAYOUT=0 turns it off)", moeRowsLayoutSwitchLine(&buf, .on_default, m4));
+    try std.testing.expectEqualStrings("[moe-rows-layout] switch off (default: no table entry for gpu gen=17 phone=false): the served MoE rows layouts", moeRowsLayoutSwitchLine(&buf, .off_default, no_plan[0]));
+    try std.testing.expectEqualStrings("[moe-rows-layout] switch off (MLX_SERVE_MOE_ROWS_LAYOUT set and not 1): the served MoE rows layouts", moeRowsLayoutSwitchLine(&buf, .off_env, m4));
+    try std.testing.expectEqualStrings("[moe-rows-layout] switch on (MLX_SERVE_MOE_ROWS_LAYOUT=1, gpu gen=16 phone=false)", moeRowsLayoutSwitchLine(&buf, .on_env, m4));
+
+    // end to end through the environment and the device seam: the layouts each case launches. The two layout overrides
+    // are cleared for the cases and every variable is restored after; a failed set, unset or restore fails the test.
+    const names = [_][*:0]const u8{ "MLX_SERVE_MOE_ROWS_LAYOUT", "MLX_SERVE_MOE_ROWS_LAYOUT_GATEUP", "MLX_SERVE_MOE_ROWS_LAYOUT_DOWN", "MLX_SERVE_KERNEL_TABLE" };
+    var saved_env: [names.len]?[:0]u8 = @splat(null);
+    defer for (saved_env) |v| if (v) |s| std.testing.allocator.free(s);
+    for (names, 0..) |n, i| {
+        if (std.c.getenv(n)) |r| saved_env[i] = try std.testing.allocator.dupeSentinel(u8, std.mem.sliceTo(r, 0), 0);
+    }
+    const saved_on = moe_rows_layout_override;
+    const saved_plan = moe_rows_layout_plan_override;
+    const saved_gen = device_gen_override;
+    var restored = false;
+    defer {
+        moe_rows_layout_override = saved_on;
+        moe_rows_layout_plan_override = saved_plan;
+        device_gen_override = saved_gen;
+        moeRowsLayoutTestForget();
+        if (!restored) moeRowsLayoutTestRestoreEnv(&names, &saved_env) catch @panic("moe-rows-layout switch test: the environment could not be restored");
+    }
+    for (names[1..3]) |n| try std.testing.expectEqual(@as(c_int, 0), moe_rows_layout_test_env.unsetenv(n));
+    // the cases test the built-in entry: a valid local table on the machine running the test must not decide them
+    try std.testing.expectEqual(@as(c_int, 0), moe_rows_layout_test_env.setenv("MLX_SERVE_KERNEL_TABLE", "off", 1));
+    moe_rows_layout_override = null;
+    moe_rows_layout_plan_override = null;
+    const Case = struct { gen: DeviceGen, env: ?[*:0]const u8, on: bool };
+    const cases = [_]Case{
+        .{ .gen = m4, .env = null, .on = true }, // the M4 with no env: the picks
+        .{ .gen = m4, .env = "0", .on = false }, // MLX_SERVE_MOE_ROWS_LAYOUT=0: the served layouts
+        .{ .gen = m4, .env = "1", .on = true },
+        .{ .gen = .{ .gen = 15, .phone = false }, .env = null, .on = true }, // the M3 with no env: its down pick
+        .{ .gen = .{ .gen = 15, .phone = false }, .env = "0", .on = false },
+        .{ .gen = no_plan[0], .env = null, .on = false }, // the M5 with no env: the served layouts
+        .{ .gen = no_plan[0], .env = "0", .on = false },
+        .{ .gen = no_plan[1], .env = null, .on = false }, // a G16 phone
+    };
+    for (cases) |c| {
+        device_gen_override = c.gen;
+        if (c.env) |v| {
+            try std.testing.expectEqual(@as(c_int, 0), moe_rows_layout_test_env.setenv("MLX_SERVE_MOE_ROWS_LAYOUT", v, 1));
+            const got = std.c.getenv("MLX_SERVE_MOE_ROWS_LAYOUT") orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings(std.mem.sliceTo(v, 0), std.mem.sliceTo(got, 0));
+        } else {
+            try std.testing.expectEqual(@as(c_int, 0), moe_rows_layout_test_env.unsetenv("MLX_SERVE_MOE_ROWS_LAYOUT"));
+            try std.testing.expect(std.c.getenv("MLX_SERVE_MOE_ROWS_LAYOUT") == null);
+        }
+        moeRowsLayoutTestForget();
+        try std.testing.expectEqual(c.on, moeRowsLayoutEnabled());
+        if (c.on and moeRowsLayoutHasPlan(moeRowsLayoutPlanFor(c.gen))) {
+            // each device's own entry, a kernel the entry leaves out on the served layout (the M3's gate/up)
+            const want = moeRowsLayoutPlanFor(c.gen);
+            try std.testing.expectEqual(want.gateup orelse MOE_ROWS_LAYOUT_GATEUP_SERVED, moeRowsLayoutGateUp(false, 704, 2816, 4, 64, .bfloat16));
+            try std.testing.expectEqual(want.down orelse MOE_ROWS_LAYOUT_DOWN_SERVED, moeRowsLayoutDown(false, 2816, 704, 4, 64, .bfloat16, 4, 6));
+        } else {
+            try std.testing.expectEqual(MOE_ROWS_LAYOUT_GATEUP_SERVED, moeRowsLayoutGateUp(false, 704, 2816, 4, 64, .bfloat16));
+            try std.testing.expectEqual(MOE_ROWS_LAYOUT_DOWN_SERVED, moeRowsLayoutDown(false, 2816, 704, 4, 64, .bfloat16, 4, 6));
+        }
+    }
+    // the restore is checked here, where a failure can fail the test; the defer covers an earlier exit and a failed restore
+    try moeRowsLayoutTestRestoreEnv(&names, &saved_env);
+    restored = true;
+    for (names, 0..) |n, i| {
+        const now = std.c.getenv(n);
+        if (saved_env[i]) |s| {
+            try std.testing.expectEqualStrings(s, std.mem.sliceTo(now orelse return error.TestUnexpectedResult, 0));
+        } else try std.testing.expect(now == null);
+    }
+}
+
+fn moeRowsLayoutTestRestoreEnv(names: []const [*:0]const u8, saved: []const ?[:0]u8) !void {
+    // every variable is tried before a failure is returned
+    var failed = false;
+    for (names, saved) |n, v| {
+        const rc = if (v) |s| moe_rows_layout_test_env.setenv(n, s, 1) else moe_rows_layout_test_env.unsetenv(n);
+        if (rc != 0) failed = true;
+    }
+    if (failed) return error.MoeRowsLayoutTestEnvRestore;
+}
+
+/// True when two arrays hold the same 16-bit patterns everywhere (NaN payloads and signed zeros included).
+pub fn moeRowsLayoutBitsEqual(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !bool {
+    var av = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(av);
+    try mlx.check(mlx.mlx_view(&av, a, .uint16, s));
+    var bv = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(bv);
+    try mlx.check(mlx.mlx_view(&bv, b, .uint16, s));
+    var eq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eq);
+    try mlx.check(mlx.mlx_array_equal(&eq, av, bv, false, s));
+    try mlx.check(mlx.mlx_array_eval(eq));
+    var v = false;
+    try mlx.check(mlx.mlx_array_item_bool(&v, eq));
+    return v;
+}
+
+/// A random [E, N, K] 4-bit affine bank at group 64: any bit pattern is a valid 4-bit row, so the words come straight
+/// from the RNG; bf16 scales in [0.01, 0.06) and biases in [-0.5, 0.5).
+pub fn moeRowsLayoutBank(s: mlx.mlx_stream, rnd: std.Random, E: c_int, N: c_int, K: c_int) !MoeRowsGeluBank {
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, rnd.int(u64)));
+    const w_shape = [_]c_int{ E, N, @divExact(K * 4, 32) };
+    var w = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(w);
+    try mlx.check(mlx.mlx_random_bits(&w, &w_shape, 3, 4, key, s));
+    const g_shape = [_]c_int{ E, N, @divExact(K, 64) };
+    const sc = try testRandUniformBf16(rnd, &g_shape, 0.01, 0.06, s);
+    errdefer _ = mlx.mlx_array_free(sc);
+    const bi = try testRandUniformBf16(rnd, &g_shape, -0.5, 0.5, s);
+    return .{ .w = w, .sc = sc, .bi = bi };
+}
+
+/// An [R, TOPK] expert table, each row's experts distinct (the router's top-k): the first row drawn alone, each later row
+/// keeping exactly `keep` of the first row's experts (0: none; TOPK: the same set as the first row) and filling the rest with experts
+/// the first row does not hold, each row's slots shuffled.
+pub fn moeRowsLayoutTable(rnd: std.Random, E: usize, R: usize, TOPK: usize, keep: usize) mlx.mlx_array {
+    // the buffers below hold at most 8 rows of 16 slots and 128 experts; a later row needs TOPK - keep experts outside the first row
+    // (a real check, not an assert: the tests run in ReleaseFast, where an assert is gone)
+    if (!(R <= 8 and TOPK <= 16 and E <= 128 and keep <= TOPK and E >= TOPK and (R < 2 or E - TOPK >= TOPK - keep))) @panic("moeRowsLayoutTable: the dimensions do not fit its buffers or cannot give distinct experts");
+    var data: [8 * 16]u32 = @splat(0);
+    for (0..R) |r| {
+        var in_row: [128]bool = @splat(false);
+        var k: usize = 0;
+        if (r > 0) {
+            // the first row's experts are never drawn fresh, so the count shared with the first row is exactly `keep`
+            for (data[0..TOPK]) |e0| in_row[e0] = true;
+            var cand: [16]u32 = undefined;
+            @memcpy(cand[0..TOPK], data[0..TOPK]);
+            var left = TOPK;
+            while (k < keep and left > 0) {
+                const j = rnd.uintLessThan(usize, left);
+                data[r * TOPK + k] = cand[j];
+                cand[j] = cand[left - 1];
+                left -= 1;
+                k += 1;
+            }
+        }
+        while (k < TOPK) {
+            const pick: u32 = @intCast(rnd.uintLessThan(usize, E));
+            if (in_row[pick]) continue;
+            data[r * TOPK + k] = pick;
+            in_row[pick] = true;
+            k += 1;
+        }
+        rnd.shuffle(u32, data[r * TOPK .. (r + 1) * TOPK]);
+    }
+    return mlx.mlx_array_new_data(&data, &[_]c_int{ @intCast(R), @intCast(TOPK) }, 2, .uint32);
+}
+
+test "moe-rows-layout: the picked MoE rows layouts give the served kernels' bits, at the M4 entry, a TPT/AX 0 layout and the fallback" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0x176C);
+    const rnd = prng.random();
+    moe_rows_fused_override = true;
+    defer moe_rows_fused_override = null;
+    gqmv_gateup_override = true;
+    defer gqmv_gateup_override = null;
+    downred_override = true;
+    defer downred_override = null;
+    const saved_on = moe_rows_layout_override;
+    const saved_plan = moe_rows_layout_plan_override;
+    defer {
+        moe_rows_layout_override = saved_on;
+        moe_rows_layout_plan_override = saved_plan;
+    }
+    // Gemma 4 26B-A4B's expert geometry (hidden 2,816, expert width 704), 4-bit affine at group 64; 32 experts.
+    const E: c_int = 32;
+    const H: c_int = 2816;
+    const I: c_int = 704;
+    const gate = try moeRowsLayoutBank(s, rnd, E, I, H);
+    defer moeRowsGeluFreeBank(gate);
+    const up = try moeRowsLayoutBank(s, rnd, E, I, H);
+    defer moeRowsGeluFreeBank(up);
+    const down = try moeRowsLayoutBank(s, rnd, E, H, I);
+    defer moeRowsGeluFreeBank(down);
+    // the GELU-tanh table over every bf16 pattern, as the verify serves Gemma 4
+    const NT: usize = 1 << 16;
+    const tb = try std.testing.allocator.alloc(f32, NT);
+    defer std.testing.allocator.free(tb);
+    for (tb, 0..) |*v, i| {
+        const xv: f64 = @floatCast(@as(f32, @bitCast(@as(u32, @intCast(i)) << 16)));
+        const gv = 0.5 * xv * (1.0 + std.math.tanh(0.7978845608028654 * (xv + 0.044715 * xv * xv * xv)));
+        v.* = if (std.math.isFinite(gv)) @floatCast(gv) else @floatCast(xv);
+    }
+    const t32 = mlx.mlx_array_new_data(tb.ptr, &[_]c_int{@intCast(NT)}, 1, .float32);
+    defer _ = mlx.mlx_array_free(t32);
+    var table = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(table);
+    try mlx.check(mlx.mlx_astype(&table, t32, .bfloat16, s));
+    try mlx.check(mlx.mlx_array_eval(table));
+
+    const plans = [_]MoeRowsLayoutPlan{
+        moeRowsLayoutPlanFor(.{ .gen = 16, .phone = false }), // the M4 entry
+        .{ .gateup = .{ .sg = 16, .ax = 0 }, .down = .{ .sps = 2, .tpt = 2, .ax = 0 } }, // the other code paths
+        .{ .gateup = null, .down = null }, // a device without an entry
+    };
+    // (rows, top-k, experts each later row keeps from the first row, GELU table): the served verify is 3 rows at top-6
+    const Case = struct { R: c_int, topk: c_int, keep: usize, gelu: bool };
+    const cases = [_]Case{
+        .{ .R = 3, .topk = 6, .keep = 0, .gelu = true },
+        .{ .R = 3, .topk = 6, .keep = 3, .gelu = true },
+        .{ .R = 3, .topk = 6, .keep = 6, .gelu = true },
+        .{ .R = 3, .topk = 6, .keep = 2, .gelu = false },
+        .{ .R = 1, .topk = 6, .keep = 0, .gelu = true },
+        .{ .R = 2, .topk = 6, .keep = 3, .gelu = true },
+        .{ .R = 4, .topk = 6, .keep = 3, .gelu = true },
+        .{ .R = 3, .topk = 8, .keep = 3, .gelu = true },
+        .{ .R = 3, .topk = 4, .keep = 2, .gelu = true },
+    };
+    const rows_tile: c_int = @divExact(32, downredLpr());
+    var checked: usize = 0;
+    for (cases) |c| {
+        const x = try testRandUniformBf16(rnd, &[_]c_int{ c.R, H }, -1.0, 1.0, s);
+        defer _ = mlx.mlx_array_free(x);
+        const scores = try testRandUniformBf16(rnd, &[_]c_int{ c.R, c.topk }, 0.05, 0.3, s);
+        defer _ = mlx.mlx_array_free(scores);
+        const inds = moeRowsLayoutTable(rnd, @intCast(E), @intCast(c.R), @intCast(c.topk), c.keep);
+        defer _ = mlx.mlx_array_free(inds);
+        const act: ?mlx.mlx_array = if (c.gelu) table else null;
+
+        moe_rows_layout_override = false;
+        const gu_off = (try gatherQmvGateUpRowsAct(s, x, gate.w, gate.sc, gate.bi, up.w, up.sc, up.bi, inds, 4, 64, .affine, null, act)) orelse return error.FusedDeclined;
+        defer _ = mlx.mlx_array_free(gu_off);
+        try std.testing.expectEqual(MOE_ROWS_LAYOUT_GATEUP_SERVED, moe_rows_layout_last_gateup);
+        const dn_off = (try gatherQmvDownReduceRows(s, gu_off, down.w, down.sc, down.bi, inds, scores, 4, 64, .affine)) orelse return error.FusedDeclined;
+        defer _ = mlx.mlx_array_free(dn_off);
+        try std.testing.expectEqual(MOE_ROWS_LAYOUT_DOWN_SERVED, moe_rows_layout_last_down);
+        try mlx.check(mlx.mlx_array_eval(dn_off));
+
+        for (plans) |p| {
+            moe_rows_layout_override = true;
+            moe_rows_layout_plan_override = p;
+            const gu_on = (try gatherQmvGateUpRowsAct(s, x, gate.w, gate.sc, gate.bi, up.w, up.sc, up.bi, inds, 4, 64, .affine, null, act)) orelse return error.FusedDeclined;
+            defer _ = mlx.mlx_array_free(gu_on);
+            const want_gu = p.gateup orelse MOE_ROWS_LAYOUT_GATEUP_SERVED;
+            try std.testing.expectEqual(want_gu, moe_rows_layout_last_gateup);
+            // the down kernel reads the switch-off gate/up output, so each kernel is compared on its own
+            const dn_on = (try gatherQmvDownReduceRows(s, gu_off, down.w, down.sc, down.bi, inds, scores, 4, 64, .affine)) orelse return error.FusedDeclined;
+            defer _ = mlx.mlx_array_free(dn_on);
+            var want_dn = MOE_ROWS_LAYOUT_DOWN_SERVED;
+            if (p.down) |d| {
+                if (@rem(c.topk, d.sps) == 0 and @rem(@divExact(H, rows_tile), d.tpt) == 0) want_dn = d;
+            }
+            try std.testing.expectEqual(want_dn, moe_rows_layout_last_down);
+            const gu_same = try moeRowsLayoutBitsEqual(gu_on, gu_off, s);
+            const dn_same = try moeRowsLayoutBitsEqual(dn_on, dn_off, s);
+            // a leading newline: the test runner's own output may share the line before the first print
+            std.debug.print("\n[moe-rows-layout test] R={d} topk={d} keep={d} gelu={} gateup sg={d} ax={d} identical={} down sps={d} tpt={d} ax={d} body={d} identical={}\n", .{
+                c.R, c.topk, c.keep, c.gelu, want_gu.sg, want_gu.ax, gu_same, want_dn.sps, want_dn.tpt, want_dn.ax, @intFromEnum(want_dn.body), dn_same,
+            });
+            try std.testing.expect(gu_same);
+            try std.testing.expect(dn_same);
+            checked += 1;
+        }
+    }
+    try std.testing.expectEqual(cases.len * plans.len, checked);
+}
+
+test "moe-rows-layout tune: the parsers and the table reader share one range check" {
+    try moeRowsLayoutCheckGateUp(32, 1);
+    try std.testing.expectError(error.MoeRowsLayoutBadValue, moeRowsLayoutCheckGateUp(0, 0));
+    try std.testing.expectError(error.MoeRowsLayoutBadValue, moeRowsLayoutCheckGateUp(33, 0));
+    try std.testing.expectError(error.MoeRowsLayoutBadValue, moeRowsLayoutCheckGateUp(8, 2));
+    try moeRowsLayoutCheckDown(6, 1, 1);
+    try std.testing.expectError(error.MoeRowsLayoutBadValue, moeRowsLayoutCheckDown(0, 1, 0));
+    try std.testing.expectError(error.MoeRowsLayoutBadValue, moeRowsLayoutCheckDown(1, 33, 0));
+    try std.testing.expectError(error.MoeRowsLayoutBadValue, moeRowsLayoutCheckDown(1, 1, 2));
+    // the parsers still refuse what the checks refuse
+    try std.testing.expectError(error.MoeRowsLayoutBadValue, moeRowsLayoutParseGateUp("sg=33 ax=0"));
+    try std.testing.expectError(error.MoeRowsLayoutBadValue, moeRowsLayoutParseDown("sps=1 tpt=0 ax=0"));
+    // the down body: 0 scalar, 1 array, absent scalar, anything else refused
+    try std.testing.expectEqual(MoeRowsLayoutDownBody.scalar, try moeRowsLayoutCheckDownBody(0));
+    try std.testing.expectEqual(MoeRowsLayoutDownBody.array, try moeRowsLayoutCheckDownBody(1));
+    try std.testing.expectError(error.MoeRowsLayoutBadValue, moeRowsLayoutCheckDownBody(2));
+    try std.testing.expectError(error.MoeRowsLayoutBadValue, moeRowsLayoutCheckDownBody(-1));
+    try std.testing.expectEqual(MoeRowsLayoutDownBody.scalar, (try moeRowsLayoutParseDown("sps=6 tpt=1 ax=1")).body);
+    try std.testing.expectEqual(MoeRowsLayoutDown{ .sps = 6, .tpt = 1, .ax = 1, .body = .array }, try moeRowsLayoutParseDown("dd=0 sps=6 tpt=1 nr=1 pf=0 ax=1 body=1"));
+    try std.testing.expectError(error.MoeRowsLayoutBadValue, moeRowsLayoutParseDown("sps=6 tpt=1 ax=1 body=2"));
+    try std.testing.expectError(error.MoeRowsLayoutBadValue, moeRowsLayoutParseDown("sps=6 tpt=1 ax=1 body=x"));
+    try std.testing.expectError(error.MoeRowsLayoutBadValue, moeRowsLayoutParseDown("sps=6 tpt=1 ax=1 body=0 body=1"));
+}
+
+test "moe-rows-layout tune: a config rebuild counts once per layout change" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0x176D);
+    const rnd = prng.random();
+    moe_rows_fused_override = true;
+    defer moe_rows_fused_override = null;
+    gqmv_gateup_override = true;
+    defer gqmv_gateup_override = null;
+    downred_override = true;
+    defer downred_override = null;
+    const saved_on = moe_rows_layout_override;
+    const saved_plan = moe_rows_layout_plan_override;
+    defer {
+        moe_rows_layout_override = saved_on;
+        moe_rows_layout_plan_override = saved_plan;
+        moe_rows_layout_tg_threads_override = null;
+    }
+    const E: c_int = 32;
+    const H: c_int = 2816;
+    const I: c_int = 704;
+    const gate = try moeRowsLayoutBank(s, rnd, E, I, H);
+    defer moeRowsGeluFreeBank(gate);
+    const up = try moeRowsLayoutBank(s, rnd, E, I, H);
+    defer moeRowsGeluFreeBank(up);
+    const down = try moeRowsLayoutBank(s, rnd, E, H, I);
+    defer moeRowsGeluFreeBank(down);
+    const x = try testRandUniformBf16(rnd, &[_]c_int{ 3, H }, -1.0, 1.0, s);
+    defer _ = mlx.mlx_array_free(x);
+    const scores = try testRandUniformBf16(rnd, &[_]c_int{ 3, 6 }, 0.05, 0.3, s);
+    defer _ = mlx.mlx_array_free(scores);
+    const inds = moeRowsLayoutTable(rnd, @intCast(E), 3, 6, 3);
+    defer _ = mlx.mlx_array_free(inds);
+
+    // gate/up: the served plan twice (at most one rebuild in all), a changed plan once, the same plan again not at all
+    moe_rows_layout_override = false;
+    moe_rows_layout_tg_threads_override = null;
+    var before = moe_rows_layout_cfg_rebuilds_gateup;
+    const g1 = (try gatherQmvGateUpRowsAct(s, x, gate.w, gate.sc, gate.bi, up.w, up.sc, up.bi, inds, 4, 64, .affine, null, null)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(g1);
+    const g2 = (try gatherQmvGateUpRowsAct(s, x, gate.w, gate.sc, gate.bi, up.w, up.sc, up.bi, inds, 4, 64, .affine, null, null)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(g2);
+    try std.testing.expect(moe_rows_layout_cfg_rebuilds_gateup - before <= 1);
+    moe_rows_layout_override = true;
+    moe_rows_layout_plan_override = .{ .gateup = .{ .sg = 32, .ax = 1 }, .down = .{ .sps = 6, .tpt = 1, .ax = 1 } };
+    before = moe_rows_layout_cfg_rebuilds_gateup;
+    const g3 = (try gatherQmvGateUpRowsAct(s, x, gate.w, gate.sc, gate.bi, up.w, up.sc, up.bi, inds, 4, 64, .affine, null, null)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(g3);
+    try std.testing.expectEqual(before + 1, moe_rows_layout_cfg_rebuilds_gateup);
+    const g4 = (try gatherQmvGateUpRowsAct(s, x, gate.w, gate.sc, gate.bi, up.w, up.sc, up.bi, inds, 4, 64, .affine, null, null)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(g4);
+    try std.testing.expectEqual(before + 1, moe_rows_layout_cfg_rebuilds_gateup);
+
+    // down: the same, reading the served gate/up output
+    moe_rows_layout_override = false;
+    before = moe_rows_layout_cfg_rebuilds_down;
+    const d1 = (try gatherQmvDownReduceRows(s, g1, down.w, down.sc, down.bi, inds, scores, 4, 64, .affine)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(d1);
+    const d2 = (try gatherQmvDownReduceRows(s, g1, down.w, down.sc, down.bi, inds, scores, 4, 64, .affine)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(d2);
+    try std.testing.expect(moe_rows_layout_cfg_rebuilds_down - before <= 1);
+    moe_rows_layout_override = true;
+    before = moe_rows_layout_cfg_rebuilds_down;
+    const d3 = (try gatherQmvDownReduceRows(s, g1, down.w, down.sc, down.bi, inds, scores, 4, 64, .affine)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(d3);
+    try std.testing.expectEqual(before + 1, moe_rows_layout_cfg_rebuilds_down);
+    const d4 = (try gatherQmvDownReduceRows(s, g1, down.w, down.sc, down.bi, inds, scores, 4, 64, .affine)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(d4);
+    try std.testing.expectEqual(before + 1, moe_rows_layout_cfg_rebuilds_down);
+    // the body is part of the config key: the array body after the scalar one at the same layout rebuilds once
+    moe_rows_layout_plan_override = .{ .gateup = null, .down = .{ .sps = 6, .tpt = 1, .ax = 1, .body = .scalar } };
+    const d5 = (try gatherQmvDownReduceRows(s, g1, down.w, down.sc, down.bi, inds, scores, 4, 64, .affine)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(d5);
+    before = moe_rows_layout_cfg_rebuilds_down;
+    moe_rows_layout_plan_override = .{ .gateup = null, .down = .{ .sps = 6, .tpt = 1, .ax = 1, .body = .array } };
+    const d6 = (try gatherQmvDownReduceRows(s, g1, down.w, down.sc, down.bi, inds, scores, 4, 64, .affine)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(d6);
+    try std.testing.expectEqual(before + 1, moe_rows_layout_cfg_rebuilds_down);
+    const d7 = (try gatherQmvDownReduceRows(s, g1, down.w, down.sc, down.bi, inds, scores, 4, 64, .affine)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(d7);
+    try std.testing.expectEqual(before + 1, moe_rows_layout_cfg_rebuilds_down);
+
+    // the thread-count seam: 256 threads is the served gate/up launch (8 simdgroups), so the bits stay the served ones;
+    // setting it and clearing it each rebuild the config
+    moe_rows_layout_override = false;
+    before = moe_rows_layout_cfg_rebuilds_gateup;
+    moe_rows_layout_tg_threads_override = 256;
+    const g5 = (try gatherQmvGateUpRowsAct(s, x, gate.w, gate.sc, gate.bi, up.w, up.sc, up.bi, inds, 4, 64, .affine, null, null)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(g5);
+    try std.testing.expectEqual(before + 1, moe_rows_layout_cfg_rebuilds_gateup);
+    try std.testing.expect(try moeRowsLayoutBitsEqual(g5, g1, s));
+    moe_rows_layout_tg_threads_override = null;
+    const g6 = (try gatherQmvGateUpRowsAct(s, x, gate.w, gate.sc, gate.bi, up.w, up.sc, up.bi, inds, 4, 64, .affine, null, null)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(g6);
+    try std.testing.expectEqual(before + 2, moe_rows_layout_cfg_rebuilds_gateup);
+    try std.testing.expect(try moeRowsLayoutBitsEqual(g6, g1, s));
+    // the table generator's bounds: a one-row table may use every expert (no second row needs experts outside the first row)
+    const one_row = moeRowsLayoutTable(rnd, 4, 1, 4, 0);
+    _ = mlx.mlx_array_free(one_row);
+    // an override that is not a positive multiple of 32 (zero included, which is not the same as no override) is refused
+    for ([_]c_int{ 0, 33, -32 }) |bad| {
+        moe_rows_layout_tg_threads_override = bad;
+        try std.testing.expectError(error.MoeRowsLayoutBadThreadOverride, gatherQmvGateUpRowsAct(s, x, gate.w, gate.sc, gate.bi, up.w, up.sc, up.bi, inds, 4, 64, .affine, null, null));
+    }
+    moe_rows_layout_tg_threads_override = null;
+}
+
+test "down-body: both down bodies give the served kernel's bits at every layout" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0x176B);
+    const rnd = prng.random();
+    moe_rows_fused_override = true;
+    defer moe_rows_fused_override = null;
+    gqmv_gateup_override = true;
+    defer gqmv_gateup_override = null;
+    downred_override = true;
+    defer downred_override = null;
+    const saved_on = moe_rows_layout_override;
+    const saved_plan = moe_rows_layout_plan_override;
+    defer {
+        moe_rows_layout_override = saved_on;
+        moe_rows_layout_plan_override = saved_plan;
+    }
+    const E: c_int = 32;
+    const H: c_int = 2816;
+    const I: c_int = 704;
+    const gate = try moeRowsLayoutBank(s, rnd, E, I, H);
+    defer moeRowsGeluFreeBank(gate);
+    const up = try moeRowsLayoutBank(s, rnd, E, I, H);
+    defer moeRowsGeluFreeBank(up);
+    const down = try moeRowsLayoutBank(s, rnd, E, H, I);
+    defer moeRowsGeluFreeBank(down);
+    const NT: usize = 1 << 16;
+    const tb = try std.testing.allocator.alloc(f32, NT);
+    defer std.testing.allocator.free(tb);
+    for (tb, 0..) |*v, i| {
+        const xv: f64 = @floatCast(@as(f32, @bitCast(@as(u32, @intCast(i)) << 16)));
+        const gv = 0.5 * xv * (1.0 + std.math.tanh(0.7978845608028654 * (xv + 0.044715 * xv * xv * xv)));
+        v.* = if (std.math.isFinite(gv)) @floatCast(gv) else @floatCast(xv);
+    }
+    const t32 = mlx.mlx_array_new_data(tb.ptr, &[_]c_int{@intCast(NT)}, 1, .float32);
+    defer _ = mlx.mlx_array_free(t32);
+    var table = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(table);
+    try mlx.check(mlx.mlx_astype(&table, t32, .bfloat16, s));
+    try mlx.check(mlx.mlx_array_eval(table));
+
+    const Case = struct { R: c_int, topk: c_int, keep: usize, gelu: bool };
+    const cases = [_]Case{
+        .{ .R = 3, .topk = 6, .keep = 0, .gelu = true },
+        .{ .R = 3, .topk = 6, .keep = 3, .gelu = true },
+        .{ .R = 3, .topk = 6, .keep = 6, .gelu = true },
+        .{ .R = 3, .topk = 6, .keep = 2, .gelu = false },
+        .{ .R = 1, .topk = 6, .keep = 0, .gelu = true },
+        .{ .R = 2, .topk = 6, .keep = 3, .gelu = true },
+        .{ .R = 4, .topk = 6, .keep = 3, .gelu = true },
+        .{ .R = 3, .topk = 8, .keep = 3, .gelu = true },
+        .{ .R = 3, .topk = 4, .keep = 2, .gelu = true },
+    };
+    const rows_tile: c_int = @divExact(32, downredLpr());
+    const sps_values = [_]c_int{ 1, 2, 3, 6 };
+    const tpt_values = [_]c_int{ 1, 2, 4 };
+    const bodies = [_]MoeRowsLayoutDownBody{ .scalar, .array };
+    var checked: usize = 0;
+    var fitting_top6: usize = 0;
+    for (cases) |c| {
+        const x = try testRandUniformBf16(rnd, &[_]c_int{ c.R, H }, -1.0, 1.0, s);
+        defer _ = mlx.mlx_array_free(x);
+        const scores = try testRandUniformBf16(rnd, &[_]c_int{ c.R, c.topk }, 0.05, 0.3, s);
+        defer _ = mlx.mlx_array_free(scores);
+        const inds = moeRowsLayoutTable(rnd, @intCast(E), @intCast(c.R), @intCast(c.topk), c.keep);
+        defer _ = mlx.mlx_array_free(inds);
+        const act: ?mlx.mlx_array = if (c.gelu) table else null;
+
+        moe_rows_layout_override = false;
+        const gu_off = (try gatherQmvGateUpRowsAct(s, x, gate.w, gate.sc, gate.bi, up.w, up.sc, up.bi, inds, 4, 64, .affine, null, act)) orelse return error.FusedDeclined;
+        defer _ = mlx.mlx_array_free(gu_off);
+        const dn_off = (try gatherQmvDownReduceRows(s, gu_off, down.w, down.sc, down.bi, inds, scores, 4, 64, .affine)) orelse return error.FusedDeclined;
+        defer _ = mlx.mlx_array_free(dn_off);
+        try std.testing.expectEqual(MOE_ROWS_LAYOUT_DOWN_SERVED, moe_rows_layout_last_down);
+        try std.testing.expectEqual(MoeRowsLayoutDownKernel.served, moe_rows_layout_last_down_kernel);
+        try mlx.check(mlx.mlx_array_eval(dn_off));
+
+        for (sps_values) |sps| for (tpt_values) |tpt| for ([_]u1{ 0, 1 }) |ax| for (bodies) |body| {
+            const d = MoeRowsLayoutDown{ .sps = sps, .tpt = tpt, .ax = ax, .body = body };
+            moe_rows_layout_override = true;
+            moe_rows_layout_plan_override = .{ .gateup = null, .down = d };
+            const dn_on = (try gatherQmvDownReduceRows(s, gu_off, down.w, down.sc, down.bi, inds, scores, 4, 64, .affine)) orelse return error.FusedDeclined;
+            defer _ = mlx.mlx_array_free(dn_on);
+            const fits = @rem(c.topk, d.sps) == 0 and @rem(@divExact(H, rows_tile), d.tpt) == 0 and
+                @divExact(c.topk, d.sps) * d.tpt * 32 <= 1024;
+            if (fits) {
+                try std.testing.expectEqual(d, moe_rows_layout_last_down);
+                const want_kernel: MoeRowsLayoutDownKernel = if (body == .array) .array else if (sps == 1 and tpt == 1 and ax == 0) .served else .scalar_body;
+                try std.testing.expectEqual(want_kernel, moe_rows_layout_last_down_kernel);
+                if (c.topk == 6) fitting_top6 += 1;
+            } else {
+                try std.testing.expectEqual(MOE_ROWS_LAYOUT_DOWN_SERVED, moe_rows_layout_last_down);
+                try std.testing.expectEqual(MoeRowsLayoutDownKernel.served, moe_rows_layout_last_down_kernel);
+            }
+            const same = try moeRowsLayoutBitsEqual(dn_on, dn_off, s);
+            std.debug.print("\n[down-body test] R={d} topk={d} keep={d} sps={d} tpt={d} ax={d} body={d} kernel={s} identical={}\n", .{
+                c.R, c.topk, c.keep, sps, tpt, ax, @intFromEnum(body), @tagName(moe_rows_layout_last_down_kernel), same,
+            });
+            try std.testing.expect(same);
+            checked += 1;
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 9 * 48), checked);
+    try std.testing.expectEqual(@as(usize, 7 * 48), fitting_top6);
+}
+
+test "down-body: a plan that does not fit runs the served kernel whatever its body" {
+    const saved_on = moe_rows_layout_override;
+    const saved_plan = moe_rows_layout_plan_override;
+    defer {
+        moe_rows_layout_override = saved_on;
+        moe_rows_layout_plan_override = saved_plan;
+    }
+    moe_rows_layout_override = true;
+    moe_rows_layout_plan_override = .{ .gateup = null, .down = .{ .sps = 6, .tpt = 1, .ax = 1, .body = .array } };
+    // top-8 and top-4 rows do not divide into 6 slots a simdgroup, and an NVFP4 bank has no array body
+    try std.testing.expectEqual(MOE_ROWS_LAYOUT_DOWN_SERVED, moeRowsLayoutDown(false, 2816, 704, 4, 64, .bfloat16, 4, 8));
+    try std.testing.expectEqual(MOE_ROWS_LAYOUT_DOWN_SERVED, moeRowsLayoutDown(false, 2816, 704, 4, 64, .bfloat16, 4, 4));
+    try std.testing.expectEqual(MOE_ROWS_LAYOUT_DOWN_SERVED, moeRowsLayoutDown(true, 2816, 704, 4, 64, .bfloat16, 4, 6));
+    try std.testing.expectEqual(MoeRowsLayoutDownBody.scalar, moeRowsLayoutDown(false, 2816, 704, 4, 64, .bfloat16, 4, 8).body);
+    // the thread cap
+    moe_rows_layout_plan_override = .{ .gateup = null, .down = .{ .sps = 1, .tpt = 8, .ax = 0, .body = .array } };
+    try std.testing.expectEqual(MOE_ROWS_LAYOUT_DOWN_SERVED, moeRowsLayoutDown(false, 2816, 704, 4, 64, .bfloat16, 4, 6));
+    // the served triple with the array body fits and keeps its body
+    moe_rows_layout_plan_override = .{ .gateup = null, .down = .{ .sps = 1, .tpt = 1, .ax = 0, .body = .array } };
+    try std.testing.expectEqual(MoeRowsLayoutDown{ .sps = 1, .tpt = 1, .ax = 0, .body = .array }, moeRowsLayoutDown(false, 2816, 704, 4, 64, .bfloat16, 4, 6));
+}
+
+// ── Task 4 tests: the local table's precedence ──
+
+const MOE_ROWS_LAYOUT_TEST_PATH = "~/.mlx-serve/tune/kernel-plans.json";
+const MOE_ROWS_LAYOUT_TEST_G16 = DeviceGen{ .gen = 16, .phone = false };
+const MOE_ROWS_LAYOUT_TEST_G15 = DeviceGen{ .gen = 15, .phone = false };
+
+fn moeRowsLayoutTestInputs(raw: ?[]const u8, gu_env: ?[]const u8, dn_env: ?[]const u8, sw: kernel_table.TableSwitch, local: MoeRowsLayoutLocal, gen: DeviceGen) MoeRowsLayoutInputs {
+    return .{
+        .moe_rows_layout_raw = raw,
+        .gateup_env = gu_env,
+        .down_env = dn_env,
+        .table_switch = sw,
+        .table_path = MOE_ROWS_LAYOUT_TEST_PATH,
+        .local = local,
+        .builtin = moeRowsLayoutPlanFor(gen),
+        .gen = gen,
+    };
+}
+
+test "moe-rows-layout tune: precedence matrix" {
+    const picks = MoeRowsLayoutPlan{ .gateup = .{ .sg = 32, .ax = 1 }, .down = .{ .sps = 6, .tpt = 1, .ax = 1 } };
+    const served_both = MoeRowsLayoutPlan{ .gateup = null, .down = null };
+    const one_each = MoeRowsLayoutPlan{ .gateup = .{ .sg = 16, .ax = 0 }, .down = null };
+    const tuned = "2026-11-22T10:00:00Z";
+    const locals = [_]MoeRowsLayoutLocal{
+        .absent,
+        .{ .refused = .{ .reason = .checksum_mismatch } },
+        .{ .valid = .{ .plan = picks, .tuned_at = tuned } },
+        .{ .valid = .{ .plan = served_both, .tuned_at = tuned } },
+        .{ .valid = .{ .plan = one_each, .tuned_at = tuned } },
+    };
+    const raws = [_]?[]const u8{ null, "1", "0" };
+    const gu_envs = [_]?[]const u8{ null, "sg=16 ax=0", "sg=99 ax=0" }; // unset, valid, refused
+    const dn_envs = [_]?[]const u8{ null, "sps=2 tpt=2 ax=0", "sps=0 tpt=1 ax=0" };
+    const switches = [_]kernel_table.TableSwitch{ .unset, .{ .path = "/t/p.json" }, .off, .empty };
+    // G16 and G15 have built-in entries (G15's is down only), G17 none
+    const gens = [_]DeviceGen{ MOE_ROWS_LAYOUT_TEST_G16, MOE_ROWS_LAYOUT_TEST_G15, .{ .gen = 17, .phone = false } };
+    var cases: usize = 0;
+    for (raws) |raw| for (gu_envs) |gue| for (dn_envs) |dne| for (switches) |tsw| for (locals) |local| for (gens) |gen| {
+        const in = moeRowsLayoutTestInputs(raw, gue, dne, tsw, local, gen);
+        const d = moeRowsLayoutDecideSources(in);
+        cases += 1;
+        try std.testing.expect(d.n_lines >= 1 and d.n_lines <= MOE_ROWS_LAYOUT_MAX_LINES);
+
+        // The reference, written from the numbered list of spec 3.7, not from the code.
+        const raw_one = if (raw) |r| std.mem.eql(u8, r, "1") else false;
+        const raw_other = raw != null and !raw_one;
+        const table_live = !raw_other and (tsw == .unset or tsw == .path);
+        const local_valid: ?MoeRowsLayoutPlan = if (table_live) switch (local) {
+            .valid => |v| v.plan,
+            else => null,
+        } else null;
+        const base: MoeRowsLayoutPlan = local_valid orelse in.builtin;
+        const base_has = base.gateup != null or base.down != null;
+        const want_on = if (raw_other) false else if (raw_one) true else base_has;
+        var want_plan = MoeRowsLayoutPlan{ .gateup = null, .down = null };
+        var want_gsrc: MoeRowsLayoutSource = .none;
+        var want_dsrc: MoeRowsLayoutSource = .none;
+        if (want_on) {
+            want_plan = base;
+            const bsrc_g: MoeRowsLayoutSource = if (local_valid != null) .local else if (base.gateup != null) .builtin else .none;
+            const bsrc_d: MoeRowsLayoutSource = if (local_valid != null) .local else if (base.down != null) .builtin else .none;
+            want_gsrc = bsrc_g;
+            want_dsrc = bsrc_d;
+            if (gue) |v| {
+                if (moeRowsLayoutParseGateUp(v)) |p| {
+                    want_plan.gateup = p;
+                    want_gsrc = .env;
+                } else |_| {
+                    want_plan.gateup = null;
+                    want_gsrc = .env_refused;
+                }
+            }
+            if (dne) |v| {
+                if (moeRowsLayoutParseDown(v)) |p| {
+                    want_plan.down = p;
+                    want_dsrc = .env;
+                } else |_| {
+                    want_plan.down = null;
+                    want_dsrc = .env_refused;
+                }
+            }
+        } else if (raw == null and local_valid != null) {
+            want_gsrc = .local;
+            want_dsrc = .local;
+        }
+        try std.testing.expectEqual(want_on, d.sw.on());
+        try std.testing.expectEqual(want_plan, d.plan);
+        try std.testing.expectEqual(want_gsrc, d.gateup_src);
+        try std.testing.expectEqual(want_dsrc, d.down_src);
+        // which switch value: a valid local table decides it only when MLX_SERVE_MOE_ROWS_LAYOUT is unset
+        if (raw == null and local_valid != null) {
+            try std.testing.expectEqual(if (base_has) MoeRowsLayoutSwitch.on_local else MoeRowsLayoutSwitch.off_local, d.sw);
+        } else if (raw_other) {
+            try std.testing.expectEqual(MoeRowsLayoutSwitch.off_env, d.sw);
+        } else if (raw_one) {
+            try std.testing.expectEqual(MoeRowsLayoutSwitch.on_env, d.sw);
+        } else {
+            try std.testing.expectEqual(if (base_has) MoeRowsLayoutSwitch.on_default else MoeRowsLayoutSwitch.off_default, d.sw);
+        }
+        // a valid local table is never mixed with the built-in: with no override both sources are local
+        if (want_on and local_valid != null and gue == null and dne == null) {
+            try std.testing.expectEqual(MoeRowsLayoutSource.local, d.gateup_src);
+            try std.testing.expectEqual(MoeRowsLayoutSource.local, d.down_src);
+        }
+        // the lines: a refusal or skip line only when a table was in play, and the plan line exactly when on
+        var refusal_lines: usize = 0;
+        var skip_lines: usize = 0;
+        var plan_lines: usize = 0;
+        for (0..d.n_lines) |i| {
+            if (std.mem.indexOf(u8, d.line(i), "local table ") != null and std.mem.indexOf(u8, d.line(i), " refused (") != null) refusal_lines += 1;
+            if (std.mem.indexOf(u8, d.line(i), "local table skipped") != null) skip_lines += 1;
+            if (std.mem.indexOf(u8, d.line(i), "MoE rows layouts on:") != null) plan_lines += 1;
+        }
+        const want_refusal: usize = if (!raw_other and (tsw == .unset or tsw == .path) and local == .refused) 1 else 0;
+        const want_skip: usize = if (!raw_other and (tsw == .off or tsw == .empty)) 1 else 0;
+        try std.testing.expectEqual(want_refusal, refusal_lines);
+        try std.testing.expectEqual(want_skip, skip_lines);
+        try std.testing.expectEqual(@as(usize, if (want_on) 1 else 0), plan_lines);
+        // the plan line is always the last line
+        if (want_on) try std.testing.expect(std.mem.indexOf(u8, d.line(d.n_lines - 1), "MoE rows layouts on:") != null);
+    };
+    try std.testing.expectEqual(@as(usize, 3 * 3 * 3 * 4 * 5 * 3), cases);
+
+    // Spot checks, with the lines written out literally.
+    {
+        const d = moeRowsLayoutDecideSources(moeRowsLayoutTestInputs(null, null, null, .unset, .absent, MOE_ROWS_LAYOUT_TEST_G16));
+        try std.testing.expectEqual(MoeRowsLayoutSwitch.on_default, d.sw);
+        try std.testing.expectEqual(MoeRowsLayoutPlan{ .gateup = .{ .sg = 32, .ax = 1 }, .down = .{ .sps = 6, .tpt = 1, .ax = 1 } }, d.plan);
+        try std.testing.expectEqual(MoeRowsLayoutSource.builtin, d.gateup_src);
+        try std.testing.expectEqual(MoeRowsLayoutSource.builtin, d.down_src);
+        try std.testing.expectEqual(@as(usize, 2), d.n_lines);
+        try std.testing.expectEqualStrings("[moe-rows-layout] switch on (default: gpu gen=16 phone=false has a table entry; MLX_SERVE_MOE_ROWS_LAYOUT=0 turns it off)", d.line(0));
+        try std.testing.expectEqualStrings("[moe-rows-layout] MoE rows layouts on: gpu gen=16 phone=false gateup(table) sg=32 ax=1 down(table) sps=6 tpt=1 ax=1 body=0", d.line(1));
+    }
+    {
+        const d = moeRowsLayoutDecideSources(moeRowsLayoutTestInputs(null, null, null, .unset, locals[3], MOE_ROWS_LAYOUT_TEST_G16));
+        try std.testing.expectEqual(MoeRowsLayoutSwitch.off_local, d.sw);
+        try std.testing.expectEqual(MoeRowsLayoutPlan{ .gateup = null, .down = null }, d.plan);
+        try std.testing.expectEqual(@as(usize, 1), d.n_lines);
+        try std.testing.expectEqualStrings("[moe-rows-layout] switch off (local table ~/.mlx-serve/tune/kernel-plans.json, tuned 2026-11-22: no confirmed gain on this Mac): the served MoE rows layouts", d.line(0));
+    }
+    {
+        const d = moeRowsLayoutDecideSources(moeRowsLayoutTestInputs(null, null, null, .unset, locals[2], MOE_ROWS_LAYOUT_TEST_G16));
+        try std.testing.expectEqual(MoeRowsLayoutSwitch.on_local, d.sw);
+        try std.testing.expectEqualStrings("[moe-rows-layout] switch on (local table ~/.mlx-serve/tune/kernel-plans.json, tuned 2026-11-22)", d.line(0));
+        try std.testing.expectEqualStrings("[moe-rows-layout] MoE rows layouts on: gpu gen=16 phone=false gateup(local) sg=32 ax=1 down(local) sps=6 tpt=1 ax=1 body=0", d.line(1));
+    }
+    {
+        const d = moeRowsLayoutDecideSources(moeRowsLayoutTestInputs(null, null, null, .unset, locals[1], MOE_ROWS_LAYOUT_TEST_G16));
+        try std.testing.expectEqual(@as(usize, 3), d.n_lines);
+        try std.testing.expectEqualStrings("[moe-rows-layout] local table ~/.mlx-serve/tune/kernel-plans.json refused (checksum_mismatch); using the built-in table or the served layouts", d.line(0));
+        try std.testing.expectEqualStrings("[moe-rows-layout] switch on (default: gpu gen=16 phone=false has a table entry; MLX_SERVE_MOE_ROWS_LAYOUT=0 turns it off)", d.line(1));
+    }
+    for ([_]kernel_table.TableSwitch{ .off, .empty }) |tsw| {
+        const d = moeRowsLayoutDecideSources(moeRowsLayoutTestInputs(null, null, null, tsw, locals[2], MOE_ROWS_LAYOUT_TEST_G16));
+        try std.testing.expectEqualStrings("[moe-rows-layout] local table skipped (MLX_SERVE_KERNEL_TABLE=off)", d.line(0));
+        try std.testing.expectEqual(MoeRowsLayoutSwitch.on_default, d.sw);
+        try std.testing.expectEqual(MoeRowsLayoutSource.builtin, d.gateup_src);
+    }
+    {
+        const d = moeRowsLayoutDecideSources(moeRowsLayoutTestInputs("0", null, null, .unset, locals[2], MOE_ROWS_LAYOUT_TEST_G16));
+        try std.testing.expectEqual(MoeRowsLayoutSwitch.off_env, d.sw);
+        try std.testing.expectEqual(@as(usize, 1), d.n_lines);
+    }
+    {
+        // one of each: the "served" kernel stays null with source local, the built-in's plan for it is not used
+        const d = moeRowsLayoutDecideSources(moeRowsLayoutTestInputs(null, null, null, .unset, locals[4], MOE_ROWS_LAYOUT_TEST_G16));
+        try std.testing.expectEqual(MoeRowsLayoutPlan{ .gateup = .{ .sg = 16, .ax = 0 }, .down = null }, d.plan);
+        try std.testing.expectEqual(MoeRowsLayoutSource.local, d.down_src);
+    }
+    {
+        // the worst case is five lines: a refusal, the switch, two override refusals and the plan line
+        const d = moeRowsLayoutDecideSources(moeRowsLayoutTestInputs(null, "sg=99 ax=0", "sps=0 tpt=1 ax=0", .unset, locals[1], MOE_ROWS_LAYOUT_TEST_G16));
+        try std.testing.expectEqual(@as(usize, 5), d.n_lines);
+    }
+}
+
+test "down-body: the override replaces the down plan as a whole" {
+    const array_plan = MoeRowsLayoutPlan{ .gateup = .{ .sg = 32, .ax = 1 }, .down = .{ .sps = 6, .tpt = 1, .ax = 1, .body = .array } };
+    const local = MoeRowsLayoutLocal{ .valid = .{ .plan = array_plan, .tuned_at = "2026-11-22T10:00:00Z" } };
+    // without an override the entry's array body serves
+    const kept = moeRowsLayoutDecideSources(moeRowsLayoutTestInputs(null, null, null, .unset, local, MOE_ROWS_LAYOUT_TEST_G16));
+    try std.testing.expectEqual(MoeRowsLayoutDownBody.array, kept.plan.down.?.body);
+    // an override without body serves the scalar body, and gate/up keeps the entry's plan
+    const d = moeRowsLayoutDecideSources(moeRowsLayoutTestInputs(null, null, "sps=6 tpt=1 ax=1", .unset, local, MOE_ROWS_LAYOUT_TEST_G16));
+    try std.testing.expectEqual(MoeRowsLayoutDown{ .sps = 6, .tpt = 1, .ax = 1, .body = .scalar }, d.plan.down.?);
+    try std.testing.expectEqual(MoeRowsLayoutSource.env, d.down_src);
+    try std.testing.expectEqual(array_plan.gateup, d.plan.gateup);
+    try std.testing.expect(std.mem.endsWith(u8, d.line(d.n_lines - 1), "sps=6 tpt=1 ax=1 body=0"));
+    // an override naming body=1 serves the array body, and the printed plan parses back to itself
+    const a = moeRowsLayoutDecideSources(moeRowsLayoutTestInputs(null, null, "sps=6 tpt=1 ax=1 body=1", .unset, local, MOE_ROWS_LAYOUT_TEST_G16));
+    try std.testing.expectEqual(MoeRowsLayoutDown{ .sps = 6, .tpt = 1, .ax = 1, .body = .array }, a.plan.down.?);
+    try std.testing.expect(std.mem.endsWith(u8, a.line(a.n_lines - 1), "sps=6 tpt=1 ax=1 body=1"));
+    // an override with a bad body is refused and the served down layout serves
+    const bad = moeRowsLayoutDecideSources(moeRowsLayoutTestInputs(null, null, "sps=6 tpt=1 ax=1 body=2", .unset, local, MOE_ROWS_LAYOUT_TEST_G16));
+    try std.testing.expectEqual(@as(?MoeRowsLayoutDown, null), bad.plan.down);
+    try std.testing.expectEqual(MoeRowsLayoutSource.env_refused, bad.down_src);
+}
+
+test "moe-rows-layout tune: the four existing switch lines are unchanged" {
+    var buf: [256]u8 = undefined;
+    const g16 = MOE_ROWS_LAYOUT_TEST_G16;
+    const g15 = MOE_ROWS_LAYOUT_TEST_G15;
+    try std.testing.expectEqualStrings("[moe-rows-layout] switch on (default: gpu gen=16 phone=false has a table entry; MLX_SERVE_MOE_ROWS_LAYOUT=0 turns it off)", moeRowsLayoutSwitchLine(&buf, .on_default, g16));
+    try std.testing.expectEqualStrings("[moe-rows-layout] switch on (default: gpu gen=15 phone=false has a table entry; MLX_SERVE_MOE_ROWS_LAYOUT=0 turns it off)", moeRowsLayoutSwitchLine(&buf, .on_default, g15));
+    try std.testing.expectEqualStrings("[moe-rows-layout] switch off (default: no table entry for gpu gen=16 phone=false): the served MoE rows layouts", moeRowsLayoutSwitchLine(&buf, .off_default, g16));
+    try std.testing.expectEqualStrings("[moe-rows-layout] switch off (default: no table entry for gpu gen=15 phone=false): the served MoE rows layouts", moeRowsLayoutSwitchLine(&buf, .off_default, g15));
+    try std.testing.expectEqualStrings("[moe-rows-layout] switch on (MLX_SERVE_MOE_ROWS_LAYOUT=1, gpu gen=16 phone=false)", moeRowsLayoutSwitchLine(&buf, .on_env, g16));
+    try std.testing.expectEqualStrings("[moe-rows-layout] switch on (MLX_SERVE_MOE_ROWS_LAYOUT=1, gpu gen=15 phone=false)", moeRowsLayoutSwitchLine(&buf, .on_env, g15));
+    try std.testing.expectEqualStrings("[moe-rows-layout] switch off (MLX_SERVE_MOE_ROWS_LAYOUT set and not 1): the served MoE rows layouts", moeRowsLayoutSwitchLine(&buf, .off_env, g16));
+    try std.testing.expectEqualStrings("[moe-rows-layout] switch off (MLX_SERVE_MOE_ROWS_LAYOUT set and not 1): the served MoE rows layouts", moeRowsLayoutSwitchLine(&buf, .off_env, g15));
+}
+
+/// Makes `moeRowsLayoutResolved()` decide from `in` and returns the previous state to `moeRowsLayoutRestoreResolved`.
+fn moeRowsLayoutTestResolveFrom(in: MoeRowsLayoutInputs) void {
+    moe_rows_layout_inputs_override = in;
+    moeRowsLayoutTestForget();
+}
+
+fn moeRowsLayoutTestRestoreResolved(saved_on: ?bool, saved_plan: ?MoeRowsLayoutPlan) void {
+    moe_rows_layout_inputs_override = null;
+    moe_rows_layout_override = saved_on;
+    moe_rows_layout_plan_override = saved_plan;
+    moeRowsLayoutTestForget();
+}
+
+test "moe-rows-layout tune: the local shape restriction" {
+    const saved_on = moe_rows_layout_override;
+    const saved_plan = moe_rows_layout_plan_override;
+    defer moeRowsLayoutTestRestoreResolved(saved_on, saved_plan);
+    moe_rows_layout_override = null;
+    moe_rows_layout_plan_override = null;
+    const local_picks = MoeRowsLayoutLocal{ .valid = .{ .plan = .{ .gateup = .{ .sg = 32, .ax = 1 }, .down = .{ .sps = 6, .tpt = 1, .ax = 1 } }, .tuned_at = "2026-11-22T10:00:00Z" } };
+
+    // a plan from the local table: the tuned shape gets it, every other shape the served layout
+    moeRowsLayoutTestResolveFrom(moeRowsLayoutTestInputs(null, null, null, .unset, local_picks, MOE_ROWS_LAYOUT_TEST_G16));
+    try std.testing.expectEqual(MoeRowsLayoutGateUp{ .sg = 32, .ax = 1 }, moeRowsLayoutGateUp(false, 704, 2816, 4, 64, .bfloat16));
+    try std.testing.expectEqual(MoeRowsLayoutDown{ .sps = 6, .tpt = 1, .ax = 1 }, moeRowsLayoutDown(false, 2816, 704, 4, 64, .bfloat16, 4, 6));
+    try std.testing.expectEqual(MOE_ROWS_LAYOUT_GATEUP_SERVED, moeRowsLayoutGateUp(false, 704, 2048, 4, 64, .bfloat16)); // another K
+    try std.testing.expectEqual(MOE_ROWS_LAYOUT_GATEUP_SERVED, moeRowsLayoutGateUp(false, 704, 2816, 8, 64, .bfloat16)); // 8-bit
+    try std.testing.expectEqual(MOE_ROWS_LAYOUT_GATEUP_SERVED, moeRowsLayoutGateUp(false, 704, 2816, 4, 32, .bfloat16)); // group 32
+    try std.testing.expectEqual(MOE_ROWS_LAYOUT_GATEUP_SERVED, moeRowsLayoutGateUp(false, 704, 2816, 4, 64, .float16)); // fp16
+    try std.testing.expectEqual(MOE_ROWS_LAYOUT_GATEUP_SERVED, moeRowsLayoutGateUp(false, 352, 2816, 4, 64, .bfloat16)); // another N that still fits
+    try std.testing.expectEqual(MOE_ROWS_LAYOUT_DOWN_SERVED, moeRowsLayoutDown(false, 2816, 1408, 4, 64, .bfloat16, 4, 6));
+    try std.testing.expectEqual(MOE_ROWS_LAYOUT_DOWN_SERVED, moeRowsLayoutDown(false, 2816, 704, 8, 64, .bfloat16, 4, 6));
+    try std.testing.expectEqual(MOE_ROWS_LAYOUT_DOWN_SERVED, moeRowsLayoutDown(false, 2816, 704, 4, 32, .bfloat16, 4, 6));
+    try std.testing.expectEqual(MOE_ROWS_LAYOUT_DOWN_SERVED, moeRowsLayoutDown(false, 2816, 704, 4, 64, .float16, 4, 6));
+    try std.testing.expectEqual(MOE_ROWS_LAYOUT_DOWN_SERVED, moeRowsLayoutDown(false, 1408, 704, 4, 64, .bfloat16, 4, 6));
+
+    // a built-in plan keeps today's behaviour: any shape that fits
+    moeRowsLayoutTestResolveFrom(moeRowsLayoutTestInputs(null, null, null, .unset, .absent, MOE_ROWS_LAYOUT_TEST_G16));
+    try std.testing.expectEqual(MoeRowsLayoutGateUp{ .sg = 32, .ax = 1 }, moeRowsLayoutGateUp(false, 704, 2048, 4, 64, .bfloat16));
+    try std.testing.expectEqual(MoeRowsLayoutGateUp{ .sg = 32, .ax = 1 }, moeRowsLayoutGateUp(false, 704, 2816, 8, 32, .float16));
+    try std.testing.expectEqual(MoeRowsLayoutDown{ .sps = 6, .tpt = 1, .ax = 1 }, moeRowsLayoutDown(false, 2816, 1408, 8, 32, .float16, 4, 6));
+
+    // an environment override keeps today's behaviour too
+    moeRowsLayoutTestResolveFrom(moeRowsLayoutTestInputs("1", "sg=16 ax=0", "sps=2 tpt=2 ax=0", .unset, local_picks, MOE_ROWS_LAYOUT_TEST_G16));
+    try std.testing.expectEqual(MoeRowsLayoutGateUp{ .sg = 16, .ax = 0 }, moeRowsLayoutGateUp(false, 704, 2048, 8, 32, .float16));
+    try std.testing.expectEqual(MoeRowsLayoutDown{ .sps = 2, .tpt = 2, .ax = 0 }, moeRowsLayoutDown(false, 2816, 1408, 8, 32, .float16, 4, 6));
+}
+
+test "moe-rows-layout tune: no HOME reads no table" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const env = MoeRowsLayoutEnv{ .home = null, .tune_root = null, .table_switch = .unset, .moe_rows_layout_raw = null, .gateup_env = null, .down_env = null };
+    const in = try moeRowsLayoutGatherInputs(arena.allocator(), std.testing.io, env);
+    try std.testing.expect(in.local == .absent);
+    try std.testing.expectEqualStrings("", in.table_path);
+    // the decision prints exactly what it prints with no table at all: the switch line and, when on, the plan line
+    const d = moeRowsLayoutDecideSources(in);
+    const none = moeRowsLayoutDecideSources(moeRowsLayoutTestInputs(null, null, null, .unset, .absent, in.gen));
+    try std.testing.expectEqual(none.n_lines, d.n_lines);
+    for (0..d.n_lines) |i| {
+        try std.testing.expectEqualStrings(none.line(i), d.line(i));
+        try std.testing.expect(std.mem.indexOf(u8, d.line(i), "local table") == null);
+    }
+    // a custom path with no HOME is still read: a missing file is absent, a malformed one is refused (so the path was used)
+    const env2 = MoeRowsLayoutEnv{ .home = null, .tune_root = null, .table_switch = .{ .path = "/nonexistent-lesto-dir/kernel-plans.json" }, .moe_rows_layout_raw = null, .gateup_env = null, .down_env = null };
+    const in2 = try moeRowsLayoutGatherInputs(arena.allocator(), std.testing.io, env2);
+    try std.testing.expect(in2.local == .absent);
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.setPermissions(io, .fromMode(0o700));
+    try tmp.dir.writeFile(io, .{ .sub_path = "bad.json", .data = "this is not a table" });
+    const bad = try tmp.dir.openFile(io, "bad.json", .{});
+    defer bad.close(io);
+    try bad.setPermissions(io, .fromMode(0o600));
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+    const bad_path = try std.fs.path.join(arena.allocator(), &.{ dir, "bad.json" });
+    const env3 = MoeRowsLayoutEnv{ .home = null, .tune_root = null, .table_switch = .{ .path = bad_path }, .moe_rows_layout_raw = null, .gateup_env = null, .down_env = null };
+    const in3 = try moeRowsLayoutGatherInputs(arena.allocator(), io, env3);
+    switch (in3.local) {
+        .refused => |det| try std.testing.expectEqual(kernel_table.KernelTableRefusal.unparseable, det.reason),
+        else => return error.TestExpectedRefusal,
+    }
+    try std.testing.expectEqualStrings(bad_path, in3.table_path);
+}
+
+test "moe-rows-layout tune: a refusal line stays whole for a long path, and control characters cannot split it" {
+    var long: [320]u8 = undefined;
+    @memset(&long, 'a');
+    long[0] = '/';
+    var in = moeRowsLayoutTestInputs(null, null, null, .unset, .{ .refused = .{ .reason = .checksum_mismatch } }, MOE_ROWS_LAYOUT_TEST_G16);
+    in.table_path = &long;
+    const d = moeRowsLayoutDecideSources(in);
+    try std.testing.expect(std.mem.indexOf(u8, d.line(0), "refused (checksum_mismatch); using the built-in table or the served layouts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d.line(0), "...") != null);
+    // a newline in the path, or in the table's date, becomes one visible character, never a second log entry
+    in.table_path = "/tmp/a\nb";
+    in.local = .{ .valid = .{ .plan = .{ .gateup = .{ .sg = 32, .ax = 1 }, .down = null }, .tuned_at = "2026-11-2\n" } };
+    const d2 = moeRowsLayoutDecideSources(in);
+    for (0..d2.n_lines) |i| for (d2.line(i)) |ch| try std.testing.expect(ch >= 0x20 and ch != 0x7f);
+    try std.testing.expect(std.mem.indexOf(u8, d2.line(0), "/tmp/a?b") != null);
 }

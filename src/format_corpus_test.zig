@@ -1238,7 +1238,7 @@ test "format corpus: recorded model outputs across families" {
                 const parsed = try std.json.parseFromSlice(std.json.Value, allocator, cs[0].arguments, .{});
                 defer parsed.deinit();
                 if (parsed.value == .object and parsed.value.object.get(key) != null) {
-                    try fail(entry, "fragment arg shipped — key must be ABSENT after truncation salvage", cs[0].arguments);
+                    try fail(entry, "fragment arg shipped - key must be ABSENT after truncation salvage", cs[0].arguments);
                 }
             }
             if (entry.tool_arg_key) |key| {

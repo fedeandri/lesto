@@ -218,6 +218,23 @@ pub fn restoreMoveEnabled() bool {
     return v;
 }
 
+var budget_trim_no_copy_env_cached: ?bool = null;
+/// Test override for `budgetTrimNoCopyEnabled()`. Null = read the environment.
+pub var budget_trim_no_copy_override: ?bool = null;
+
+/// `MLX_SERVE_BUDGET_TRIM_NO_COPY=1` commits a self-length budget trim (one that sheds only capacity rows)
+/// without the copy when the rows in use fit the budget. Off (unset or any other value): the copy, as before.
+pub fn budgetTrimNoCopyEnabled() bool {
+    if (budget_trim_no_copy_override) |v| return v;
+    if (budget_trim_no_copy_env_cached) |v| return v;
+    const v = blk: {
+        const raw = std.c.getenv("MLX_SERVE_BUDGET_TRIM_NO_COPY") orelse break :blk false;
+        break :blk std.mem.eql(u8, std.mem.sliceTo(raw, 0), "1");
+    };
+    budget_trim_no_copy_env_cached = v;
+    return v;
+}
+
 /// What the shutdown flush did, for its one summary line.
 pub const ShutdownTally = struct {
     /// Records a shutdown slice brought whole (a record already covered on disk is not counted).
@@ -449,11 +466,11 @@ pub const HotPrefixCache = struct {
             .kv_only => |w| w,
         };
         t.cache.restore(&snap.snapshot) catch |err| {
-            log.warn("  [hot-cache] {s} restore failed: {s} — starts blind\n", .{ what, @errorName(err) });
+            log.warn("  [hot-cache] {s} restore failed: {s} - starts blind\n", .{ what, @errorName(err) });
             return null;
         };
         t.cache.truncate(want, s) catch |err| {
-            log.warn("  [hot-cache] {s} clamp failed: {s} — starts blind\n", .{ what, @errorName(err) });
+            log.warn("  [hot-cache] {s} clamp failed: {s} - starts blind\n", .{ what, @errorName(err) });
             return null;
         };
         t.base_pos.* = snap.base_pos;
@@ -531,6 +548,25 @@ pub const HotPrefixCache = struct {
                     const rows: u64 = @intCast(mlx.mlx_array_shape(arr)[2]);
                     if (rows > 0) {
                         total += (@as(u64, mlx.mlx_array_size(arr)) * @as(u64, mlx.mlx_array_itemsize(arr))) / rows;
+                    }
+                }
+            }
+        }
+        return total;
+    }
+
+    /// The bytes a `trimmedCopy` at `len` holds, array by array: each layer's rows up to `len`
+    /// past its base, priced from the array's own shape. Host metadata reads only.
+    fn snapshotUsedBytesAt(snap: *const KVCacheSnapshot, len: usize) u64 {
+        var total: u64 = 0;
+        for (snap.entries) |e| {
+            if (!e.initialized) continue;
+            const kept_rows: u64 = @min(e.offset, len) -| e.base;
+            inline for (.{ e.keys, e.values, e.keys_scales, e.keys_biases, e.values_scales, e.values_biases }) |arr| {
+                if (arr.ctx != null and mlx.mlx_array_ndim(arr) > 2) {
+                    const rows: u64 = @intCast(mlx.mlx_array_shape(arr)[2]);
+                    if (rows > 0) {
+                        total += (@as(u64, mlx.mlx_array_size(arr)) * @as(u64, mlx.mlx_array_itemsize(arr))) / rows * @min(kept_rows, rows);
                     }
                 }
             }
@@ -715,7 +751,7 @@ pub const HotPrefixCache = struct {
             const final_len: usize = if (full_match and effective > 1) effective - 1 else effective;
             const sw = io_util.Stopwatch.init(d.io);
             d.restorePrefixInto(target_cache, dm.idx, @intCast(final_len), s) catch |err| {
-                log.warn("  [disk-cache] restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
+                log.warn("  [disk-cache] restore failed: {s} - falling back to RAM/cold path\n", .{@errorName(err)});
                 if (err == error.MlxError) _ = d.poisonId(d.entries.items[dm.idx].id, @errorName(err));
                 // A failed restore can leave a half-rebuilt cache; reset it.
                 target_cache.truncate(0, s) catch {};
@@ -1060,6 +1096,32 @@ pub const HotPrefixCache = struct {
                         return .{ .kept_resident = self.entries.items[idx].tokens.len };
                     }
                 }
+                // A self-length trim (the target is the candidate's own length) sheds only
+                // capacity rows. When the rows in use fit the budget, keep the snapshot itself (it shares the
+                // live KV, as an under-budget commit's does) instead of copying it, priced at what the copy
+                // would hold. The rest is the copy's path: the speculative payloads are dropped and the
+                // entry's tokens and media are the target's, so its key and accounting match the copy's.
+                if (budgetTrimNoCopyEnabled() and tl == tokens.len) {
+                    const used = snapshotUsedBytesAt(&new_snap, tl);
+                    if (used <= self.max_kv_bytes) {
+                        if (new_dflash) |*d| {
+                            d.deinit();
+                            new_dflash = null;
+                            new_dflash_bytes = 0;
+                        }
+                        eff_tokens = tokens[0..tl];
+                        eff_media = spansBelow(eff_media, tl);
+                        new_kv_bytes = used;
+                        new_bytes = new_kv_bytes;
+                        log.info("  [hot-cache] budget trim without copy: kept the self-length entry without a copy ({d} tokens, {d:.2} MB used; {d:.2} MB budget)\n", .{
+                            tl,
+                            @as(f64, @floatFromInt(new_bytes)) / (1024.0 * 1024.0),
+                            @as(f64, @floatFromInt(self.max_kv_bytes)) / (1024.0 * 1024.0),
+                        });
+                        trimmed_ok = true;
+                        break;
+                    }
+                }
                 const trimmed = new_snap.trimmedCopy(tl, mlx.gpuStream()) catch |err| {
                     decline = .snapshot_copy_failed;
                     decline_err = err;
@@ -1247,7 +1309,7 @@ pub const HotPrefixCache = struct {
         const note: []const u8 = switch (outcome) {
             .persisted => "complete",
             .partial => "byte-capped, continues on later commits",
-            .skipped => "already persisted — nothing new to write",
+            .skipped => "already persisted - nothing new to write",
         };
         log.info("  [disk-cache] declined RAM candidate spilled to SSD ({d} tokens, {s})\n", .{ tokens.len, note });
     }
@@ -1277,7 +1339,7 @@ pub const HotPrefixCache = struct {
             self.pending_disk = null;
         }
         var snap = source_cache.snapshot() catch |err| {
-            log.warn("  [disk-cache] live snapshot failed: {s} — flushing the RAM entry instead\n", .{@errorName(err)});
+            log.warn("  [disk-cache] live snapshot failed: {s} - flushing the RAM entry instead\n", .{@errorName(err)});
             return;
         };
         // Dupe the spans FIRST: a media record must never reach the tier with
@@ -1363,26 +1425,26 @@ pub const HotPrefixCache = struct {
                 specs.dflash,
                 s,
             ) catch |err| {
-                log.warn("  [hot-cache] idle spill failed: {s} — entry stays resident\n", .{@errorName(err)});
+                log.warn("  [hot-cache] idle spill failed: {s} - entry stays resident\n", .{@errorName(err)});
                 continue;
             };
             // Only `.persisted`: a silent skip or a `.partial` copy is not a copy.
             if (outcome != .persisted) continue;
             // `.persisted` is the write path's claim; the index has to agree.
             const disk_id = d.fullPrefixEntryId(e.snapshot.entries, e.snapshot.step, e.tokens, e.has_tools, e.snapshot.config, e.media) orelse {
-                log.warn("  [hot-cache] idle spill: the tier does not hold the full prefix — entry stays resident\n", .{});
+                log.warn("  [hot-cache] idle spill: the tier does not hold the full prefix - entry stays resident\n", .{});
                 continue;
             };
             // A staged copy is not durable yet, and the check must not be a drain (this runs on
             // the inference thread at every finish); the next pass asks again.
             if (d.entryWritesPending(disk_id)) continue;
             if (d.writeErrors() != errs_before) {
-                log.warn("  [hot-cache] idle spill: background write failed — entry stays resident\n", .{});
+                log.warn("  [hot-cache] idle spill: background write failed - entry stays resident\n", .{});
                 continue;
             }
             // Ask the filesystem too: one stat per chunk, against the eviction of a whole session.
             if (!d.entryWholeOnDisk(disk_id)) {
-                log.warn("  [hot-cache] idle spill: the persisted chunks do not match the index — entry stays resident\n", .{});
+                log.warn("  [hot-cache] idle spill: the persisted chunks do not match the index - entry stays resident\n", .{});
                 continue;
             }
             e.spill_durable = true;
@@ -1840,7 +1902,7 @@ pub const HotPrefixCache = struct {
                 report.bytes / (1024 * 1024),
                 report.accounted_bytes / (1024 * 1024),
                 seq_tokens,
-                if (report.shared_stop) " — stopped: the next entry is shared with a live request" else "",
+                if (report.shared_stop) " - stopped: the next entry is shared with a live request" else "",
             });
         }
         return report;
@@ -1986,7 +2048,7 @@ test "HotPrefixCache: findBestMatch returns longest shared prefix" {
 
     // has_tools mismatch returns null.
     try testing.expectEqual(@as(?@TypeOf(m), null), cache.findBestMatch(&lookup_ids, true, &.{}, kv_quant.KVQuantConfig.dense));
-    // A media item at row 0 matches only the same pixels, both ways.
+    // A media item in the first row matches only the same pixels, both ways.
     var k7 = [_]MediaSpan{.{ .start = 0, .key = 7 }};
     try testing.expectEqual(@as(?@TypeOf(m), null), cache.findBestMatch(&lookup_ids, false, &k7, kv_quant.KVQuantConfig.dense));
     cache.entries.items[0].media = &k7;
@@ -2976,7 +3038,7 @@ test "HotPrefixCache: oversized entry trims to the longest prefix that fits (#33
     }
 }
 
-test "HotPrefixCache: trimmed entry is one-shot — a covered re-commit keeps the resident copy (#330)" {
+test "HotPrefixCache: trimmed entry is one-shot - a covered re-commit keeps the resident copy (#330)" {
     const s = mlx.gpuStream();
 
     var src = try KVCache.init(testing.allocator, 2);
@@ -3452,7 +3514,7 @@ fn testDropPending(hc: *HotPrefixCache) void {
     hc.pending_disk = null;
 }
 
-test "SSD-first: an in-flight write does not stall the tick — the entry is re-checked next pass" {
+test "SSD-first: an in-flight write does not stall the tick - the entry is re-checked next pass" {
     // The durability check must not drain the writer on the inference thread: an entry whose
     // files are still staged is not evictable on this pass, and the next pass evicts.
     const io = std.testing.io;
@@ -3666,7 +3728,7 @@ test "SSD-first: the allowance is a HARD cap, shed in two tiers (durable first)"
     }
 }
 
-test "SSD-first: a silent SKIP is not a durable copy — the idle entry stays resident" {
+test "SSD-first: a silent SKIP is not a durable copy - the idle entry stays resident" {
     // Every silent skip used to read as "the SSD holds this session" and evicted the RAM copy.
     // Four skip reasons, each asserting both halves: the tier holds nothing, RAM still holds the entry.
     const io = std.testing.io;
@@ -3754,7 +3816,7 @@ test "SSD-first: a silent SKIP is not a durable copy — the idle entry stays re
     }
 }
 
-test "SSD-first: a PARTIAL copy is not a copy — the idle entry stays resident" {
+test "SSD-first: a PARTIAL copy is not a copy - the idle entry stays resident" {
     // A byte-capped flush lands real bytes and stops on a chunk boundary: the entry on disk is short and RAM keeps it.
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -4041,7 +4103,7 @@ test "prefix cache: the trim's row price is the entry's own bytes divided by its
     }
 }
 
-test "HotPrefixCache: a bounded disk flush leaves disk_dirty set and later flushes complete the entry — never a whole-entry claim in between" {
+test "HotPrefixCache: a bounded disk flush leaves disk_dirty set and later flushes complete the entry - never a whole-entry claim in between" {
     // A long entry reaches the tier in pieces; each piece is a valid shorter entry and the next
     // `flushPendingDisk` extends it.
     const io = std.testing.io;
@@ -4184,7 +4246,7 @@ test "HotPrefixCache: the idle flush skips a checked-out entry and never reports
 }
 
 test "HotPrefixCache: a failed background write costs only its own session; the idle flush moves on" {
-    // Failure matrix row 1: the writer loses one of the oldest session's chunks. The others still
+    // Failure matrix, first row: the writer loses one of the oldest session's chunks. The others still
     // land whole and the idle loop ends.
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -4397,7 +4459,7 @@ test "HotPrefixCache: the shutdown flush skips a checked-out entry and counts it
 }
 
 test "HotPrefixCache: a failed write during the shutdown flush is counted and the flush moves on" {
-    // Failure matrix row 1 at SIGTERM: the writer loses one of the oldest session's chunks.
+    // Failure matrix, first row at SIGTERM: the writer loses one of the oldest session's chunks.
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -4851,7 +4913,7 @@ fn testEntryFor(hc: *HotPrefixCache, toks: []const u32) !*Entry {
     return error.EntryGone;
 }
 
-test "SSD-first: a chunk write that fails AFTER the pass invalidates the entry — RAM is never dropped against it" {
+test "SSD-first: a chunk write that fails AFTER the pass invalidates the entry - RAM is never dropped against it" {
     // Pass N stages A and skips it (pending). The writer then loses `c000003` but, FIFO, still
     // lands meta.json, so the index keeps a non-zero `chunk_bytes[3]`. Pass N+1 must not call
     // A durable. The bar is the verdict (`spill_durable`), not the eviction it licenses.
@@ -5043,7 +5105,7 @@ test "SSD-first: a spill pass probes the volume only for a store, never for a co
     try testing.expect(kv_disk_cache.test_space_probes > p2);
 }
 
-test "SSD-first: the durability check STATS the chunks — a truncated file is never durable" {
+test "SSD-first: the durability check STATS the chunks - a truncated file is never durable" {
     // A byte can go missing with no write error at all; one stat per chunk catches it.
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -5286,4 +5348,116 @@ test "an image turn persists its full media-keyed prefix to the SSD tier" {
             try testing.expectEqual(@as(usize, lk.want), res.matched);
         }
     }
+}
+
+/// For the budget-trim tests: a 600-token, two-layer cache (capacity 768 rows, `nextCapacityPolicy`'s 256-row chunks)
+/// committed under a budget that fits its 600 rows in use but not its capacity: a self-length trim.
+fn budgetTrimNoCopySelfLengthBudget(src: *KVCache) !u64 {
+    var probe = try src.snapshot();
+    defer probe.deinit();
+    const budget = HotPrefixCache.snapshotUsedBytesAt(&probe, 600);
+    // The setup is the case: capacity over the budget, the trim target the candidate's own length.
+    try testing.expect(HotPrefixCache.snapshotBytes(&probe) > budget);
+    try testing.expectEqual(@as(?usize, 600), HotPrefixCache.trimLenForBudget(budget, 600, HotPrefixCache.snapshotRowBytes(&probe)));
+    return budget;
+}
+
+test "budget-trim: a self-length trim whose used rows fit commits the snapshot itself, keyed and priced as the copy" {
+    const s = mlx.gpuStream();
+    var src = try KVCache.init(testing.allocator, 2);
+    defer src.deinit();
+    try testFillCache(&src, s, 2, 600);
+    var toks: [600]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    const budget = try budgetTrimNoCopySelfLengthBudget(&src);
+    defer budget_trim_no_copy_override = null;
+    // A DFlash context payload rides both commits: the copy's path drops it, and so must the kept snapshot's.
+    var dfl = try KVCache.init(testing.allocator, 1);
+    defer dfl.deinit();
+    try testFillCache(&dfl, s, 1, 64);
+    const payload: DflashCommit = .{ .cache = &dfl, .base_pos = 0 };
+
+    // Off: the copy, holding exactly the used rows.
+    budget_trim_no_copy_override = false;
+    var off = HotPrefixCache.initWithMem(testing.allocator, 4, budget);
+    defer off.deinit();
+    _ = try off.commitWithState(&src, &toks, false, &.{}, payload);
+    try testing.expectEqual(@as(usize, 1), off.entryCount());
+    const off_e = &off.entries.items[0];
+    try testing.expectEqual(@as(usize, 600), off_e.tokens.len);
+    try testing.expectEqual(budget, HotPrefixCache.snapshotBytes(&off_e.snapshot));
+    try testing.expect(off_e.dflash == null);
+    try testing.expectEqual(@as(u64, 0), off_e.dflash_bytes);
+
+    // On: no copy (the entry holds the capacity-shaped buffers it shares), the same key and the same price.
+    budget_trim_no_copy_override = true;
+    var on = HotPrefixCache.initWithMem(testing.allocator, 4, budget);
+    defer on.deinit();
+    _ = try on.commitWithState(&src, &toks, false, &.{}, payload);
+    try testing.expectEqual(@as(usize, 1), on.entryCount());
+    const on_e = &on.entries.items[0];
+    try testing.expectEqualSlices(u32, off_e.tokens, on_e.tokens);
+    try testing.expect(HotPrefixCache.snapshotBytes(&on_e.snapshot) > budget);
+    try testing.expectEqual(off_e.kv_bytes, on_e.kv_bytes);
+    try testing.expectEqual(off.current_kv_bytes, on.current_kv_bytes);
+    try testing.expect(on_e.dflash == null);
+    try testing.expectEqual(@as(u64, 0), on_e.dflash_bytes);
+    try testing.expectEqual(off_e.snapshot.entries[0].offset, on_e.snapshot.entries[0].offset);
+
+    // A follow-up turn restores the same rows from either entry and appends the same tail.
+    var more: [610]u32 = undefined;
+    @memcpy(more[0..600], &toks);
+    for (more[600..], 600..) |*t, i| t.* = @intCast(i + 1);
+    var dst_off = try KVCache.init(testing.allocator, 2);
+    defer dst_off.deinit();
+    var dst_on = try KVCache.init(testing.allocator, 2);
+    defer dst_on.deinit();
+    var moe_off: usize = 0;
+    var moe_on: usize = 0;
+    budget_trim_no_copy_override = false;
+    const res_off = try off.lookupAndRestore(&dst_off, &moe_off, s, &more, false, &.{}, null);
+    budget_trim_no_copy_override = true;
+    const res_on = try on.lookupAndRestore(&dst_on, &moe_on, s, &more, false, &.{}, null);
+    try testing.expectEqual(@as(usize, 600), res_off.matched);
+    try testing.expectEqual(res_off.matched, res_on.matched);
+    try testing.expectEqual(moe_off, moe_on);
+    var li: u32 = 0;
+    while (li < 2) : (li += 1) {
+        try testWriteCacheLayer(&dst_off, s, li, 600, 10);
+        try testWriteCacheLayer(&dst_on, s, li, 600, 10);
+    }
+    try testing.expectEqual(dst_off.step, dst_on.step);
+    for ([_]usize{ 0, 299, 599, 600, 609 }) |row| {
+        var a: [8]f32 = undefined;
+        var b: [8]f32 = undefined;
+        try testReadKeyRows(&dst_off, 1, row, &a);
+        try testReadKeyRows(&dst_on, 1, row, &b);
+        try testing.expectEqualSlices(f32, &a, &b);
+    }
+}
+
+test "budget-trim: a trim below the candidate's own length still copies with the switch on" {
+    const s = mlx.gpuStream();
+    var src = try KVCache.init(testing.allocator, 2);
+    defer src.deinit();
+    try testFillCache(&src, s, 2, 600);
+    var toks: [600]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    var probe = try src.snapshot();
+    defer probe.deinit();
+    const budget = HotPrefixCache.snapshotUsedBytesAt(&probe, 400);
+
+    budget_trim_no_copy_override = true;
+    defer budget_trim_no_copy_override = null;
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, budget);
+    defer hc.deinit();
+    _ = try hc.commit(&src, &toks, false);
+    try testing.expectEqual(@as(usize, 1), hc.entryCount());
+    try testing.expectEqual(@as(usize, 400), hc.entries.items[0].tokens.len);
+    try testing.expectEqual(budget, HotPrefixCache.snapshotBytes(&hc.entries.items[0].snapshot));
+}
+
+test "budget-trim: the switch is off unless MLX_SERVE_BUDGET_TRIM_NO_COPY is 1" {
+    try testing.expect(budget_trim_no_copy_override == null);
+    if (std.c.getenv("MLX_SERVE_BUDGET_TRIM_NO_COPY") == null) try testing.expect(!budgetTrimNoCopyEnabled());
 }

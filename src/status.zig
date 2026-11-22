@@ -25,6 +25,9 @@ extern "c" fn CFDictionaryGetValue(dict: ?*const anyopaque, key: ?*const anyopaq
 extern "c" fn CFStringCreateWithCString(alloc: ?*anyopaque, s: [*:0]const u8, enc: u32) ?*const anyopaque;
 extern "c" fn CFNumberGetValue(num: ?*const anyopaque, typ: u32, out: *anyopaque) u8;
 extern "c" fn CFRelease(cf: ?*const anyopaque) void;
+extern "c" fn CFGetTypeID(cf: ?*const anyopaque) usize;
+extern "c" fn CFDictionaryGetTypeID() usize;
+extern "c" fn CFNumberGetTypeID() usize;
 
 // ── Mach struct layouts (extern = C ABI) ──
 
@@ -275,30 +278,58 @@ pub fn getCpuPct() u32 {
     return @intCast((total - idle) * 100 / total);
 }
 
+/// The raw host CPU tick counters (user, system, idle, nice), or null when the read fails. Unlike `getCpuPct` it keeps no
+/// state, so a caller that wants a share over its own span reads twice and subtracts.
+pub fn cpuTicks() ?[4]u64 {
+    var info = std.mem.zeroes(CpuLoadInfo);
+    var count: u32 = 4;
+    if (host_statistics(mach_host_self(), 3, @ptrCast(&info), &count) != 0) return null;
+    var out: [4]u64 = undefined;
+    for (0..4) |i| out[i] = info.ticks[i];
+    return out;
+}
+
+/// Test seam: when set, `gpuUtilPct` returns this reading without touching IOKit.
+var gpu_util_test: ?struct { value: ?u32 } = null;
+
 pub fn getGpuPct() u32 {
+    return pctOrZero(gpuUtilPct());
+}
+
+/// The status page shows an unknown reading as 0; `lesto tune` reads `gpuUtilPct` itself and keeps the difference.
+fn pctOrZero(reading: ?u32) u32 {
+    return reading orelse 0;
+}
+
+/// The GPU's `Device Utilization %`, or null when the AGXAccelerator service, its `PerformanceStatistics` dictionary or the
+/// key is missing (or reads outside 0 to 100), so a caller can tell "unknown" from "idle".
+pub fn gpuUtilPct() ?u32 {
+    if (gpu_util_test) |t| return t.value;
     // IOKit's IOServiceMatching/AGXAccelerator path is macOS-only; the symbols
     // aren't in the public iOS SDK (and apps are sandboxed from the GPU service
-    // registry anyway). On iOS we report 0 — the value is only a log-line stat.
-    if (comptime !is_macos) return 0;
-    const matching = IOServiceMatching("AGXAccelerator") orelse return 0;
+    // registry anyway). On iOS the reading is unknown.
+    if (comptime !is_macos) return null;
+    const matching = IOServiceMatching("AGXAccelerator") orelse return null;
     var iter: u32 = 0;
-    if (IOServiceGetMatchingServices(0, matching, &iter) != 0) return 0;
+    if (IOServiceGetMatchingServices(0, matching, &iter) != 0) return null;
     defer _ = IOObjectRelease(iter);
 
     const entry = IOIteratorNext(iter);
-    if (entry == 0) return 0;
+    if (entry == 0) return null;
     defer _ = IOObjectRelease(entry);
 
     var props: ?*anyopaque = null;
-    if (IORegistryEntryCreateCFProperties(entry, &props, null, 0) != 0) return 0;
+    if (IORegistryEntryCreateCFProperties(entry, &props, null, 0) != 0) return null;
     defer if (props) |p| CFRelease(p);
 
-    const perf = cfDictGet(props, "PerformanceStatistics") orelse return 0;
-    const util = cfDictGet(perf, "Device Utilization %") orelse return 0;
+    const perf = cfDictGet(props, "PerformanceStatistics") orelse return null;
+    if (CFGetTypeID(perf) != CFDictionaryGetTypeID()) return null; // another type: unknown, never a crash
+    const util = cfDictGet(perf, "Device Utilization %") orelse return null;
+    if (CFGetTypeID(util) != CFNumberGetTypeID()) return null;
 
     var value: i64 = 0;
-    _ = CFNumberGetValue(util, 4, @ptrCast(&value));
-    return if (value >= 0 and value <= 100) @intCast(value) else 0;
+    if (CFNumberGetValue(util, 4, @ptrCast(&value)) == 0) return null; // not an integer number: unknown, never 0
+    return if (value >= 0 and value <= 100) @intCast(value) else null;
 }
 
 var gpu_cores: ?u32 = null;
@@ -319,8 +350,9 @@ pub fn gpuCoreCount() u32 {
         if (IORegistryEntryCreateCFProperties(entry, &props, null, 0) != 0) break :blk 0;
         defer if (props) |p| CFRelease(p);
         const v = cfDictGet(props, "gpu-core-count") orelse break :blk 0;
+        if (CFGetTypeID(v) != CFNumberGetTypeID()) break :blk 0;
         var n: i64 = 0;
-        _ = CFNumberGetValue(v, 4, @ptrCast(&n));
+        if (CFNumberGetValue(v, 4, @ptrCast(&n)) == 0) break :blk 0;
         break :blk if (n > 0 and n < 1 << 16) @intCast(n) else 0;
     };
     return gpu_cores.?;
@@ -338,6 +370,36 @@ test "getAppMemFootprintMb returns a plausible nonzero footprint" {
     // would yield 0 or absurd garbage.
     try std.testing.expect(fp > 0);
     try std.testing.expect(fp < 1024 * 1024); // < 1 TB sanity bound
+}
+
+test "status tune: gpuUtilPct and getGpuPct agree" {
+    if (comptime !is_macos) return error.SkipZigTest;
+    // the live reading is in range when there is one; whether this machine has one depends on its hardware, so it is not asserted
+    if (gpuUtilPct()) |u| try std.testing.expect(u <= 100);
+    try std.testing.expect(getGpuPct() <= 100);
+    // the wrapper keeps every known reading and turns only an unknown one into 0, through the public function
+    defer gpu_util_test = null;
+    gpu_util_test = .{ .value = 37 };
+    try std.testing.expectEqual(@as(?u32, 37), gpuUtilPct());
+    try std.testing.expectEqual(@as(u32, 37), getGpuPct());
+    gpu_util_test = .{ .value = 100 };
+    try std.testing.expectEqual(@as(u32, 100), getGpuPct());
+    gpu_util_test = .{ .value = 0 };
+    try std.testing.expectEqual(@as(?u32, 0), gpuUtilPct());
+    gpu_util_test = .{ .value = null };
+    try std.testing.expectEqual(@as(?u32, null), gpuUtilPct());
+    try std.testing.expectEqual(@as(u32, 0), getGpuPct());
+}
+
+test "status tune: cpuTicks leaves getCpuPct's state alone" {
+    if (comptime !is_macos) return error.SkipZigTest;
+    const before = prev_ticks;
+    const a = cpuTicks();
+    try std.testing.expect(a != null);
+    try std.testing.expectEqual(before, prev_ticks);
+    const b = cpuTicks().?;
+    for (0..4) |i| try std.testing.expect(b[i] >= a.?[i]); // the counters only grow
+    try std.testing.expectEqual(before, prev_ticks);
 }
 
 test "gpuCoreCount reads the GPU's core count" {
