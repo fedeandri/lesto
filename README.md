@@ -4,7 +4,7 @@ It is a personal experiment, shared as it is. I built it to learn how inference 
 
 Lesto starts from [mlx-serve](https://github.com/ddalcu/mlx-serve) by David Dalcu, a much broader project. I removed every other model family, media type and platform, then tuned what was left for Gemma 4 text. If you need images, other models or a maintained product, use mlx-serve or [mlx-lm](https://github.com/ml-explore/mlx-lm).
 
-On an M4 Pro, one user at a time, Lesto decodes Gemma 4 26B-A4B 22 to 30% faster than five other Mac engines at a 1k-token prompt, and 28 to 60% faster at 8k.
+On an M4 Pro, one user at a time, Lesto decodes Gemma 4 26B-A4B 22 to 31% faster than five other Mac engines at a 1k-token prompt, and 30 to 61% faster at 8k.
 
 - Runs offline, with no Python and no account, behind an HTTP API for chat, tool calls, JSON schemas and reasoning.
 - Apple silicon Macs, M1 or later; tested on M3 Pro and M4 Pro. Download a binary for macOS 14 or later, or build from source.
@@ -13,21 +13,21 @@ On an M4 Pro, one user at a time, Lesto decodes Gemma 4 26B-A4B 22 to 30% faster
 
 ## Speed
 
-Gemma 4 26B-A4B, `mlx-community`'s standard 4-bit checkpoint unless the row says otherwise. Each engine ran with its default flags, one at a time, serving one user at a time: 15 cold requests per prompt size for a 200-token reply. M4 Pro, 20 GPU cores, 64 GB, macOS 26.7.2. The other engines were measured on 2026-11-06, at their latest releases of that day; Lesto 0.21.1 on 2026-11-13, on the same machine and macOS with the same method.
+Gemma 4 26B-A4B, `mlx-community`'s standard 4-bit checkpoint unless the row says otherwise. Each engine ran with its default flags, one at a time, serving one user at a time: 15 cold requests per prompt size for a 200-token reply. M4 Pro, 20 GPU cores, 64 GB, macOS 26.7.2. The other engines were measured on 2026-11-06, at their latest releases of that day; Lesto 0.27.1 on 2026-11-23, on the same machine and macOS with the same method.
 
 | Engine | Decode tok/s, 1k / 8k | First text s, 1k / 8k | 200-token reply s, 1k / 8k | First text on later turns s, 1k / 8k |
 |---|---:|---:|---:|---:|
-| Lesto 0.21.1, the checkpoint below | 93.1 / 85.3 | 1.33 / 9.45 | 3.47 / 11.79 | 0.18 / 0.23 |
-| Lesto 0.21.1 | 87.8 / 80.7 | 1.33 / 9.54 | 3.60 / 12.01 | 0.18 / 0.23 |
+| Lesto 0.27.1, the checkpoint below | 93.0 / 85.6 | 1.28 / 8.89 | 3.42 / 11.21 | 0.18 / 0.23 |
+| Lesto 0.27.1 | 88.0 / 81.3 | 1.28 / 8.87 | 3.54 / 11.32 | 0.18 / 0.23 |
 | mlx-serve 26.11.2 | 71.9 / 51.7 | 1.37 / 9.37 | 4.13 / 13.22 | 0.19 / 0.26 |
 | oMLX 0.7.4.dev1 | 69.1 / 50.4 | 1.57 / 10.51 | 4.45 / 14.46 | 0.36 / 0.53 |
 | vllm-mlx 0.6.0 | 68.7 / 51.1 | 1.40 / 10.40 | 4.29 / 14.29 | 1.52 / 10.89 |
 | mlx-vlm 0.7.12 | 68.4 / 50.7 | 1.40 / 10.43 | 4.31 / 14.35 | 1.53 / 10.90 |
 | mlx-lm 0.32.2 | 67.3 / 62.6 | 1.44 / 10.90 | 4.39 / 14.10 | 0.23 / 0.28 |
 
-Lesto's lead is in decoding. It reads a long prompt about as fast as mlx-serve: at 8k, mlx-serve shows first text 0.17 seconds sooner, and a whole 200-token reply takes Lesto about 9% less time there. Several users at once were not measured.
+Lesto's lead is in decoding. It reads a long prompt a little faster than mlx-serve: at 8k, Lesto shows first text 0.5 seconds sooner, and a whole 200-token reply takes Lesto about 14% less time there. Several users at once were not measured.
 
-On 2026-11-06 a second launch of the whole benchmark agreed with the first, and the gap between Lesto and each engine held in each of the 3 rounds, on both this standard checkpoint and the one below without its Latin-script head, which the other engines do not use. Lesto 0.21.1's rows come from its release run, which measured it against 0.17.1 in 3 rounds: 0.21.1 was faster in every round, and 0.17.1 decoded as fast as on 2026-11-06 (89.3 tok/s at 1k on the checkpoint below, 89.4 then), so the two days compare. To run it yourself: [docs/benchmark.md](docs/benchmark.md).
+On 2026-11-06 a second launch of the whole benchmark agreed with the first, and the gap between Lesto and each engine held in each of the 3 rounds, on both this standard checkpoint and the one below without its Latin-script head, which the other engines do not use. Lesto 0.27.1's rows come from its release run, which measured it against 0.21.1 in 3 rounds: decoding was level (93.0 against 93.1 tok/s at 1k on the checkpoint below), first text at 8k came about 7% sooner in every round, and 0.21.1 decoded as fast as in its own release run of 2026-11-13 (93.1 tok/s), so the days compare. To run it yourself: [docs/benchmark.md](docs/benchmark.md).
 
 ## The checkpoint
 
